@@ -1,10 +1,11 @@
 name: Release
 
-# Tag push releases: publish the tagged version to npm (skipped when the
-# Publish workflow already published it) and create the GitHub release.
-# Authentication uses npm Trusted Publishing (OIDC) — register this
-# workflow (release.yml) as a trusted publisher for the package on
-# registry.npmjs.org, alongside publish.yml.
+# Tag push releases: verify the tag against package.json, run tests, then
+# publish to npm via Trusted Publishing (OIDC) and create the GitHub
+# release. npm allows exactly one trusted publisher per package — register
+# this workflow (release.yml) as the publisher for the package on
+# registry.npmjs.org. Publish is skipped when the version is already on
+# the registry; the release is created either way.
 on:
   push:
     tags: ["v*"]
