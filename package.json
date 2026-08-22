@@ -36,14 +36,14 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/sablejs/sablejs.git"
+    "url": "git+https://github.com/ErosZy/sablejs.git"
   },
   "author": "ErosZhao",
   "license": "Apache-2.0",
   "bugs": {
-    "url": "https://github.com/sablejs/sablejs/issues"
+    "url": "https://github.com/ErosZy/sablejs/issues"
   },
-  "homepage": "https://github.com/sablejs/sablejs#readme",
+  "homepage": "https://github.com/ErosZy/sablejs#readme",
   "devDependencies": {
     "@babel/core": "7.29.7",
     "@babel/preset-env": "7.29.7",
