@@ -1,779 +1,193 @@
-
 ![LOGO](./logo.jpg)
 
-![linux ci](https://github.com/sablejs/sablejs/actions/workflows/linux.yml/badge.svg)
-![osx ci](https://github.com/sablejs/sablejs/actions/workflows/osx.yml/badge.svg)
-![windows ci](https://github.com/sablejs/sablejs/actions/workflows/win.yml/badge.svg)
-<a href="https://www.npmjs.com/package/sablejs"><img src="https://img.shields.io/npm/v/sablejs.svg?sanitize=true" alt="Version"></a>
+[![Ubuntu CI](https://github.com/sablejs/sablejs/actions/workflows/ci.yml/badge.svg)](https://github.com/sablejs/sablejs/actions/workflows/ci.yml)
+[![Version](https://img.shields.io/npm/v/sablejs.svg?sanitize=true)](https://www.npmjs.com/package/sablejs)
+[![License](https://img.shields.io/github/license/sablejs/sablejs)](LICENSE)
 
-> 🎉 sablejs 2.0 will be opening all the code, please [click to learn more](https://github.com/sablejs/sablejs/issues/19) about our milestone and goals.
+sablejs is a **small AOT-compiled execution layer** for running **user-authored and AI-generated JavaScript** in browsers. It combines a **stable ES5.1 contract**, **explicit capabilities**, and **Worker isolation** for **rules, plugins, formulas, and other untrusted logic**.
 
-English | [简体中文](./README-zh_CN.md)
+## Why sablejs
 
-The safer and faster ECMA5.1 interpreter written by JavaScript, it can be used:
+- **Versus `eval` / `new Function`**: these compile and execute source at runtime inside a privileged JavaScript environment. sablejs moves source compilation to build time, ships no runtime evaluator, rejects dynamically generated source, and mediates access to host capabilities.
+- **Versus an iframe sandbox**: an iframe isolates and restricts a browsing context. sablejs instead exposes copied data, protected intrinsics, and explicit capabilities — guest code receives no browser realm, so a dedicated Worker can serve as the entire guest environment.
+- **Versus QuickJS-WASM**: QuickJS-WASM embeds a complete JavaScript interpreter inside WebAssembly. sablejs instead AOT-compiles ES5.1 into direct JavaScript for the host engine, trading interpreter/parser/dispatch overhead for larger generated code and a deliberately stable ES5.1 source contract.
 
-1. Sandbox (like Figma Plugin Sandbox, but better and easier to use);
-2. Protect JavaScript source code via AOT compiling to opcode.
+## Use cases
 
-sablejs covered ~95% [test262 es5-tests cases](https://github.com/tc39/test262/tree/es5-tests), it can be safely used in production.
+sablejs is built for products that execute code the operator did not author:
 
-* [Quick Start](https://github.com/sablejs/sablejs#quick-start)
-* [APIs](https://github.com/sablejs/sablejs#apis)
-* [Benchmark](https://github.com/sablejs/sablejs#benchmark)
-* [Limits](https://github.com/sablejs/sablejs#limits)
-* [Bindings](https://github.com/sablejs/sablejs#bindings)
-* [License](https://github.com/sablejs/sablejs#license)
+- **AI executors and agents** — run LLM-generated JavaScript (data transforms, formulas, API-call scripts, UI automation steps) as an untrusted artifact: compile the model's output ahead of time, execute it in a Worker, and get copied results back with no page access. AOT produces a stable, cacheable executable artifact, while the fixed ES5.1 contract makes generated code easier to validate and repair.
+- **User plugins and extensions** — Figma and design-tool plugins, and embeddable plugin systems with user-defined behavior.
+- **Rules and formula engines** — low-code rules, spreadsheet formulas, validators, workflow steps, and pricing logic.
+- **Code playgrounds and learning tools** — sandboxed execution with no host access.
 
-### Quick Start
+The best fit is small or medium programs, an ES5.1-compatible feature set, repeated execution, and a narrow host API:
 
-**sablejs includes the Compiler and Interpreter independently**, so we removed the related dynamic api from the spec (see [Limits 1](https://github.com/sablejs/sablejs#limits)). In short, you need to compile your JavaScript code with sablejs cli before you run it.
+```text
+modern source -> Babel/SWC -> ES5.1 -> sablejs AOT -> browser bundle -> dedicated Worker
+                                                                       | explicit messages only
+                                                                       v
+                                                                  application UI
+```
 
-#### Example
+## Quick start
 
-Suppose we have the following code in `fib.js`:
+Compile an ES5.1 program — a script with no imports that returns its result as the final expression — then create an instance and run it:
 
-```javascript
-function fib(n) {
-  return n < 2 ? n : fib(n - 1) + fib(n - 2);
+```js
+const fs = require("node:fs");
+const { compile } = require("sablejs");
+const generated = compile("({ total: input.price * 1.2 });");
+fs.writeFileSync("program.cjs", generated.code);
+```
+
+```js
+const program = require("./program.cjs");
+const instance = program.createInstance({
+  globals: { input: { price: 100 } },
+});
+
+try {
+  console.log(instance.run()); // { total: 120 } — synchronous, returns the value
+} finally {
+  instance.dispose();
 }
-
-var start = Date.now();
-console.log("[INFO] fib: " + fib(30));
-console.log("[INFO] time consuming: " + (Date.now() - start) + "ms");
 ```
 
-#### Compile It!
+The default `security: "sandbox"` mode recursively copies plain `globals` data, so guest mutations do not reach the host object graph. One `instance.run()` call executes the program; instances are single-run and meant to be disposed.
 
-```shell
-> npm i sablejs -g
-> sablejs -i fib.js -o output # get output file that contains base64 string
+## Calling program functions
+
+End the program with a function expression and `run()` returns a callable. Call it with plain data — arguments and the receiver are copied like `globals`, so guest mutations cannot reach host objects:
+
+```js
+const program = require("./program.cjs");
+// program source: "function price(input) { return { total: input.price * 1.2 }; } price;"
+const instance = program.createInstance({ globals: {} });
+const price = instance.run();      // synchronous — returns the callable
+price({ price: 100 });             // { total: 120 } — synchronous call
+instance.dispose();
 ```
 
-sablejs cli includes the following commands:
+Guest functions keep reference semantics between their own frames; only host-initiated calls copy. Alternatively, pass the arguments through the `input` global and call once per run:
 
-```shell
-Usage: sablejs [options]
-
-Options:
-  -v, --vers           output the current version
-  -i, --input <path>   compile input filepath
-  -o, --output <path>  compile output filepath
-  -j  --json           don't do Base64 compress, output simple json result
-  -s, --slient         don't output log
-  -h, --help
+```js
+// program source: "function price(input) { return { total: input.price * 1.2 }; } price(input);"
+const instance = program.createInstance({ globals: { input: { price: 100 } } });
+instance.run();                    // { total: 120 } — synchronous
 ```
 
-#### Run It!
+## Exposing host operations: capability()
 
-```shell
-> npm install sablejs --save
-```
+Sandbox programs cannot touch host functions or ambient objects. Expose exactly the operations they need as capabilities:
 
-or you can import to your html directly
+```js
+const { capability } = require("sablejs");
 
-```html
-<script src="https://cdn.jsdelivr.net/npm/sablejs@1.0.8/runtime.js"></script>
-```
-
-##### Browser
-
-```javascript
-const VM = require("sablejs/runtime")();
-
-// import console.log function to vm call
-const vm = new VM();
-const vGlobal = vm.getGlobal();
-const vConsole = vm.createObject();
-const vLog = vm.createFunction("log", function () {
-  const temp = [];
-  for (let i = 0; i < arguments.length; i++) {
-    temp.push(vm.asString(arguments[i]));
-  }
-
-  console.log(...temp);
-  return vm.createUndefined();
-});
-
-vm.setProperty(vConsole, "log", vLog);
-vm.setProperty(vGlobal, "console", vConsole);
-
-(async () => {
-  const resp = await fetch("<output url>");
-  const data = await resp.text();
-  vm.run(data);
-  vm.destroy();
-})();
-```
-
-##### Node
-
-```javascript
-const VM = require("sablejs/runtime")();
-const fs = require("fs");
-
-// import console.log function to vm call
-const vm = new VM();
-const vGlobal = vm.getGlobal();
-const vConsole = vm.createObject();
-const vLog = vm.createFunction("log", function () {
-  const temp = [];
-  for (let i = 0; i < arguments.length; i++) {
-    temp.push(vm.asString(arguments[i]));
-  }
-
-  console.log(...temp);
-  return vm.createUndefined();
-});
-
-vm.setProperty(vConsole, "log", vLog);
-vm.setProperty(vGlobal, "console", vConsole);
-
-// please run: sablejs -i fib.js -o output
-vm.run(fs.readFileSync("./output").toString());
-vm.destroy();
-```
-
-### APIs
-
-- VM.prototype.run(source, isSimpleJSON)
-  - source: String - the compiled result via sablejs compiler
-  - isSimpleJSON: Boolean - if be true, you should use `-j` to make compiler output simple json result, default false.
-  - `return:` undefined
-  
-Initialize the VM and execute the compiled source code.
-
-```javascript
-const VM = require('sablejs/runtime')();
-const vm = new VM();
-
-// source should be base64 string via sablejs compiling
-vm.run(`<compiled source string>`);
-```
-
-- VM.prototype.getGlobal()
-  - `return:` Value
-
-Returns the `global` in the VM, which is similar to the `window` in browser and the `global` in Node.js.
-
-```javascript
-const global = vm.getGlobal();
-```
-
-- VM.prototype.createUndefined()
-  - `return` Value
-
-Create an `undefined` boxed type.
-
-```javascript
-const vUndefined = vm.createUndefined();
-```
-
-- VM.prototype.createNull()
-  - `return:` Value
-
-Create an `null` boxed type.
-
-```javascript
-const vNull = vm.createNull();
-```
-
-- VM.prototype.createBoolean(bool)
-  - bool: Boolean
-  - `return` Value
-
-Create an `bool` boxed type.
-
-```javascript
-const vBoolean = vm.createBoolean(true);
-```
-
-- VM.prototype.createNumber(num)
-  - num: Number
-  - `return` Value
-
-Create an `number` boxed type.
-
-```javascript
-const vNumber = vm.createNumber(1024);
-```
-
-- VM.prototype.createString(str)
-  - str: String
-  - `return` Value
-
-Create an `string` boxed type.
-
-```javascript
-const vString = vm.createString('Hello World!');
-```
-
-
-- VM.prototype.createObject()
-  - `return` Value
-
-Create an `object` boxed type.
-
-```javascript
-const vObject = vm.createObject();
-```
-
-- VM.prototype.createArray(length)
-  - length: Number | undefined
-  - `return` Value
-
-Create an `array` boxed type.
-
-```javascript
-const vArray1 = vm.createArray();
-// or
-const vArray2 = vm.createArray(128);
-```
-
-- VM.prototype.createFunction(name, func)
-  - name: String
-  - func: Function
-  - `return` Value
-
-Create an `funcntion` boxed type. It receives a function name and the specific implementation of the function. Both the `function parameter` and `this` are boxed types in `func`.
-
-```javascript
-const vFunction = vm.createFunction("trim", function(str) {
-  // this is the undefined or new's instannce boxed type
-  // str maybe the string boxed type, we need to check it
+const instance = program.createInstance({
+  globals: {
+    input: { price: 100 },
+    save: capability(async function (record) {
+      const response = await fetch("/api/records", {
+        method: "POST",
+        body: JSON.stringify(record),
+      });
+      return { saved: response.ok };
+    }, { name: "save" }),
+  },
 });
 ```
 
-- VM.prototype.createError(message)
-  - message: String | undefined
-  - `return` Value
+Capability arguments and results are copied, thrown errors are sanitized, and wrappers are revoked after `instance.dispose()`. For fully trusted integrations that need reference identity and the lowest overhead, compile with `security: "trusted"` — this restores raw `globals` pass-through.
 
-Create an `error` boxed type.
+## Isolating CPU and memory: the Worker
 
-```javascript
-const vError1 = vm.createError();
-// or
-const vError2 = vm.createError("unknown error");
+The language boundary does not stop infinite loops or memory exhaustion. Run each program in a dedicated Worker and terminate it when it exceeds its budget. `sablejs/worker` packages the two pieces:
+
+```js
+// sandbox.worker.js — worker side
+require("sablejs/worker").handleSandboxMessages(program);
 ```
 
-- VM.prototype.createRegExp(pattern, flags)
-  - pattern: String
-  - flags: String | undefined
-  - `return` Value
-
-Create an `regexp` boxed type.
-
-```javascript
-const vRegExp = vm.createRegExp("\\w+", "ig");
+```js
+// host side — worker calls are asynchronous
+const { createSandboxClient } = require("sablejs/worker");
+const sandbox = createSandboxClient(new Worker("/sandbox.worker.js"), { timeoutMs: 1000 });
+await sandbox.run({ price: 100 }); // { total: 120 }
+await sandbox.evaluate(artifactCode, { price: 100 });
 ```
 
-- VM.prototype.createDate()
-  - `return` Value
+`run` and `evaluate` return promises (a message round-trip), unlike the in-process `instance.run()` above, which is synchronous. Per-run timeouts terminate the Worker, responses are validated, and each message runs a fresh instance — the worker survives many calls. The full build pipeline (Babel downlevel, esbuild bundling) and size budgets are in [Worker isolation](docs/worker-isolation.md). Do not place secrets in client-side bundles.
 
-Create an `date` boxed type.
+## Sandbox semantics
 
-```javascript
-const vDate = vm.createDate();
+ES5.1 defines ECMAScript built-ins, not a universal set of browser or application host objects. Availability therefore follows these rules:
+
+| Category | sandbox behavior |
+| --- | --- |
+| ES5.1 built-ins | `Object`, `Array`, strings, numbers, `Math`, `Date`, `RegExp`, errors, `JSON`, and URI/number helpers are available through protected intrinsics. Static `Function` source can be AOT-compiled; runtime-generated source and global `eval` are unavailable. |
+| Newer ECMAScript built-ins | Typed arrays, `Map`, `Set`, `Promise`, `Symbol`, `BigInt`, `Reflect`, `Proxy`, `Atomics`, `WeakRef`, and `Intl` are available when the host implements them. Shared intrinsic mutation remains blocked. |
+| Injected data | Primitives, plain objects, arrays, `Date`, `RegExp`, buffers/views, `Map`, `Set`, and sanitized errors are copied into the guest. |
+| Host/platform objects | `window`, `document`, DOM nodes, `Response`, `File`, `WebSocket`, Figma APIs, Node `process`/`fs`, and class instances are not injected directly. Expose narrow operations with `capability()` and return plain data. |
+
+`Proxy` is available when the host implements it, under a reviewed policy: the guest may wrap its own objects, wrapping protected intrinsics is blocked, and trap bodies execute as guest code with mediated entries (see [Security](docs/security.md)). If your guest does not need `Proxy`, treat it like any other optional intrinsic and keep its host availability in mind when reviewing the surface you expose.
+
+`security: "trusted"` can use arbitrary host objects by reference, including their methods, accessors, and prototype chains. Use it only when the compiled program is fully trusted. The threat model, policies, and audit record are in [Security](docs/security.md).
+
+## ES5.1 core and Babel downlevel
+
+The ES5.1 core is a deliberate, stable surface: small enough to keep the security boundary auditable and the compiler maintainable. Modern source should be downleveled with Babel or SWC before compilation — **Babel lowers syntax; sablejs controls execution**. Modern built-ins the host already implements (`Map`, `Set`, `Promise`, typed arrays, `Intl`) are exposed as optional intrinsics; features that would expand the language surface (Proxy semantics beyond the guest, module loaders, generator/async runtimes) are intentionally not added natively. See the [Roadmap](docs/roadmap.md) for what is planned and what is deliberately out of scope.
+
+## Compatibility
+
+| Surface | Current contract |
+| --- | --- |
+| Source | ES5.1; direct static `eval` and `Function` inputs are compiled ahead of time |
+| Output | CommonJS; bundle with esbuild for browsers |
+| Security | `sandbox` by default; explicit `trusted` pass-through mode |
+| Browsers | Chromium, Firefox, WebKit; main thread and Worker E2E |
+| Other hosts | Node 24, Deno 2, Bun |
+| Conformance | Test262 pinned to `3655e7464de3d52643ecddd4b5f9f4f3e7f62398` |
+
+Optional globals such as typed arrays, `Map`, `Promise`, and `Intl` follow host availability.
+
+## Performance
+
+Three-run medians on the Linux x64 reference machine (methodology, exclusions, and variance: [Performance](docs/performance.md)):
+
+| Backend | V8 Benchmark Suite 7 score | vs sandbox |
+| --- | ---: | ---: |
+| sablejs O2 sandbox | 1,395 | — |
+| sablejs O2 trusted | 2,070 | 1.48x |
+| QuickJS-WASM 0.32.0 | 1,083 | 0.78x |
+
+| Suite | sablejs trusted | sablejs sandbox | QuickJS-WASM |
+| --- | ---: | ---: | ---: |
+| Octane 2.0 geometric score | 2,205 | 1,772 | 1,413 |
+| SunSpider 1.0 total (23 tests, ms) | 302.9 | 482.3 | 619.0 |
+| Kraken 1.1 total (14 tests, ms) | 6,094.2 | 20,829.8 | 22,402.1 |
+
+Sandbox retains 67.4% of trusted throughput on V8 Benchmark Suite 7 under this harness, and beats QuickJS-WASM on all eight real-world workloads. These numbers characterize this benchmark and harness, not universal application performance. A 137 KB benchmark source compiles to a 571 KB minified sandbox bundle — 82 KB gzipped.
+
+## Security
+
+An internal boundary audit completed on 2026-08-22 found no known usable escape within the tested threat model — no host-code execution and no host-object-graph access through the reviewed paths. The adversarial battery of 100+ probes runs across the O0/O1/O2/Os optimization levels (110 tests, 0 skipped), and a differential fuzzer compares sablejs against native V8 and QuickJS on generated programs. Security depends on the combination: `sandbox` mode + a dedicated Worker + narrow capabilities + correct host integration. Threat model, trust boundaries, and policies: [Security](docs/security.md).
+
+## Documentation
+
+[Architecture](docs/architecture.md) · [Performance](docs/performance.md) · [Security](docs/security.md) · [Worker isolation](docs/worker-isolation.md) · [Roadmap](docs/roadmap.md)
+
+## Development
+
+```sh
+npm ci
+npm test                        # unit + adversarial battery
+npm run test:e2e:build && npm run test:e2e:node
+npm run benchmark:smoke
 ```
 
-- VM.prototype.isUndefined(value)
-  - value: Value
-  - `return` Boolean
+Semantic changes must also pass the pinned Test262 gate, and performance changes use three measured runs — both command lists are in [Architecture](docs/architecture.md) (Verification) and [Performance](docs/performance.md) (Reproduction). Keep dependencies directed through `frontend -> ir -> backend -> compiler -> runtime`, add focused regression tests, and update the concise English documentation. The repository uses `package-lock.json` as its only lockfile.
 
-Used to determine if the type is `undefinend`.
+## License
 
-```javascript
-const vUndefined = vm.createUndefined();
-if(vm.isUndefined(vUndefined)) {
-  // ...
-}
-```
-
-- VM.prototype.isNull(value)
-  - value: Value
-  - `return` Boolean
-
-Used to determine if the type is `null`.
-
-```javascript
-const vNull = vm.createNull();
-if(vm.isNull(vNull)) {
-  // ...
-}
-```
-
-- VM.prototype.isBoolean(value)
-  - value: Value
-  - `return` Boolean
-
-Used to determine if the type is `bool`.
-
-```javascript
-const vBoolean = vm.createBoolean(true);
-if(vm.isBoolean(vBoolean)) {
-  // ...
-}
-```
-
-- VM.prototype.isNumber(value)
-  - value: Value
-  - `return` Boolean
-
-Used to determine if the type is `number`.
-
-```javascript
-const vNumber = vm.createNumber(1024);
-if(vm.isNumber(vNumber)) {
-  // ...
-}
-```
-
-- VM.prototype.isString(value)
-  - value: Value
-  - `return` Boolean
-
-Used to determine if the type is `string`.
-
-```javascript
-const vString = vm.createString("Hello World!");
-if(vm.isString(vString)) {
-  // ...
-}
-```
-
-- VM.prototype.isObject(value)
-  - value: Value
-  - `return` Boolean
-
-Used to determine if the type is `object`.
-
-```javascript
-const vObject = vm.createObject();
-const vArray = vm.createArray();
-if(vm.isObject(vObject) && vm.isObject(vArray)) {
-  // ...
-}
-```
-
-- VM.prototype.isArray(value)
-  - value: Value
-  - `return` Boolean
-
-Used to determine if the type is `array`.
-
-```javascript
-const vArray = vm.createArray();
-if(vm.isArray(vArray)) {
-  // ...
-}
-```
-
-- VM.prototype.isFunction(value)
-  - value: Value
-  - `return` Boolean
-
-Used to determine if the type is `function`.
-
-```javascript
-const vFunction = vm.createFunction("log", function(){});
-if(vm.isFunction(vFunction)){
-  // ...
-}
-```
-
-- VM.prototype.isError(value)
-  - value: Value
-  - `return` Boolean
-
-Used to determine if the type is `error`.
-
-```javascript
-const vError = vm.createError('unknown error');
-if(vm.isError(vError)){
-  // ...
-}
-```
-
-- VM.prototype.isRegExp(value)
-  - value: Value
-  - `return` Boolean
-
-Used to determine if the type is `regexp`.
-
-```javascript
-const vRegExp = vm.createRegExp("\\w+", "ig");
-if(vm.isRegExp(vRegExp)){
-  // ...
-}
-```
-
-- VM.prototype.isDate(value)
-  - value: Value
-  - `return` Boolean
-
-Used to determine if the type is `date`.
-
-```javascript
-const vDate = vm.createDate();
-if(vm.isDate(vDate)){
-  // ...
-}
-```
-
-- VM.prototype.asUndefined(value)
-  - value: Value
-  - `return` undefined
-
-Converting `undefined` boxed type to `plain undefined` value.
-
-```javascript
-const vUndefined = vm.createUndefined();
-vm.asUndefined(vUndefined) === undefined;
-```
-
-- VM.prototype.asNull(value)
-  - value: Value
-  - `return` null
-
-Converting `null` boxed type to `plain null` value.
-
-```javascript
-const vNull = vm.createNull();
-vm.asNull(vNull) === null;
-```
-
-- VM.prototype.asBoolean(value)
-  - value: Value
-  - `return` Boolean
-
-Converting `bool` boxed type to `plain bool` value.
-
-```javascript
-const vBoolean = vm.createBoolean(true);
-const boolean = vm.asBoolean(vBoolean);
-if(boolean === true) {
-  // ...
-}
-```
-
-- VM.prototype.asNumber(value)
-  - value: Value
-  - `return` Number
-
-Converting `number` boxed type to `plain number` value.
-
-```javascript
-const vNumber = vm.createNumber(1024);
-const number = vm.asNumber(vNumber);
-if(number === 1024) {
-  // ...
-}
-```
-
-- VM.prototype.asString(value)
-  - value: Value
-  - `return` String
-
-Converting `string` boxed type to `plain string` value.
-
-```javascript
-const vString = vm.createString('Hello World!');
-const string = vm.asString(vString);
-if(string === 'Hello World!') {
-  // ...
-}
-```
-
-- VM.prototype.asObject(value)
-  - value: Value
-  - `return` Object
-
-Converting `object` boxed type to `inner object` value.
-
-```javascript
-const vObject = vm.createFunction("asObject", function(){});
-const object = vm.asObject(vObject);
-if(object.type === 12) {
-  // ...
-}
-```
-
-- VM.prototype.instanceof(lval, rval)
-  - lval: Value
-  - rval: Value
-  - `return` Boolean
-
-Equivalent to the `instanceof` keyword.
-
-```javascript
-const global = vm.getGlobal();
-const vDateFunc = vm.getProperty(global, "Date");
-const vDate = vm.createDate();
-if(vm.instanceof(vDate, vDateFunc)) {
-  // ...
-}
-```
-
-- VM.prototype.typeof(value)
-  - value: Value
-  - `return` String
-
-Equivalent to the `typeof` keyword.
-
-```javascript
-const vString = vm.createString('Hello World!');
-if(vm.typeof(vString) === "string") {
-  // ...
-}
-```
-
-- VM.prototype.getProperty(value, name)
-  - value: Value
-  - name: String
-  - `return` Value
-
-Get the value of the property of the object. Return is a property boxed type.
-
-```javascript
-const global = vm.getGlobal();
-const vPrint = vm.getProperty(global, "print");
-if(vm.isFunction(vPrint)) {
-  // ...
-}
-```
-
-- VM.prototype.setProperty(value, name, property)
-  - value: Value
-  - name: String
-  - property: Value
-  - `return` Value
-
-Assigning the property to object. Return is a property boxed type.
-
-```javascript
-const global = vm.getGlobal();
-const console = vm.createObject();
-const log = vm.createFunction("log", function() {
-  // console.log impl
-});
-
-vm.setProperty(console, "log", log);
-vm.setProperty(global, "console", console);
-```
-
-- VM.prototype.deleteProperty(value, name)
-  - value: Value
-  - name: String
-  - `return` Boolean
-
-Delete the property of object.
-
-```javascript
-const global = vm.getGlobal();
-vm.deleteProperty(global, "print");
-
-const vPrint = vm.getProperty(global, "print");
-if(vm.isUndefined(vPrint)) {
-  // ...
-} 
-```
-
-- VM.prototype.defineProperty(value, name, desc)
-  - value: Value
-  - name: String
-  - desc: Object
-  - `return` Value
-
-Equivalent to the `Object.defineProperty` function.
-
-```javascript
-const vObject = vm.createObject();
-vm.defineProperty(vObject, "name", { 
-  value: vm.createString("sablejs"),
-});
-
-const getter = vm.createFunction("getter", function() {
-  return vm.createNumber("101");
-});
-
-const setter = vm.createFunction("setter", function(age) {
-  vm.setProperty(this, "__age__", age);
-});
-
-vm.defineProperty(vObject, "age", {
-  enumerable: false,
-  get: getter,
-  set: setter,
-});
-
-```
-
-- VM.prototype.getPrototype(value)
-  - value: Value
-  - `return` Value
-
-Get the prototype of object.
-
-```javascript
-const global = vm.getGlobal();
-const vStringFunc = vm.getProperty(global, "String");
-if(!vm.isUndefined(vStringFunc)) {
-  const vTrimStart = vm.createFunction("trimStart", function() {
-    const str = vm.asString(this);
-    return vm.createString(str);
-  });
-
-  const vStringFuncProto = vm.getPrototype(vStringFunc);
-  vm.setProperty(vStringFuncProto, "trimStart", vTrimStart);
-}
-```
-
-- VM.prototype.setPrototype(value, prototype)
-  - value: Value
-  - prototype: Value
-  - `return` Value
-
-Set the prototype of object.
-
-```javascript
-const vA = vm.createFunction("A", function() {});
-const vObject = vm.createObject();
-
-vm.setProperty(vObject, 'name', vm.createString('Hello World!'));
-vm.setPrototype(vA, vObject);
-```
-
-- VM.prototype.throw(value)
-  - value: Value
-  - `return` undefined
-
-Equivalent to the `throw` keyword.
-
-```javascript
-const vError = vm.createError('unknown error');
-vm.throw(vError);
-```
-
-- VM.prototype.new(func[, arg1, arg2, arg3...])
-  - func: Value
-  - arg: Value
-  - `return` Value
-
-Equivalent to the `new` keyword.
-
-```javascript
-const vA = vm.createFunction('A', function(name) {
-  vm.setProperty(this, 'name', name);
-});
-
-vm.new(vA, vm.createString("A"));
-```
-
-- VM.prototype.call(func, thisPtr[, arg1, arg2, arg3...])
-  - func: Value
-  - thisPtr: Value | undefined
-  - arg: Value
-  - `return` Value
-
-Equivalent to the `Function.prototype.call` function.
-
-```javascript
-const vLog = vm.createFunction('log', function() {
-  const temp = [];
-  for(let i = 0; i < arguments.length; i++){
-    temp.push(vm.asString(arguments[i]));
-  }
-  console.log(...temp); // '1', 1, false
-});
-
-vm.call(
-  vLog, 
-  vm.createUndefined(), 
-  vm.createString('1'), 
-  vm.createNumber(1), 
-  vm.createBoolean(false)
-);
-```
-
-- VM.prototype.destroy
-  - `return` undefined
-
-Destroy the VM instance.
-
-```javascript
-vm.destroy();
-```
-
-### Benchmark
-
-sablejs may be the fastest interpreter written in JavaScript ([using v8 benchmark suites](https://github.com/mozilla/arewefastyet/tree/master/benchmarks/v8-v7)):
-
-> Benchmark Enviorment:
->
-> - Node.js v12.19.0
-> - Golang 1.15.6
-> - GCC 5.4.0 -O3
-> - 2.4 GHz Intel Core i9
-> - MacOS Mojave 10.14.6 (18G6032)
-
-|               | sablejs    | sval       | eval5      | quickjs-wasm    | goja   |
-| ------------- | ---------- | ---------- | ---------- | --------------- | ------ |
-| Language      | JavaScript | JavaScript | JavaScript | C + WebAssembly | Golang |
-| Richards      | 110        | 24.9       | 24.7       | 376             | 208    |
-| Crypto        | 114        | 24.6       | 20.2       | 400             | 104    |
-| RayTrace      | 258        | 92.2       | 98.5       | 471             | 294    |
-| NavierStokes  | 183        | 35.9       | 49.8       | 665             | 191    |
-| DeltaBlue     | 120        | 35.3       | 29.5       | 402             | 276    |
-| Total score   | 148        | 37.3       | 37.3       | 452             | 202    |
-| Baseline      | 1          | ▼ 2.96     | ▼ 2.96     | ▲ 2.05          | ▲ 0.36 |
-| File Size(KB) | 216        | 152        | 134        | 434             | -      |
-| Gzip Size(KB) | 29         | 40         | 34         | 245             | -      |
-
-### Limits
-
-1. Dynamic execution by `eval` and `Function` is forbidden, but passing literal string/number/null and undefined is allowed (the interpreter doesn't contain any compiler).
-
-```javascript
-eval("print('Hello World!')"); // it's ok
-eval("var " + "a=1"); // it's ok
-
-var str = "Hello World!";
-eval("print('" + str + "')"); // throw SyntaxError
-
-Function("a", "b", "return a+b"); // it's ok
-new Function("a", "b", "return a+b"); // it's ok
-
-var str = "return a+b";
-Function("a", "b", str); // throw SyntaxError
-new Function("a", "b", str); // throw SyntaxError
-```
-
-2. The browser environment relies on native browser functions such as `btoa` / `unescape` / `decodeURIComponent`, etc. if you need support for IE9 or below, you need to add shims.
-
-
-### Bindings
-* [cax2sablejs](https://github.com/sablejs/cax4sablejs) - Canvas2D rendering engine for sablejs
-* [ajax2sablejs](https://github.com/sablejs/ajax4sablejs) - A tiny and simple ajax for sablejs
-
-### License
-
-sablejs JavaScript Engine
-
-Copyright (c) 2020-Now ErosZhao
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-Non-profit projects of individuals or organizations and commercial projects with
-commercial authorization of the author.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
-THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
-THE SOFTWARE.
+[Apache-2.0](LICENSE)

@@ -1,0 +1,302 @@
+"use strict";
+
+// Differential fuzzing for the ES5.1 semantics: generate random programs,
+// run each in sablejs (trusted), native V8, and QuickJS-WASM, and compare
+// the JSON-stringified result or the exception name. Mismatching cases are
+// saved with their seed and minimized by statement-level delta debugging.
+//
+//   node test/differential/fuzz.js --seed=1 --cases=2000 [--minimize]
+//
+// Native V8 is the ES5.1 reference oracle; QuickJS is a second witness.
+// sablejs must agree with V8; three-way disagreements are reported with
+// both witnesses.
+
+const fs = require("fs");
+const path = require("path");
+const { performance } = require("perf_hooks");
+const { compile } = require("../../src/compiler");
+const { getQuickJS } = require("quickjs-emscripten");
+
+const runtimeModule = path.resolve(__dirname, "../../src/runtime");
+const failureDirectory = path.resolve(__dirname, "../../.cache/differential-failures");
+
+function argument(name, fallback) {
+  const prefix = `--${name}=`;
+  const value = process.argv.find((entry) => entry.startsWith(prefix));
+  return value ? value.slice(prefix.length) : fallback;
+}
+
+function mulberry32(seed) {
+  let state = seed >>> 0;
+  return function random() {
+    state = (state + 0x6d2b79f5) >>> 0;
+    let value = state;
+    value = Math.imul(value ^ (value >>> 15), value | 1);
+    value ^= value + Math.imul(value ^ (value >>> 7), value | 61);
+    return ((value ^ (value >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+function pick(random, items) {
+  return items[Math.floor(random() * items.length)];
+}
+
+class Generator {
+  constructor(seed) {
+    this.random = mulberry32(seed);
+  }
+
+  number() {
+    const roll = this.random();
+    if (roll < 0.2) return String(Math.floor(this.random() * 100) - 50);
+    if (roll < 0.4) return String(Math.floor(this.random() * 10));
+    if (roll < 0.5) return (this.random() * 100).toFixed(3);
+    return String(Math.floor(this.random() * 4));
+  }
+
+  string() {
+    const fragments = ["a", "ab", "abc", "1", "1.5", "true", "null", "", "-0", "1e3", " "];
+    return JSON.stringify(pick(this.random, fragments) + (this.random() < 0.5 ? pick(this.random, fragments) : ""));
+  }
+
+  expression(depth, variables) {
+    const random = this.random;
+    if (depth <= 0 || random() < 0.25) {
+      const kind = Math.floor(random() * 5);
+      if (kind === 0) return this.number();
+      if (kind === 1) return this.string();
+      if (kind === 2) return pick(random, ["true", "false", "null", "void 0"]);
+      if (kind === 3 && variables.length) return pick(random, variables);
+      return this.number();
+    }
+    const kind = Math.floor(random() * 8);
+    switch (kind) {
+      case 0: {
+        const operator = pick(random, ["+", "-", "*", "/", "%", "<", ">", "<=", ">=", "==", "!=", "===", "!==", "&", "|", "^", "<<", ">>"]);
+        return `(${this.expression(depth - 1, variables)} ${operator} ${this.expression(depth - 1, variables)})`;
+      }
+      case 1: {
+        const operator = pick(random, ["&&", "||"]);
+        return `(${this.expression(depth - 1, variables)} ${operator} ${this.expression(depth - 1, variables)})`;
+      }
+      case 2:
+        return `(${pick(random, ["!", "-", "+", "~", "typeof "])}${this.expression(depth - 1, variables)})`;
+      case 3:
+        return `(${this.expression(depth - 1, variables)} ? ${this.expression(depth - 1, variables)} : ${this.expression(depth - 1, variables)})`;
+      case 4:
+        return `[${this.expression(depth - 1, variables)}, ${this.expression(depth - 1, variables)}, ${this.expression(depth - 1, variables)}]`;
+      case 5:
+        return `({ a: ${this.expression(depth - 1, variables)}, b: ${this.expression(depth - 1, variables)} })`;
+      case 6:
+        return `(${this.expression(depth - 1, variables)})[${pick(random, ["\"a\"", "\"b\"", "\"length\"", "0", "1"])}]`;
+      case 7:
+      default:
+        return `${pick(random, ["f0", "f1"])}(${this.expression(depth - 1, variables)}, ${this.expression(depth - 1, variables)})`;
+    }
+  }
+
+  statement(depth, variables, output) {
+    const random = this.random;
+    const kind = Math.floor(random() * 6);
+    switch (kind) {
+      case 0: {
+        const name = `v${Math.floor(random() * 4)}`;
+        output.push(`var ${name} = ${this.expression(depth, variables)};`);
+        return name;
+      }
+      case 1: {
+        const name = `v${Math.floor(random() * 4)}`;
+        output.push(`${name} = ${this.expression(depth, variables)};`);
+        return name;
+      }
+      case 2: {
+        output.push(`if (${this.expression(depth, variables)}) {`);
+        output.push(`  v1 = ${this.expression(depth, variables)};`);
+        output.push("} else {");
+        output.push(`  v2 = ${this.expression(depth, variables)};`);
+        output.push("}");
+        return null;
+      }
+      case 3: {
+        output.push(`for (var i = 0; i < ${1 + Math.floor(random() * 4)}; i++) {`);
+        output.push(`  v3 = ${this.expression(depth, variables)};`);
+        output.push("}");
+        return null;
+      }
+      case 4: {
+        output.push(`while (${this.expression(depth, variables)}) {`);
+        output.push(`  v0 = ${this.expression(depth, variables)};`);
+        output.push("  break;");
+        output.push("}");
+        return null;
+      }
+      case 5:
+      default:
+        output.push(`${this.expression(depth, variables)};`);
+        return null;
+    }
+  }
+
+  functionBody(depth, name) {
+    const output = [];
+    const variables = ["a", "b", "v0", "v1", "v2", "v3"];
+    for (let index = 0; index < 4; index += 1) {
+      output.push(`var v${index} = ${this.expression(depth - 1, variables)};`);
+    }
+    for (let index = 0; index < 3; index += 1) this.statement(depth, variables, output);
+    output.push(`return ${this.expression(depth - 1, variables)};`);
+    return output;
+  }
+
+  program() {
+    const lines = ["\"use strict\";"];
+    for (let index = 0; index < 2; index += 1) {
+      const depth = 1 + Math.floor(this.random() * 3);
+      lines.push(`function f${index}(a, b) {`);
+      this.functionBody(depth).forEach((line) => lines.push(`  ${line}`));
+      lines.push("}");
+    }
+    lines.push("function main() {");
+    this.functionBody(1 + Math.floor(this.random() * 3)).forEach((line) => lines.push(`  ${line}`));
+    lines.push("}");
+    // The completion value is the stringified result; all three engines
+    // (indirect eval, sablejs run, quickjs evalCode) agree on it.
+    lines.push("JSON.stringify(main());");
+    return lines.join("\n");
+  }
+}
+
+function runNative(source) {
+  try {
+    const indirectEval = globalThis.eval;
+    return { ok: true, value: indirectEval(source) };
+  } catch (error) {
+    return { ok: false, error: error && error.name };
+  }
+}
+
+function runSableJS(source) {
+  try {
+    const compiled = compile(source, { optimization: "O2", security: "trusted", runtimeModule });
+    const generatedModule = { exports: {} };
+    new Function("require", "module", "exports", compiled.code)(require, generatedModule, generatedModule.exports);
+    const instance = generatedModule.exports.createInstance({});
+    try { return { ok: true, value: instance.run() }; } finally { instance.dispose(); }
+  } catch (error) {
+    return { ok: false, error: error && error.name };
+  }
+}
+
+async function createQuickJS() {
+  const QuickJS = await getQuickJS();
+  // One context per case: a WASM stack overflow (infinite recursion in a
+  // generated program) surfaces as a native throw that leaves the runtime
+  // dirty; a dirty context cannot even be disposed, so it is intentionally
+  // leaked and a fresh context serves the next case.
+  return {
+    run(source) {
+      let context;
+      let dirty = false;
+      try {
+        context = QuickJS.newContext();
+        const result = context.evalCode(source, "fuzz.js");
+        if (result.error) {
+          const error = context.dump(result.error);
+          result.error.dispose();
+          return { ok: false, error: error && error.name };
+        }
+        const value = context.dump(result.value);
+        result.value.dispose();
+        return { ok: true, value };
+      } catch (error) {
+        dirty = true;
+        return { ok: false, error: error && error.name };
+      } finally {
+        // A dirty runtime aborts the process if disposed; leak it instead.
+        if (context && !dirty) context.dispose();
+      }
+    },
+    dispose() {},
+  };
+}
+
+function same(left, right) {
+  return left.ok === right.ok && (left.ok ? left.value === right.value : left.error === right.error);
+}
+
+function minimize(source, seed) {
+  // Statement-level delta debugging over the main() body: keep dropping
+  // non-controversial statement chunks while the mismatch persists.
+  const chunks = source.split(";");
+  let changed = true;
+  while (changed) {
+    changed = false;
+    const stride = Math.max(1, Math.floor(chunks.length / 2));
+    for (let start = 0; start < chunks.length; start += stride) {
+      const candidate = chunks.slice(0, start).concat(chunks.slice(start + stride));
+      const candidateSource = candidate.join(";");
+      const native = runNative(candidateSource);
+      const sable = runSableJS(candidateSource);
+      if (native.ok && sable.ok && native.value !== sable.value) {
+        chunks.splice(start, stride);
+        changed = true;
+        break;
+      }
+    }
+  }
+  return chunks.join(";");
+}
+
+async function main() {
+  const seed = Number(argument("seed", "1"));
+  const cases = Number(argument("cases", "1000"));
+  const shouldMinimize = process.argv.includes("--minimize");
+  const quiet = process.argv.includes("--quiet");
+  fs.mkdirSync(failureDirectory, { recursive: true });
+  const quickjs = await createQuickJS();
+  const startedAt = performance.now();
+  const mismatches = [];
+
+  for (let index = 0; index < cases; index += 1) {
+    const caseSeed = seed + index;
+    const source = new Generator(caseSeed).program();
+    const native = runNative(source);
+    const sable = runSableJS(source);
+    const quick = quickjs.run(source);
+
+    if (!same(native, sable)) {
+      mismatches.push({ seed: caseSeed, source, native, sable, quick });
+      const suffix = shouldMinimize ? ".min.js" : ".js";
+      fs.writeFileSync(path.join(failureDirectory, `seed-${caseSeed}${suffix}`), source);
+      if (shouldMinimize) {
+        const minimized = minimize(source, caseSeed);
+        fs.writeFileSync(path.join(failureDirectory, `seed-${caseSeed}.min.js`), minimized);
+      }
+      if (!quiet) {
+        console.log(`MISMATCH seed=${caseSeed}: native=${JSON.stringify(native)} sablejs=${JSON.stringify(sable)} quickjs=${JSON.stringify(quick)}`);
+      }
+    }
+    if (!quiet && (index + 1) % 500 === 0) {
+      console.log(`[differential] ${index + 1}/${cases} cases, ${mismatches.length} mismatches`);
+    }
+  }
+  quickjs.dispose();
+  const elapsedMs = performance.now() - startedAt;
+  console.log(JSON.stringify({
+    seed,
+    cases,
+    mismatches: mismatches.length,
+    elapsedMs: Math.round(elapsedMs),
+    failures: mismatches.slice(0, 10).map((m) => ({ seed: m.seed, native: m.native, sablejs: m.sable, quickjs: m.quick })),
+  }, null, 2));
+  if (mismatches.length) process.exitCode = 1;
+}
+
+module.exports = { Generator, minimize, runNative, runSableJS, same };
+
+if (require.main === module) {
+  main().catch((error) => {
+    console.error(error && error.stack || error);
+    process.exitCode = 1;
+  });
+}

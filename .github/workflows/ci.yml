@@ -1,0 +1,78 @@
+name: Ubuntu CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    name: Unit, Test262, and performance smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24.x
+          cache: npm
+      - name: Install locked dependencies
+        run: npm ci
+      - name: Run unit tests
+        run: npm test
+      - name: Fetch pinned Test262 revision
+        run: npm run upstream:fetch -- test262
+      - name: Run ES5.1 Test262 gate
+        run: npm run test262
+      - name: Run performance smoke test
+        run: npm run benchmark:smoke
+
+  runtimes:
+    name: Node, Deno, and Bun E2E
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24.x
+          cache: npm
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - name: Install locked dependencies
+        run: npm ci
+      - name: Build portable E2E artifact
+        run: npm run test:e2e:build
+      - name: Run on Node
+        run: npm run test:e2e:node
+      - name: Run on Deno
+        run: npm run test:e2e:deno
+      - name: Run on Bun
+        run: npm run test:e2e:bun
+
+  browsers:
+    name: Chromium, Firefox, and WebKit E2E
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24.x
+          cache: npm
+      - name: Install locked dependencies
+        run: npm ci
+      - name: Install browser engines
+        run: npx playwright install --with-deps chromium firefox webkit
+      - name: Build portable E2E artifact
+        run: npm run test:e2e:build
+      - name: Run browser and Worker E2E
+        run: npm run test:e2e:browsers

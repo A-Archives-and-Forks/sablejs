@@ -1,41 +1,61 @@
 {
   "name": "sablejs",
-  "version": "1.1.0",
-  "description": "🏖️ The safer and faster ECMA5.1 interpreter written by JavaScript.",
+  "version": "2.0.0",
+  "description": "ES5.1 native-object ahead-of-time compiler and runtime",
+  "main": "src/index.js",
+  "exports": {
+    ".": "./src/index.js",
+    "./runtime": "./src/runtime/index.js",
+    "./worker": "./src/worker.js"
+  },
+  "directories": {
+    "test": "test"
+  },
+  "scripts": {
+    "test": "node --test test/unit/*.test.js",
+    "test:differential": "node test/differential/fuzz.js --seed=1 --cases=2000 --quiet",
+    "fuzz:differential": "node test/differential/fuzz.js --seed=1 --cases=100000",
+    "test:unit": "node --test test/unit/*.test.js",
+    "test262": "node --expose-gc test/conformance/test262.js",
+    "test:e2e:build": "node test/e2e/build.js",
+    "test:e2e:node": "node .cache/e2e/program.js",
+    "test:e2e:deno": "deno run .cache/e2e/program.js",
+    "test:e2e:bun": "bun .cache/e2e/program.js",
+    "test:e2e:browsers": "playwright test --config=test/e2e/playwright.config.js",
+    "benchmark": "node --expose-gc benchmark/run.js",
+    "benchmark:artifacts": "node benchmark/artifacts.js",
+    "benchmark:octane": "node --expose-gc benchmark/octane.js",
+    "benchmark:sunspider": "node --expose-gc benchmark/sunspider.js",
+    "benchmark:kraken": "node --expose-gc benchmark/kraken.js",
+    "benchmark:workloads": "node --expose-gc benchmark/workloads.js",
+    "benchmark:release": "node --expose-gc benchmark/release.js",
+    "benchmark:smoke": "node --expose-gc benchmark/run.js --suite=Richards",
+    "upstream:fetch": "node tools/fetch-upstreams.js",
+    "build": "node tools/build.js",
+    "prepublishOnly": "npm run build"
+  },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/sablejs/sablejs.git"
   },
-  "scripts": {
-    "test262": "cd test && node test262.js",
-    "testapi": "cd test && mocha testapi.js",
-    "benchmark": "cd benchmark && node index.js"
-  },
-  "keywords": [
-    "javascript",
-    "interpreter",
-    "compiler",
-    "sandbox",
-    "opcode",
-    "ecma5"
-  ],
   "author": "ErosZhao",
-  "bin": "bin/sablejs",
+  "license": "Apache-2.0",
   "bugs": {
     "url": "https://github.com/sablejs/sablejs/issues"
   },
-  "homepage": "https://www.sablejs.com",
-  "dependencies": {
-    "chalk": "^4.1.1",
-    "commander": "^7.2.0",
-    "cross-spawn": "^7.0.3",
-    "enquirer": "^2.3.6",
-    "isdir": "^2.0.1",
-    "nodejs-file-downloader": "^4.5.1",
-    "terminal-kit": "^2.1.2",
-    "walkdir": "^0.4.1"
-  },
+  "homepage": "https://github.com/sablejs/sablejs#readme",
   "devDependencies": {
-    "mocha": "^8.4.0"
+    "@babel/core": "7.29.7",
+    "@babel/preset-env": "7.29.7",
+    "@playwright/test": "1.62.1",
+    "esbuild": "0.28.2",
+    "prettier": "2.8.8",
+    "quickjs-emscripten": "^0.32.0",
+    "uglify-js": "3.19.3",
+    "yaml": "2.9.0"
+  },
+  "dependencies": {
+    "acorn": "8.18.0",
+    "chalk": "4.1.2"
   }
 }

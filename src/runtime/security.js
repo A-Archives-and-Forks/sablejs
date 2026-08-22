@@ -1,0 +1,645 @@
+"use strict";
+
+const CAPABILITY_RECORDS = new WeakMap();
+// Wrapper -> raw host target. Stored as a symbol-keyed property instead of a
+// WeakMap lookup on the hot paths. The symbol is guest-invisible: every
+// introspection entry point (Object.getOwnPropertySymbols and friends) is
+// redirected through propertyTarget, so it surfaces the raw target's own
+// symbols rather than the wrapper's tag.
+const HOST_TARGET = Symbol("sablejs.hostTarget");
+const OBJECT_CREATE = Object.create;
+const OBJECT_DEFINE_PROPERTY = Object.defineProperty;
+const OBJECT_FREEZE = Object.freeze;
+const OBJECT_GET_OWN_PROPERTY_DESCRIPTOR = Object.getOwnPropertyDescriptor;
+const OBJECT_GET_PROTOTYPE_OF = Object.getPrototypeOf;
+const OBJECT_PROTOTYPE = Object.prototype;
+const OWN_KEYS = Reflect.ownKeys;
+const REFLECT_APPLY = Reflect.apply;
+const REFLECT_CONSTRUCT = Reflect.construct;
+const REFLECT_GET = Reflect.get;
+const FUNCTION_APPLY = Function.prototype.apply;
+const FUNCTION_BIND = Function.prototype.bind;
+const FUNCTION_CALL = Function.prototype.call;
+
+const CODE_CONSTRUCTORS = new Set([Function]);
+try { CODE_CONSTRUCTORS.add((async function () {}).constructor); } catch (_) {}
+try { CODE_CONSTRUCTORS.add((function* () {}).constructor); } catch (_) {}
+try { CODE_CONSTRUCTORS.add((async function* () {}).constructor); } catch (_) {}
+
+const MUTATES_ARGUMENT_ZERO = new Set([
+  Object.assign,
+  Object.defineProperty,
+  Object.defineProperties,
+  Object.freeze,
+  Object.preventExtensions,
+  Object.seal,
+  Object.setPrototypeOf,
+  typeof Proxy === "function" && Proxy,
+  typeof Proxy === "function" && Proxy.revocable,
+  typeof Reflect === "object" && Reflect.defineProperty,
+  typeof Reflect === "object" && Reflect.deleteProperty,
+  typeof Reflect === "object" && Reflect.preventExtensions,
+  typeof Reflect === "object" && Reflect.set,
+  typeof Reflect === "object" && Reflect.setPrototypeOf,
+].filter(Boolean));
+
+const INSPECTS_ARGUMENT_ZERO = new Set([
+  Object.getOwnPropertyDescriptor,
+  Object.getOwnPropertyDescriptors,
+  Object.getOwnPropertyNames,
+  Object.getOwnPropertySymbols,
+  Object.getPrototypeOf,
+  Object.isExtensible,
+  Object.isFrozen,
+  Object.isSealed,
+  Object.keys,
+  typeof Reflect === "object" && Reflect.getOwnPropertyDescriptor,
+  typeof Reflect === "object" && Reflect.getPrototypeOf,
+  typeof Reflect === "object" && Reflect.isExtensible,
+  typeof Reflect === "object" && Reflect.ownKeys,
+].filter(Boolean));
+
+const CAPTURE_STACK_TRACE = typeof Error.captureStackTrace === "function" && Error.captureStackTrace;
+const FUNCTION_TO_STRING = Function.prototype.toString;
+
+const MUTATES_RECEIVER = new Set();
+function addMutators(prototype, names) {
+  if (!prototype) return;
+  for (const name of names) {
+    const descriptor = OBJECT_GET_OWN_PROPERTY_DESCRIPTOR(prototype, name);
+    if (descriptor && typeof descriptor.value === "function") {
+      MUTATES_RECEIVER.add(descriptor.value);
+    }
+  }
+}
+addMutators(Object.prototype, ["__defineGetter__", "__defineSetter__"]);
+const OBJECT_PROTO_DESCRIPTOR = OBJECT_GET_OWN_PROPERTY_DESCRIPTOR(Object.prototype, "__proto__");
+if (OBJECT_PROTO_DESCRIPTOR && typeof OBJECT_PROTO_DESCRIPTOR.set === "function") {
+  MUTATES_RECEIVER.add(OBJECT_PROTO_DESCRIPTOR.set);
+}
+addMutators(Array.prototype, [
+  "copyWithin", "fill", "pop", "push", "reverse", "shift", "sort", "splice", "unshift",
+]);
+addMutators(Date.prototype, OWN_KEYS(Date.prototype).filter((key) =>
+  typeof key === "string" && key.startsWith("set")
+));
+addMutators(typeof Map === "function" && Map.prototype, ["clear", "delete", "set"]);
+addMutators(typeof Set === "function" && Set.prototype, ["add", "clear", "delete"]);
+addMutators(typeof WeakMap === "function" && WeakMap.prototype, ["delete", "set"]);
+addMutators(typeof WeakSet === "function" && WeakSet.prototype, ["add", "delete"]);
+addMutators(typeof RegExp === "function" && RegExp.prototype, ["compile"]);
+for (const name of [
+  "Int8Array", "Uint8Array", "Uint8ClampedArray", "Int16Array", "Uint16Array",
+  "Int32Array", "Uint32Array", "Float32Array", "Float64Array", "BigInt64Array", "BigUint64Array",
+]) {
+  const constructor = globalThis[name];
+  addMutators(constructor && constructor.prototype, ["copyWithin", "fill", "reverse", "set", "sort"]);
+}
+
+function boundaryError(message) {
+  const error = new TypeError(`sablejs sandbox boundary: ${message}`);
+  // Boundary violations propagate into guest catch blocks; strip the stack
+  // so host file paths and frames never cross the boundary.
+  try { delete error.stack; } catch (_) {}
+  return error;
+}
+
+function capability(callable, options = {}) {
+  if (typeof callable !== "function") throw new TypeError("sablejs capability requires a function");
+  if (options == null || typeof options !== "object") {
+    throw new TypeError("sablejs capability options must be an object");
+  }
+  const token = OBJECT_FREEZE(OBJECT_CREATE(null));
+  CAPABILITY_RECORDS.set(token, {
+    callable,
+    name: typeof options.name === "string" ? options.name : callable.name || "capability",
+    thisValue: options.thisValue,
+  });
+  return token;
+}
+
+function safeError(error) {
+  let name = "Error";
+  let message = "Host capability failed";
+  try { if (error && typeof error.name === "string") name = error.name; } catch (_) {}
+  try {
+    if (error && typeof error.message === "string") message = error.message;
+    else if (typeof error === "string") message = error;
+  } catch (_) {}
+  const sanitized = new Error(message);
+  sanitized.name = name;
+  try { delete sanitized.stack; } catch (_) {}
+  return sanitized;
+}
+
+function isPlainObject(value) {
+  const prototype = OBJECT_GET_PROTOTYPE_OF(value);
+  return prototype === OBJECT_PROTOTYPE || prototype === null;
+}
+
+function isObject(value) {
+  return (typeof value === "object" && value !== null) || typeof value === "function";
+}
+
+function collectIntrinsicGraph(roots) {
+  const graph = new WeakSet();
+  const pending = roots.filter(isObject);
+  while (pending.length) {
+    const value = pending.pop();
+    if (graph.has(value)) continue;
+    graph.add(value);
+    let prototype;
+    try { prototype = OBJECT_GET_PROTOTYPE_OF(value); } catch (_) { prototype = null; }
+    if (isObject(prototype) && !graph.has(prototype)) pending.push(prototype);
+    let keys;
+    try { keys = OWN_KEYS(value); } catch (_) { keys = []; }
+    for (const key of keys) {
+      let descriptor;
+      try { descriptor = OBJECT_GET_OWN_PROPERTY_DESCRIPTOR(value, key); } catch (_) { descriptor = null; }
+      if (!descriptor) continue;
+      for (const candidate of [descriptor.value, descriptor.get, descriptor.set]) {
+        if (isObject(candidate) && !graph.has(candidate)) pending.push(candidate);
+      }
+    }
+  }
+  return graph;
+}
+
+// The protected-intrinsic graph is host state captured once and shared by
+// every sandbox instance: walking it per instance dominates short-program
+// startup (~48% of createInstance). Contract: the host must not extend
+// intrinsic prototypes after the first sandbox instance is created.
+let sharedIntrinsicGraph = null;
+function protectedIntrinsicGraph(roots) {
+  if (sharedIntrinsicGraph === null) sharedIntrinsicGraph = collectIntrinsicGraph(roots);
+  return sharedIntrinsicGraph;
+}
+
+class SandboxBoundary {
+  constructor(intrinsics, isDisposed, profile = false) {
+    this.isDisposed = isDisposed;
+    this.profiling = profile;
+    // Opt-in hot-path counters for sandbox-tax analysis. `profileBoundary`
+    // must be enabled at createInstance; counting is skipped otherwise.
+    this.stats = {
+      calls: 0, // boundary.call entries
+      guestCalls: 0, // guest-function dispatch (counter + apply)
+      hostCalls: 0, // callHost mediations
+      constructs: 0, // boundary.construct entries
+      writeTargets: 0, // property writes resolved through the boundary
+      mediatedGets: 0, // boundary.get reads
+      functionWrites: 0, // property writes whose value needed securing
+      argumentCopies: 0, // secureArguments had to copy the args array
+      wrapperCreations: 0, // wrapHostFunction calls
+      blocked: 0, // boundary violations thrown
+    };
+    this.count = this.profiling
+      ? (key) => { this.stats[key] += 1; }
+      : () => {};
+    this.ambientValues = new WeakSet();
+    this.ambientValues.add(globalThis);
+    if (typeof globalThis.process === "object" && globalThis.process !== null) {
+      this.ambientValues.add(globalThis.process);
+    }
+    this.guestFunctions = new WeakSet();
+    this.protectedValues = protectedIntrinsicGraph(intrinsics);
+    this.hostFunctionWrappers = new WeakMap();
+    // Monomorphic identity cache for pure-intrinsic calls, and a lazily
+    // computed pure-intrinsic classification per target: both serve the
+    // intrinsic-call hot path without per-call guard-set lookups.
+    this.pureIntrinsicCache = new WeakMap();
+    this.cachedPureCallable = null;
+    this.cachedPureTarget = null;
+    this.pendingGuestEntries = 0;
+    // True while run() executes the program. Host-initiated guest entries
+    // (a returned function called from the host) are detected by this flag
+    // being false; nested host-callback entries during execution keep guest
+    // reference semantics.
+    this.guestExecutionActive = false;
+    const boundary = this;
+    this.functionConstructor = function sableDynamicFunctionBoundary() {
+      throw boundaryError("dynamic code constructors are disabled");
+    };
+    this.registerGuestFunction(this.functionConstructor);
+    // Shared redaction installed as the wrappers' own toString so direct
+    // reads disclose nothing about boundary internals.
+    this.redactedToString = () => "function () { [sablejs sandbox boundary] }";
+    this.registerGuestFunction(this.redactedToString);
+  }
+
+  registerGuestFunction(callable) {
+    this.guestFunctions.add(callable);
+    return callable;
+  }
+
+  consumeInternalGuestEntry() {
+    if (this.pendingGuestEntries === 0) return false;
+    this.pendingGuestEntries -= 1;
+    return true;
+  }
+
+  importGlobals(globals) {
+    if (globals == null) return null;
+    if (typeof globals !== "object") throw boundaryError("globals must be an object");
+    return this.cloneValue(globals, "globals", "host-to-guest", new WeakMap());
+  }
+
+  exposeIntrinsic(value) {
+    return CODE_CONSTRUCTORS.has(value) ? this.functionConstructor : value;
+  }
+
+  isFunctionConstructor(value) {
+    return value === this.functionConstructor;
+  }
+
+  propertyTarget(value) {
+    if (value === this.functionConstructor) return Function;
+    return (value != null ? value[HOST_TARGET] : undefined) || value;
+  }
+
+  isProtected(value) {
+    const target = this.propertyTarget(value);
+    return isObject(target) && this.protectedValues.has(target);
+  }
+
+  assertMutable(value, operation = "modify") {
+    if (this.isProtected(value)) {
+      throw boundaryError(`cannot ${operation} a shared intrinsic`);
+    }
+  }
+
+  // Resolves the write target and asserts mutability in one pass for the hot
+  // property-write path.
+  writeTarget(value, operation = "modify") {
+    this.count("writeTargets");
+    if (value === this.functionConstructor) {
+      throw boundaryError(`cannot ${operation} a shared intrinsic`);
+    }
+    const target = (value != null ? value[HOST_TARGET] : undefined) || value;
+    if (isObject(target) && this.protectedValues.has(target)) {
+      throw boundaryError(`cannot ${operation} a shared intrinsic`);
+    }
+    return target;
+  }
+
+  secureValue(value) {
+    if (typeof value === "function") {
+      if (this.guestFunctions.has(value)) return value;
+      if (value[HOST_TARGET]) return value;
+      if (CODE_CONSTRUCTORS.has(value)) return this.functionConstructor;
+      return this.wrapHostFunction(value);
+    }
+    if (typeof value === "object" && value !== null && this.ambientValues.has(value)) {
+      throw boundaryError("an intrinsic exposed an ambient host object");
+    }
+    return value;
+  }
+
+  // Returns args unchanged when no element needs securing so the common
+  // no-function-argument case avoids allocating a copy per call.
+  secureArguments(args) {
+    for (let index = 0; index < args.length; index += 1) {
+      const value = args[index];
+      if (typeof value !== "function") continue;
+      const secured = this.secureValue(value);
+      if (secured === value) continue;
+      const copy = args.slice(0, index);
+      this.count("argumentCopies");
+      copy[index] = secured;
+      for (let rest = index + 1; rest < args.length; rest += 1) {
+        const candidate = args[rest];
+        if (typeof candidate === "function") {
+          const wrapped = this.secureValue(candidate);
+          copy[rest] = wrapped === candidate ? candidate : wrapped;
+        } else {
+          copy[rest] = candidate;
+        }
+      }
+      return copy;
+    }
+    return args;
+  }
+
+  // Host-initiated guest entries (calling a returned guest function, or
+  // invoking it with .call/.apply) copy plain-data values the same way
+  // globals are copied, so guest mutations cannot reach host objects through
+  // the arguments or the receiver. Guest-internal entries never take this
+  // path; they keep reference semantics between guest frames.
+  secureHostEntryValue(value) {
+    if (typeof value === "function") return this.secureValue(value);
+    if (typeof value === "object" && value !== null) {
+      return this.cloneValue(value, "arguments", "host-to-guest", new WeakMap());
+    }
+    return value;
+  }
+
+  secureHostEntryArguments(args) {
+    for (let index = 0; index < args.length; index += 1) {
+      const value = args[index];
+      if (typeof value !== "object" || value === null) continue;
+      const copy = args.slice(0, index);
+      this.count("argumentCopies");
+      copy[index] = this.secureHostEntryValue(value);
+      for (let rest = index + 1; rest < args.length; rest += 1) {
+        const candidate = args[rest];
+        copy[rest] = (typeof candidate === "object" && candidate !== null)
+          ? this.secureHostEntryValue(candidate)
+          : candidate;
+      }
+      return copy;
+    }
+    return args;
+  }
+
+  wrapHostFunction(target) {
+    this.count("wrapperCreations");
+    const existing = this.hostFunctionWrappers.get(target);
+    if (existing) return existing;
+    const boundary = this;
+    const wrapper = function sableIntrinsicBoundary(...args) {
+      if (new.target !== undefined) return boundary.constructHost(target, args);
+      return boundary.callHost(target, this, args);
+    };
+    wrapper[HOST_TARGET] = target;
+    // Redact the wrapper's own source so direct toString reads disclose
+    // nothing about boundary internals.
+    OBJECT_DEFINE_PROPERTY(wrapper, "toString", {
+      value: this.redactedToString,
+      writable: false,
+      enumerable: false,
+      configurable: true,
+    });
+    this.hostFunctionWrappers.set(target, wrapper);
+    return wrapper;
+  }
+
+  call(callable, thisValue, args) {
+    this.count("calls");
+    // Identity cache for pure intrinsics: single-intrinsic loops skip
+    // dispatch entirely. The cached callable can never be a guest function,
+    // so the hit check is safe by identity.
+    if (callable === this.cachedPureCallable) {
+      return this.callHost(this.cachedPureTarget, thisValue, args);
+    }
+    if (this.guestFunctions.has(callable)) {
+      this.count("guestCalls");
+      const previousEntries = this.pendingGuestEntries;
+      this.pendingGuestEntries += 1;
+      try {
+        return REFLECT_APPLY(callable, thisValue, args);
+      } finally {
+        this.pendingGuestEntries = previousEntries;
+      }
+    }
+    if (this.isFunctionConstructor(callable) || CODE_CONSTRUCTORS.has(callable)) {
+      throw boundaryError("dynamic code constructors are disabled");
+    }
+    const target = callable[HOST_TARGET];
+    if (target) {
+      if (this.isPureIntrinsic(target)) {
+        this.cachedPureCallable = callable;
+        this.cachedPureTarget = target;
+      }
+      return this.callHost(target, thisValue, args);
+    }
+    if (this.protectedValues.has(callable)) {
+      if (this.isPureIntrinsic(callable)) {
+        this.cachedPureCallable = callable;
+        this.cachedPureTarget = callable;
+      }
+      return this.callHost(callable, thisValue, args);
+    }
+    throw boundaryError("calling an unmediated host function is disabled");
+  }
+
+  construct(constructor, args) {
+    this.count("constructs");
+    if (this.isFunctionConstructor(constructor) || CODE_CONSTRUCTORS.has(constructor)) {
+      throw boundaryError("dynamic code constructors are disabled");
+    }
+    const target = constructor[HOST_TARGET];
+    if (target) return this.constructHost(target, args);
+    if (this.protectedValues.has(constructor)) return this.constructHost(constructor, args);
+    if (!this.guestFunctions.has(constructor)) {
+      throw boundaryError("constructing an unmediated host function is disabled");
+    }
+    return REFLECT_CONSTRUCT(constructor, args);
+  }
+
+  callHost(target, thisValue, args) {
+    this.count("hostCalls");
+    // Intrinsics that appear in no guard set skip the per-call argument and
+    // receiver inspections below.
+    if (this.isPureIntrinsic(target)) {
+      return this.applyHost(target, thisValue, this.secureArguments(args));
+    }
+    // V8's captureStackTrace writes a host stack onto its receiver; even a
+    // guest-owned receiver would disclose host file paths. It is not part of
+    // ES5.1, so the sandbox refuses it outright.
+    if (CAPTURE_STACK_TRACE && target === CAPTURE_STACK_TRACE) {
+      throw boundaryError("Error.captureStackTrace is not available in the sandbox");
+    }
+    // Function.prototype.toString reads the receiver's literal source, so it
+    // would disclose boundary internals through a wrapper; own redacted
+    // toString properties only cover direct reads.
+    if (target === FUNCTION_TO_STRING && typeof thisValue === "function" && thisValue[HOST_TARGET]) {
+      throw boundaryError("reading the source of a mediated function is disabled");
+    }
+    if (MUTATES_ARGUMENT_ZERO.has(target) && args.length) {
+      this.assertMutable(args[0], "modify");
+    }
+    if (typeof Reflect === "object" && target === Reflect.set && args.length > 3) {
+      this.assertMutable(args[3], "modify through");
+    }
+    if (MUTATES_RECEIVER.has(target)) this.assertMutable(thisValue, "modify");
+    let hostArgs = this.secureArguments(args);
+    if (INSPECTS_ARGUMENT_ZERO.has(target) && hostArgs.length) {
+      hostArgs = hostArgs.slice();
+      hostArgs[0] = this.propertyTarget(hostArgs[0]);
+    }
+    let hostThis = thisValue;
+    if ((target === FUNCTION_APPLY || target === FUNCTION_BIND || target === FUNCTION_CALL) &&
+        typeof hostThis === "function") {
+      hostThis = this.secureValue(hostThis);
+    }
+    if ((target === REFLECT_APPLY || target === REFLECT_CONSTRUCT) &&
+        hostArgs.length && typeof hostArgs[0] === "function") {
+      hostArgs = hostArgs.slice();
+      hostArgs[0] = this.secureValue(hostArgs[0]);
+      if (target === REFLECT_CONSTRUCT && hostArgs.length > 2 &&
+          typeof hostArgs[2] === "function") {
+        hostArgs[2] = this.secureValue(hostArgs[2]);
+      }
+    }
+    return this.applyHost(target, hostThis, hostArgs);
+  }
+
+  // Shared invocation tail: run the target, sanitize its errors, and secure
+  // the result. Boundary errors pass through untouched.
+  applyHost(target, thisValue, args) {
+    try {
+      return this.secureValue(REFLECT_APPLY(target, thisValue, args));
+    } catch (error) {
+      if (error && /^sablejs sandbox boundary:/.test(String(error.message))) throw error;
+      throw safeError(error);
+    }
+  }
+
+  // Intrinsics that appear in no guard set: their calls need no argument or
+  // receiver inspection beyond securing argument values. Classified lazily
+  // per target and cached, so the hot call path is one WeakMap lookup.
+  isPureIntrinsic(target) {
+    let pure = this.pureIntrinsicCache.get(target);
+    if (pure === undefined) {
+      pure = !(
+        MUTATES_ARGUMENT_ZERO.has(target) ||
+        INSPECTS_ARGUMENT_ZERO.has(target) ||
+        MUTATES_RECEIVER.has(target) ||
+        (CAPTURE_STACK_TRACE && target === CAPTURE_STACK_TRACE) ||
+        target === FUNCTION_TO_STRING ||
+        target === FUNCTION_APPLY || target === FUNCTION_BIND || target === FUNCTION_CALL ||
+        target === REFLECT_APPLY || target === REFLECT_CONSTRUCT
+      );
+      this.pureIntrinsicCache.set(target, pure);
+    }
+    return pure;
+  }
+
+  constructHost(target, args) {
+    if (CODE_CONSTRUCTORS.has(target)) {
+      throw boundaryError("dynamic code constructors are disabled");
+    }
+    if (typeof Proxy === "function" && target === Proxy && args.length) {
+      this.assertMutable(args[0], "wrap");
+    }
+    try {
+      return this.secureValue(REFLECT_CONSTRUCT(target, args));
+    } catch (error) {
+      if (error && /^sablejs sandbox boundary:/.test(String(error.message))) throw error;
+      throw safeError(error);
+    }
+  }
+
+  get(value, key) {
+    this.count("mediatedGets");
+    if (value === null || value === undefined) {
+      throw new TypeError(`Cannot read properties of ${value}`);
+    }
+    let target = value;
+    if (typeof value !== "object" && typeof value !== "function") target = Object(value);
+    if (typeof target === "function") target = this.propertyTarget(target);
+    const result = REFLECT_GET(target, key, target);
+    if (typeof result === "function") return this.secureValue(result);
+    if (typeof result === "object" && result !== null && this.ambientValues.has(result)) {
+      throw boundaryError("an intrinsic exposed an ambient host object");
+    }
+    return result;
+  }
+
+  cloneValue(value, path, direction, seen) {
+    if ((typeof value !== "object" || value === null) && typeof value !== "function") return value;
+    if (direction === "host-to-guest" && this.ambientValues.has(value)) {
+      throw boundaryError(`${path} contains an ambient host object`);
+    }
+
+    const record = direction === "host-to-guest" ? CAPABILITY_RECORDS.get(value) : null;
+    if (record) return this.createCapability(record);
+    if (typeof value === "function") {
+      const kind = direction === "host-to-guest"
+        ? "function; wrap it with capability()"
+        : "guest function";
+      throw boundaryError(`${path} contains a ${kind}`);
+    }
+    if (seen.has(value)) return seen.get(value);
+
+    if (value instanceof Date) return new Date(value.getTime());
+    if (value instanceof RegExp) return new RegExp(value.source, value.flags);
+    if (typeof ArrayBuffer !== "undefined" && value instanceof ArrayBuffer) return value.slice(0);
+    if (typeof ArrayBuffer !== "undefined" && ArrayBuffer.isView(value)) {
+      // Buffer carries its own prototype with host-only methods; clone it
+      // into a plain Uint8Array so only standard view semantics cross.
+      if (typeof Buffer !== "undefined" && value instanceof Buffer) {
+        return new Uint8Array(value);
+      }
+      if (typeof DataView !== "undefined" && value instanceof DataView) {
+        const buffer = value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength);
+        return new DataView(buffer);
+      }
+      return new value.constructor(value);
+    }
+    if (typeof Map !== "undefined" && value instanceof Map) {
+      const clone = new Map();
+      seen.set(value, clone);
+      for (const [key, entry] of value) {
+        clone.set(
+          this.cloneValue(key, `${path}.<key>`, direction, seen),
+          this.cloneValue(entry, `${path}.<value>`, direction, seen)
+        );
+      }
+      return clone;
+    }
+    if (typeof Set !== "undefined" && value instanceof Set) {
+      const clone = new Set();
+      seen.set(value, clone);
+      for (const entry of value) {
+        clone.add(this.cloneValue(entry, `${path}.<value>`, direction, seen));
+      }
+      return clone;
+    }
+    if (value instanceof Error) return safeError(value);
+    if (!Array.isArray(value) && !isPlainObject(value)) {
+      throw boundaryError(`${path} must contain only plain data or explicit capabilities`);
+    }
+
+    const clone = Array.isArray(value) ? new Array(value.length) : {};
+    seen.set(value, clone);
+    for (const key of OWN_KEYS(value)) {
+      if (typeof key === "symbol") throw boundaryError(`${path} contains a symbol property`);
+      if (Array.isArray(value) && key === "length") continue;
+      const descriptor = OBJECT_GET_OWN_PROPERTY_DESCRIPTOR(value, key);
+      if (!descriptor) continue;
+      if (!("value" in descriptor)) throw boundaryError(`${path}.${key} is an accessor`);
+      OBJECT_DEFINE_PROPERTY(clone, key, {
+        value: this.cloneValue(descriptor.value, `${path}.${key}`, direction, seen),
+        writable: descriptor.writable,
+        enumerable: descriptor.enumerable,
+        configurable: descriptor.configurable,
+      });
+    }
+    return clone;
+  }
+
+  createCapability(record) {
+    const boundary = this;
+    const wrapper = function sableCapability(...guestArgs) {
+      if (new.target !== undefined) throw boundaryError(`capability ${record.name} is not a constructor`);
+      if (boundary.isDisposed()) throw boundaryError(`capability ${record.name} has been revoked`);
+      const hostArgs = new Array(guestArgs.length);
+      for (let index = 0; index < guestArgs.length; index += 1) {
+        hostArgs[index] = boundary.cloneValue(
+          guestArgs[index],
+          `${record.name}.args[${index}]`,
+          "guest-to-host",
+          new WeakMap()
+        );
+      }
+      let result;
+      try {
+        result = REFLECT_APPLY(record.callable, record.thisValue, hostArgs);
+      } catch (error) {
+        throw safeError(error);
+      }
+      if (typeof Promise !== "undefined" && result instanceof Promise) {
+        return Promise.resolve(result).then(
+          (value) => boundary.cloneValue(value, `${record.name}.result`, "host-to-guest", new WeakMap()),
+          (error) => { throw safeError(error); }
+        );
+      }
+      return boundary.cloneValue(result, `${record.name}.result`, "host-to-guest", new WeakMap());
+    };
+    this.registerGuestFunction(wrapper);
+    return wrapper;
+  }
+}
+
+module.exports = { SandboxBoundary, boundaryError, capability };

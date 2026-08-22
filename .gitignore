@@ -1,4 +1,13 @@
-.pkg
 node_modules
-bin/.aggrement
+.idea
+dist
+.vscode
+src/index.js
+src/index.html
+src/.cache
+src/dist
+src/test.js
+.cache
 .DS_Store
+/index.js
+benchmark/suite.aot*.cjs
