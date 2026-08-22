@@ -1,6 +1,6 @@
 {
   "name": "sablejs",
-  "version": "2.0.0-beta",
+  "version": "2.0.0-beta.1",
   "description": "ES5.1 native-object ahead-of-time compiler and runtime",
   "main": "src/index.js",
   "exports": {
