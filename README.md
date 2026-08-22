@@ -32,10 +32,11 @@ modern source -> Babel/SWC -> ES5.1 -> sablejs AOT -> browser bundle -> dedicate
 
 ## Install and build
 
-Install the published package from npm:
+Install the published v2 beta from npm (the v2 series is in beta; `latest`
+still points at the v1 line until 2.0.0 goes stable):
 
 ```sh
-npm install sablejs
+npm install sablejs@beta
 ```
 
 For the ES6+ downlevel and bundling step you also want `@babel/core`, `@babel/preset-env`, and `esbuild` as devDependencies.

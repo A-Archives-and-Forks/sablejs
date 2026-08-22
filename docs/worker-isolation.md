@@ -6,10 +6,10 @@ The language boundary controls what guest code can reach. It deliberately does n
 
 ## Compiling at build time
 
-Install sablejs, Babel, and esbuild:
+Install sablejs (v2 beta), Babel, and esbuild:
 
 ```sh
-npm install sablejs
+npm install sablejs@beta
 npm install --save-dev @babel/core @babel/preset-env esbuild
 ```
 
