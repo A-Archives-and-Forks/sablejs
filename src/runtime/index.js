@@ -418,6 +418,16 @@ function setSandboxPropertyValue(runtime, writer, object, key, value) {
   return value;
 }
 
+// Slim sandbox write path for provably guest-created objects (literals,
+// closures, and provenance-marked locals). writeTarget would be a no-op for
+// them — they are never wrappers, capability tokens, or protected
+// intrinsics — so this keeps only the value securing and the strict/sloppy
+// writer dispatch of setSandboxPropertyValue.
+function setGuestPropertyValue(runtime, frame, object, key, value) {
+  const stored = typeof value === "function" ? runtime.boundary.secureValue(value) : value;
+  return writePropertyValue(frame, object, key, stored);
+}
+
 function applySandboxValue(runtime, callable, thisValue, args) {
   if (typeof callable !== "function") throw new TypeError(`${String(callable)} is not a function`);
   return runtime.boundary.call(callable, thisValue, args);
@@ -654,6 +664,15 @@ class RuntimeInstance {
     // checks such as Object.prototype.toString observe the browser model. The
     // ES5 mapped-parameter behavior is then expressed with own accessors.
     const object = REFLECT_APPLY(CAPTURE_ARGUMENTS_OBJECT, undefined, args);
+    // Bundlers hoist "use strict" over the whole bundle, which turns the
+    // capture helper strict: its Arguments object then carries PoisonPill
+    // callee/caller accessors (non-configurable), and the defines below would
+    // throw "Cannot redefine property: callee". Detect that capture and, for
+    // sloppy frames, route the exposed object through the same proxy the
+    // mapped-parameter path uses, with callee backed in a closure cell so
+    // ES5 sloppy semantics hold even though the host exotic object is strict.
+    const capturedCallee = OBJECT_GET_OWN_PROPERTY_DESCRIPTOR(object, "callee");
+    const capturedStrictly = !capturedCallee || !capturedCallee.configurable;
     const mappedNames = new Set();
     const parameterMap = OBJECT_CREATE(null);
     let hasMappedParameters = false;
@@ -666,25 +685,45 @@ class RuntimeInstance {
         hasMappedParameters = true;
       }
     }
-    if (frame.metadata.strict) {
-      const restricted = () => { throw new TypeError("Restricted arguments property access"); };
-      defineAccessor(object, "callee", restricted, restricted, false, false);
-      defineAccessor(object, "caller", restricted, restricted, false, false);
-    } else {
-      defineData(object, "callee", frame.currentFunction, true, false, true);
+    if (!capturedStrictly) {
+      if (frame.metadata.strict) {
+        const restricted = () => { throw new TypeError("Restricted arguments property access"); };
+        defineAccessor(object, "callee", restricted, restricted, false, false);
+        defineAccessor(object, "caller", restricted, restricted, false, false);
+      } else {
+        defineData(object, "callee", frame.currentFunction, true, false, true);
+      }
+      if (!hasMappedParameters) return object;
+    } else if (frame.metadata.strict) {
+      // The host PoisonPill accessors already restrict callee/caller.
+      if (!hasMappedParameters) return object;
     }
-    if (!hasMappedParameters) return object;
+    return this.createArgumentsProxy(object, parameterMap, frame, capturedStrictly ? frame.currentFunction : undefined);
+  }
 
-    // A Proxy lets the exposed object retain native Arguments identity while
-    // the compiled frame owns its lexical parameter slots. The traps implement
-    // ES5's invisible [[ParameterMap]] without exposing accessor descriptors.
+  // A Proxy lets the exposed object retain native Arguments identity while
+  // the compiled frame owns its lexical parameter slots. The traps implement
+  // ES5's invisible [[ParameterMap]] without exposing accessor descriptors.
+  // `sloppyCallee` is set when the host capture was strict but the frame is
+  // sloppy: callee (and the legacy caller) then live in closure cells because
+  // the strict exotic object's PoisonPill accessors cannot be redefined.
+  createArgumentsProxy(object, parameterMap, frame, sloppyCallee) {
+    let callee = sloppyCallee;
+    let calleeAlive = typeof sloppyCallee !== "undefined";
     return new Proxy(object, {
       get(target, key, receiver) {
         if (key === Symbol.toStringTag) return "Arguments";
+        if (calleeAlive && key === "callee") return callee;
+        if (calleeAlive && key === "caller") return undefined;
         if (HAS_OWN_PROPERTY(parameterMap, key)) return frame.locals[parameterMap[key]];
         return REFLECT_GET(target, key, receiver);
       },
       set(target, key, value, receiver) {
+        if (calleeAlive && key === "callee") {
+          callee = value;
+          return true;
+        }
+        if (calleeAlive && key === "caller") return true;
         if (HAS_OWN_PROPERTY(parameterMap, key)) {
           const updated = REFLECT_SET(target, key, value, target);
           if (updated) frame.locals[parameterMap[key]] = value;
@@ -693,6 +732,10 @@ class RuntimeInstance {
         return REFLECT_SET(target, key, value, receiver);
       },
       getOwnPropertyDescriptor(target, key) {
+        if (calleeAlive && key === "callee") {
+          return { value: callee, writable: true, enumerable: false, configurable: true };
+        }
+        if (calleeAlive && key === "caller") return undefined;
         const current = OBJECT_GET_OWN_PROPERTY_DESCRIPTOR(target, key);
         if (!current || !HAS_OWN_PROPERTY(parameterMap, key)) return current;
         const descriptor = safePropertyDescriptor(current);
@@ -700,6 +743,10 @@ class RuntimeInstance {
         return descriptor;
       },
       defineProperty(target, key, descriptor) {
+        if (calleeAlive && key === "callee") {
+          if (HAS_OWN_PROPERTY(descriptor, "value")) callee = descriptor.value;
+          return true;
+        }
         const mapped = HAS_OWN_PROPERTY(parameterMap, key);
         const localIndex = mapped ? parameterMap[key] : 0;
         const updated = REFLECT_DEFINE_PROPERTY(target, key, safePropertyDescriptor(descriptor));
@@ -712,6 +759,10 @@ class RuntimeInstance {
         return true;
       },
       deleteProperty(target, key) {
+        if (calleeAlive && key === "callee") {
+          calleeAlive = false;
+          return true;
+        }
         const deleted = REFLECT_DELETE_PROPERTY(target, key);
         if (deleted) REFLECT_DELETE_PROPERTY(parameterMap, key);
         return deleted;
@@ -1297,6 +1348,7 @@ module.exports = {
   readGlobalVariableValue,
   readVariableValue,
   setArgumentsValue,
+  setGuestPropertyValue,
   setSandboxPropertyValue,
   writeGlobalVariableValue,
   writeVariableValue,

@@ -653,13 +653,13 @@ function emitStackToLocalRange(lines, scope, instructions, indent, context) {
         return true;
       }
       case "NEWARRAY":
-        stack.push(temporary("[]"));
+        stack.push(temporary("[]", instruction, { kind: "guest-object" }));
         return true;
       case "NEWOBJECT":
-        stack.push(temporary("{}"));
+        stack.push(temporary("{}", instruction, { kind: "guest-object" }));
         return true;
       case "NEWREGEXP":
-        stack.push(temporary(`new RegExp(${jsLiteral(instruction.args[0])}, ${jsLiteral(instruction.args[1])})`));
+        stack.push(temporary(`new RegExp(${jsLiteral(instruction.args[0])}, ${jsLiteral(instruction.args[1])})`, instruction, { kind: "guest-object" }));
         return true;
       case "LOC":
         lines.push(`${indent}$f.line = ${jsLiteral(instruction.args[0])}; $f.column = ${jsLiteral(instruction.args[1])};`);
@@ -696,11 +696,15 @@ function emitStackToLocalRange(lines, scope, instructions, indent, context) {
           ? `$l[${index}]`
           : `$g[${jsLiteral(scope.variables[index - 1])}]`;
         const knownFunction = context.knownFunctionBindings.get(index);
-        stack.push(temporary(expression, instruction, knownFunction && {
-          kind: "known-function",
-          identity: knownFunction.identity,
-          scopeId: knownFunction.scopeId,
-        }));
+        // The guest-object provenance pass marks GETLOCAL loads that provably
+        // hold guest-created objects; sandbox property writes to them can
+        // skip writeTarget resolution.
+        const origin = knownFunction
+          ? { kind: "known-function", identity: knownFunction.identity, scopeId: knownFunction.scopeId }
+          : instruction.guestObjectOutput
+            ? { kind: "guest-object" }
+            : null;
+        stack.push(temporary(expression, instruction, origin));
         return true;
       }
       case "SETLOCAL":
@@ -825,18 +829,36 @@ function emitStackToLocalRange(lines, scope, instructions, indent, context) {
         const value = load();
         const key = load();
         const object = load();
-        lines.push(context.security === "sandbox"
-          ? `${indent}$setSandbox($r, ${context.writeProperty}, ${object}, ${key}, ${value});`
-          : `${indent}${context.writeProperty}(${object}, ${key}, ${value});`);
+        if (context.security === "sandbox") {
+          // Guest-created objects (literals, closures, and provenance-marked
+          // locals) are never wrappers or protected intrinsics, so writeTarget
+          // resolution is a provable no-op; the slim helper keeps value
+          // securing and the strict/sloppy writer semantics.
+          const origin = context.temporaryOrigins.get(object);
+          const guestObject = origin && (origin.kind === "guest-object" ||
+            origin.kind === "closure" || origin.kind === "known-function");
+          lines.push(guestObject
+            ? `${indent}$setGuest($r, $f, ${object}, ${key}, ${value});`
+            : `${indent}$setSandbox($r, ${context.writeProperty}, ${object}, ${key}, ${value});`);
+        } else {
+          lines.push(`${indent}${context.writeProperty}(${object}, ${key}, ${value});`);
+        }
         stack.push(value);
         return true;
       }
       case "SETPROP_S": {
         const value = load();
         const object = load();
-        lines.push(context.security === "sandbox"
-          ? `${indent}$setSandbox($r, ${context.writeProperty}, ${object}, ${jsLiteral(instruction.args[0])}, ${value});`
-          : `${indent}${context.writeProperty}(${object}, ${jsLiteral(instruction.args[0])}, ${value});`);
+        if (context.security === "sandbox") {
+          const origin = context.temporaryOrigins.get(object);
+          const guestObject = origin && (origin.kind === "guest-object" ||
+            origin.kind === "closure" || origin.kind === "known-function");
+          lines.push(guestObject
+            ? `${indent}$setGuest($r, $f, ${object}, ${jsLiteral(instruction.args[0])}, ${value});`
+            : `${indent}$setSandbox($r, ${context.writeProperty}, ${object}, ${jsLiteral(instruction.args[0])}, ${value});`);
+        } else {
+          lines.push(`${indent}${context.writeProperty}(${object}, ${jsLiteral(instruction.args[0])}, ${value});`);
+        }
         stack.push(value);
         return true;
       }
@@ -926,7 +948,7 @@ function emitStackToLocalRange(lines, scope, instructions, indent, context) {
     const instruction = instructions[loopIndex];
     const arrayLiteral = arrayLiteralRanges.get(instruction.offset);
     if (arrayLiteral) {
-      stack.push(temporary(`[${arrayLiteral.elements.join(", ")}]`, instruction));
+      stack.push(temporary(`[${arrayLiteral.elements.join(", ")}]`, instruction, { kind: "guest-object" }));
       loopIndex = arrayLiteral.endIndex - 1;
       continue;
     }
@@ -1694,6 +1716,7 @@ const RUNTIME_IMPORTS = Object.freeze([
   ["readGlobalVariableValue", "$readGlobal"],
   ["readVariableValue", "$readVar"],
   ["setArgumentsValue", "$setArguments"],
+  ["setGuestPropertyValue", "$setGuest"],
   ["setSandboxPropertyValue", "$setSandbox"],
   ["writeGlobalVariableValue", "$writeGlobal"],
   ["writeSloppyPropertyValue", "$writeSloppy"],

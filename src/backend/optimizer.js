@@ -10,6 +10,7 @@ const {
   runLoopInvariantCodeMotion,
 } = require("./mir-optimizations");
 const { runSCCP } = require("./sccp");
+const { runGuestProvenance } = require("./guest-provenance");
 
 const LEVELS = new Set(["O0", "O1", "O2", "Os"]);
 const BINARY_FOLDERS = {
@@ -189,56 +190,115 @@ function optimizeProgram(program, requestedLevel, options = {}) {
     stats.nodesAfter = stats.nodesBefore;
     return stats;
   }
+  // Pass pipeline contract.
+  // - Every pass preserves program semantics exactly; PassManager re-verifies
+  //   the HIR after each pass and records live-instruction deltas.
+  // - Passes communicate only through the fields they are licensed to write:
+  //   `elided` / `unreachable` marks, `instruction.optimized` literal folds,
+  //   `instruction.optimizedBranchTarget` branch rewrites, and the
+  //   `guestObjectOutput` provenance mark. Everything else is input to every
+  //   later pass.
+  // - Security-sensitive passes (guest-object-provenance) may only move data
+  //   toward the sandbox fast path when the proof travels with the mark
+  //   itself; see the per-pass notes below and guest-provenance.js.
   const passes = new PassManager(program, stats, options);
 
   passes.run("constant-folding", (currentProgram) => {
+    // Folds constant unary/binary chains into `optimized` literals and elides
+    // their inputs. Never folds across or into jump targets (offset-based
+    // peephole guards), never folds allocate ops (NEW*/CLOSURE are not
+    // literals), and preserves the instruction stream's offset layout.
     currentProgram.scopes.forEach((scope) => foldConstants(scope, stats));
   });
 
   passes.run("constant-branches", (currentProgram) => {
+    // Rewrites JTRUE/JFALSE on known literal conditions to a direct
+    // `optimizedBranchTarget` (taken target or fall-through `end`). The
+    // condition instruction stays live; CFG reachability is resolved by the
+    // next pass from the rewritten target.
     currentProgram.scopes.forEach((scope) => foldConstantBranches(scope, stats));
   });
 
   passes.run("cfg-unreachable-code", (currentProgram) => {
+    // Marks blocks unreachable from entry as `unreachable` (CFG reachability);
+    // canonical TryFinally finalizer bodies are always kept reachable so
+    // structured unwinds cannot lose their cleanup path.
     currentProgram.scopes.forEach((scope) => eliminateUnreachableBlocks(scope, stats));
   });
 
   if ((level === "O2" || level === "Os") && options.preserveSourceLocations !== true) {
     passes.run("strip-source-locations", (currentProgram) => {
+      // Elides LOC instructions (debug markers only, no runtime effect).
       currentProgram.scopes.forEach((scope) => stripSourceLocations(scope, stats));
     });
   }
 
   let analysisMIR;
   passes.run("ssa-sccp", (currentProgram) => {
+    // Sparse conditional constant propagation over the MIR value graph.
+    // Constants flow only through SSA values, never across the sandbox
+    // boundary; produces the shared `analysisMIR` consumed by the later SSA
+    // passes (rebuilt once, verified, reused).
     analysisMIR = runSCCP(currentProgram, stats);
   });
 
   passes.run("ssa-copy-propagation", (currentProgram) => {
+    // Propagates known literals into private lightweight locals (intra-block;
+    // parameters excluded — sloppy arguments can alias them). Kills on any
+    // unknown store. Literals only, so guest-allocated values never get
+    // aliased into slots the provenance pass would misjudge.
     runCopyPropagation(currentProgram, stats, analysisMIR);
   });
 
   if (level === "O2") {
     passes.run("loop-invariant-code-motion", (currentProgram) => {
+      // Hoists private non-parameter local reads out of loops (O2 only). Such
+      // reads cannot invoke guest code, and lightweight scopes prove no
+      // with/eval/closures can mutate the slot; a loop-local write is a hard
+      // kill.
       runLoopInvariantCodeMotion(currentProgram, stats, analysisMIR);
     });
 
     passes.run("global-value-numbering", (currentProgram) => {
+      // Memory-aware cross-block CSE for private locals (O2 only): a load is
+      // available across a block only when every predecessor carries the
+      // same dominating load and no path writes that local.
       runGlobalValueNumbering(currentProgram, stats, analysisMIR);
     });
   }
 
   if (level === "O2" || level === "Os") {
     passes.run("local-cse", (currentProgram) => {
+      // Same-block CSE (O2/Os).
       runLocalCSE(currentProgram, stats, analysisMIR);
     });
   }
 
   passes.run("ssa-dead-code-elimination", (currentProgram) => {
+    // Removes Pure-effect operations whose single output is consumed by POP.
+    // Pure-only: nothing with observable effects or multiple uses is touched.
+    // The last SSA pass — later passes see the final MIR shape.
     runDeadCodeElimination(currentProgram, stats, analysisMIR);
   });
 
+  if (level === "O2" || level === "Os") {
+    passes.run("guest-object-provenance", (currentProgram) => {
+      // SECURITY-SENSITIVE. Proves GETLOCAL outputs are guest-created and
+      // marks them `guestObjectOutput` — the fast-path ticket for sandbox
+      // property writes. The mark seeds exclusively at allocate ops
+      // (NEWARRAY/NEWOBJECT/NEWREGEXP/CLOSURE), flows only through slots and
+      // phi joins (AND meet), and is written after the last pass that can
+      // move or eliminate values, so the mark cannot go stale. Nothing
+      // unmarked ever takes the fast path; see guest-provenance.js.
+      runGuestProvenance(currentProgram, stats, analysisMIR);
+    });
+  }
+
   passes.run("copy-folding", (currentProgram) => {
+    // Peephole re-runs after the SSA passes: SSA passes rewrite the
+    // instruction stream (elisions, replaced operands), so the offset-based
+    // peepholes are re-applied to the final HIR to keep their decisions
+    // consistent with what codegen will emit.
     currentProgram.scopes.forEach((scope) => foldConstants(scope, stats));
   });
 

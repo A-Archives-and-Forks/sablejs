@@ -1,12 +1,14 @@
 "use strict";
 
 const CAPABILITY_RECORDS = new WeakMap();
-// Wrapper -> raw host target. Stored as a symbol-keyed property instead of a
-// WeakMap lookup on the hot paths. The symbol is guest-invisible: every
-// introspection entry point (Object.getOwnPropertySymbols and friends) is
-// redirected through propertyTarget, so it surfaces the raw target's own
-// symbols rather than the wrapper's tag.
-const HOST_TARGET = Symbol("sablejs.hostTarget");
+// Wrapper -> raw host target, stored in a WeakMap rather than as a
+// symbol-keyed property. A property read on a guest-owned proxy invokes the
+// guest's get trap with the key, so a symbol tag would be observable (and
+// forgeable through trap return values); WeakMap identity lookups never
+// invoke proxy traps. Every introspection entry point
+// (Object.getOwnPropertySymbols and friends) is still redirected through
+// propertyTarget, so wrappers surface the raw target's own keys rather than
+// any wrapper-surface artifacts.
 const OBJECT_CREATE = Object.create;
 const OBJECT_DEFINE_PROPERTY = Object.defineProperty;
 const OBJECT_FREEZE = Object.freeze;
@@ -53,6 +55,8 @@ const INSPECTS_ARGUMENT_ZERO = new Set([
   Object.isFrozen,
   Object.isSealed,
   Object.keys,
+  Object.entries,
+  Object.values,
   typeof Reflect === "object" && Reflect.getOwnPropertyDescriptor,
   typeof Reflect === "object" && Reflect.getPrototypeOf,
   typeof Reflect === "object" && Reflect.isExtensible,
@@ -61,6 +65,15 @@ const INSPECTS_ARGUMENT_ZERO = new Set([
 
 const CAPTURE_STACK_TRACE = typeof Error.captureStackTrace === "function" && Error.captureStackTrace;
 const FUNCTION_TO_STRING = Function.prototype.toString;
+// Canonical typed-array constructors, in instanceof-safe order. Clones of
+// subclassed views are rebuilt with their base constructor so only standard
+// view semantics cross the boundary (same policy as Buffer -> Uint8Array).
+const VIEW_BASE_CONSTRUCTORS = [
+  "Uint8ClampedArray", "Int8Array", "Uint8Array", "Int16Array", "Uint16Array",
+  "Int32Array", "Uint32Array", "Float32Array", "Float64Array", "BigInt64Array", "BigUint64Array",
+]
+  .map((name) => globalThis[name])
+  .filter(Boolean);
 
 const MUTATES_RECEIVER = new Set();
 function addMutators(prototype, names) {
@@ -96,12 +109,32 @@ for (const name of [
   addMutators(constructor && constructor.prototype, ["copyWithin", "fill", "reverse", "set", "sort"]);
 }
 
+// Boundary errors are identified by identity, not by message: the message
+// test runs in catch paths that may themselves be on an exhausted stack
+// (a guest recursion overflow inside a mediated call), where even a regex
+// compile or string coercion can throw and corrupt the reported error.
+const BOUNDARY_ERRORS = new WeakSet();
+
 function boundaryError(message) {
   const error = new TypeError(`sablejs sandbox boundary: ${message}`);
+  BOUNDARY_ERRORS.add(error);
   // Boundary violations propagate into guest catch blocks; strip the stack
   // so host file paths and frames never cross the boundary.
   try { delete error.stack; } catch (_) {}
   return error;
+}
+
+// Shared catch tail for mediated calls: boundary errors pass through
+// untouched; other host errors are sanitized. If even sanitization cannot
+// run (stack exhaustion), the original error propagates — guests must see
+// the engine's own failure, not a corruption of it.
+function sanitizeHostError(error) {
+  if (error && BOUNDARY_ERRORS.has(error)) return error;
+  try {
+    return safeError(error);
+  } catch (_) {
+    return error;
+  }
 }
 
 function capability(callable, options = {}) {
@@ -203,7 +236,12 @@ class SandboxBoundary {
     }
     this.guestFunctions = new WeakSet();
     this.protectedValues = protectedIntrinsicGraph(intrinsics);
+    // Target -> wrapper dedup cache (wrapHostFunction returns the same
+    // wrapper for the same raw target) and wrapper -> target reverse
+    // mapping. Both are WeakMaps: identity lookups never invoke proxy traps,
+    // so a guest proxy can neither observe nor forge the mapping.
     this.hostFunctionWrappers = new WeakMap();
+    this.wrapperTargets = new WeakMap();
     // Monomorphic identity cache for pure-intrinsic calls, and a lazily
     // computed pure-intrinsic classification per target: both serve the
     // intrinsic-call hot path without per-call guard-set lookups.
@@ -254,7 +292,9 @@ class SandboxBoundary {
 
   propertyTarget(value) {
     if (value === this.functionConstructor) return Function;
-    return (value != null ? value[HOST_TARGET] : undefined) || value;
+    // WeakMap.get is trap-free: a guest proxy passed here never runs its get
+    // trap, so the wrapper-target mapping stays unobservable and unforgeable.
+    return this.wrapperTargets.get(value) || value;
   }
 
   isProtected(value) {
@@ -269,13 +309,18 @@ class SandboxBoundary {
   }
 
   // Resolves the write target and asserts mutability in one pass for the hot
-  // property-write path.
+  // property-write path. Single-pass TOCTOU analysis: the WeakMap lookup and
+  // the protected-set check are trap-free and synchronous — no guest code can
+  // run between resolution and the caller's write, and the returned target is
+  // the exact object the caller writes to. Guest proxies cannot steer the
+  // resolution (their traps never fire here), so the checked object is always
+  // the written object.
   writeTarget(value, operation = "modify") {
     this.count("writeTargets");
     if (value === this.functionConstructor) {
       throw boundaryError(`cannot ${operation} a shared intrinsic`);
     }
-    const target = (value != null ? value[HOST_TARGET] : undefined) || value;
+    const target = this.wrapperTargets.get(value) || value;
     if (isObject(target) && this.protectedValues.has(target)) {
       throw boundaryError(`cannot ${operation} a shared intrinsic`);
     }
@@ -285,7 +330,7 @@ class SandboxBoundary {
   secureValue(value) {
     if (typeof value === "function") {
       if (this.guestFunctions.has(value)) return value;
-      if (value[HOST_TARGET]) return value;
+      if (this.wrapperTargets.get(value)) return value;
       if (CODE_CONSTRUCTORS.has(value)) return this.functionConstructor;
       return this.wrapHostFunction(value);
     }
@@ -360,7 +405,9 @@ class SandboxBoundary {
       if (new.target !== undefined) return boundary.constructHost(target, args);
       return boundary.callHost(target, this, args);
     };
-    wrapper[HOST_TARGET] = target;
+    // The wrapper -> target mapping lives in wrapperTargets (trap-free), not
+    // on the wrapper, so guest proxy traps can never observe it.
+    this.wrapperTargets.set(wrapper, target);
     // Redact the wrapper's own source so direct toString reads disclose
     // nothing about boundary internals. Null-prototype descriptor: a plain
     // literal would inherit guest-visible Object.prototype pollution and
@@ -396,7 +443,7 @@ class SandboxBoundary {
     if (this.isFunctionConstructor(callable) || CODE_CONSTRUCTORS.has(callable)) {
       throw boundaryError("dynamic code constructors are disabled");
     }
-    const target = callable[HOST_TARGET];
+    const target = this.wrapperTargets.get(callable);
     if (target) {
       if (this.isPureIntrinsic(target)) {
         this.cachedPureCallable = callable;
@@ -419,7 +466,7 @@ class SandboxBoundary {
     if (this.isFunctionConstructor(constructor) || CODE_CONSTRUCTORS.has(constructor)) {
       throw boundaryError("dynamic code constructors are disabled");
     }
-    const target = constructor[HOST_TARGET];
+    const target = this.wrapperTargets.get(constructor);
     if (target) return this.constructHost(target, args);
     if (this.protectedValues.has(constructor)) return this.constructHost(constructor, args);
     if (!this.guestFunctions.has(constructor)) {
@@ -444,7 +491,8 @@ class SandboxBoundary {
     // Function.prototype.toString reads the receiver's literal source, so it
     // would disclose boundary internals through a wrapper; own redacted
     // toString properties only cover direct reads.
-    if (target === FUNCTION_TO_STRING && typeof thisValue === "function" && thisValue[HOST_TARGET]) {
+    if (target === FUNCTION_TO_STRING && typeof thisValue === "function" &&
+        this.wrapperTargets.get(thisValue)) {
       throw boundaryError("reading the source of a mediated function is disabled");
     }
     if (MUTATES_ARGUMENT_ZERO.has(target) && args.length) {
@@ -482,8 +530,7 @@ class SandboxBoundary {
     try {
       return this.secureValue(REFLECT_APPLY(target, thisValue, args));
     } catch (error) {
-      if (error && /^sablejs sandbox boundary:/.test(String(error.message))) throw error;
-      throw safeError(error);
+      throw sanitizeHostError(error);
     }
   }
 
@@ -517,8 +564,7 @@ class SandboxBoundary {
     try {
       return this.secureValue(REFLECT_CONSTRUCT(target, args));
     } catch (error) {
-      if (error && /^sablejs sandbox boundary:/.test(String(error.message))) throw error;
-      throw safeError(error);
+      throw sanitizeHostError(error);
     }
   }
 
@@ -540,78 +586,199 @@ class SandboxBoundary {
 
   cloneValue(value, path, direction, seen) {
     if ((typeof value !== "object" || value === null) && typeof value !== "function") return value;
-    if (direction === "host-to-guest" && this.ambientValues.has(value)) {
-      throw boundaryError(`${path} contains an ambient host object`);
-    }
 
-    const record = direction === "host-to-guest" ? CAPABILITY_RECORDS.get(value) : null;
-    if (record) return this.createCapability(record);
-    if (typeof value === "function") {
-      const kind = direction === "host-to-guest"
-        ? "function; wrap it with capability()"
-        : "guest function";
-      throw boundaryError(`${path} contains a ${kind}`);
-    }
-    if (seen.has(value)) return seen.get(value);
+    // Iterative clone: an explicit work stack bounds depth by memory instead
+    // of the host call stack, so pathologically deep payloads clone instead
+    // of overflowing the stack inside the boundary. Containers register in
+    // `seen` at materialization, so shared references and cycles survive;
+    // specials (Date/RegExp/buffers/views/errors) clone per occurrence.
+    let result;
+    const pending = [{
+      value,
+      path,
+      place: (clone) => { result = clone; },
+    }];
+    while (pending.length > 0) {
+      const current = pending[pending.length - 1];
+      pending.length -= 1;
+      const { value: node, path: nodePath, place } = current;
+      // Primitive short-circuit: entry checks above cover the root, but
+      // nested values arrive as tasks, and isPlainObject would box them
+      // (Object.getPrototypeOf(1) === Number.prototype).
+      if ((typeof node !== "object" || node === null) && typeof node !== "function") {
+        place(node);
+        continue;
+      }
+      // The checks the entry path used to perform at every recursion level
+      // run here, because nested values arrive as tasks: ambient objects,
+      // capability records, and functions keep their specific messages.
+      if (direction === "host-to-guest" && this.ambientValues.has(node)) {
+        throw boundaryError(`${nodePath} contains an ambient host object`);
+      }
+      const record = direction === "host-to-guest" ? CAPABILITY_RECORDS.get(node) : null;
+      if (record) {
+        place(this.createCapability(record));
+        continue;
+      }
+      if (typeof node === "function") {
+        const kind = direction === "host-to-guest"
+          ? "function; wrap it with capability()"
+          : "guest function";
+        throw boundaryError(`${nodePath} contains a ${kind}`);
+      }
+      if (seen.has(node)) {
+        place(seen.get(node));
+        continue;
+      }
 
-    if (value instanceof Date) return new Date(value.getTime());
-    if (value instanceof RegExp) return new RegExp(value.source, value.flags);
-    if (typeof ArrayBuffer !== "undefined" && value instanceof ArrayBuffer) return value.slice(0);
-    if (typeof ArrayBuffer !== "undefined" && ArrayBuffer.isView(value)) {
-      // Buffer carries its own prototype with host-only methods; clone it
-      // into a plain Uint8Array so only standard view semantics cross.
-      if (typeof Buffer !== "undefined" && value instanceof Buffer) {
-        return new Uint8Array(value);
+      // The branded paths below operate on the node's internal slots, which
+      // a Proxy cannot carry: instanceof matches through the target, and
+      // the branded method call then fails with a raw receiver TypeError
+      // ("this is not a Date object", "incompatible receiver"). Proxies and
+      // other exotic objects are not plain data, so the failure is turned
+      // into the documented boundary error instead of leaking clone
+      // internals. (Proxies over plain objects and arrays brand as plain
+      // data and clone as the data they present, with per-node checks.)
+      if (node instanceof Date) {
+        try {
+          place(new Date(node.getTime()));
+        } catch (error) {
+          throw boundaryError(`${nodePath} is a Proxy-wrapped Date; only plain data or explicit capabilities cross`);
+        }
+        continue;
       }
-      if (typeof DataView !== "undefined" && value instanceof DataView) {
-        const buffer = value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength);
-        return new DataView(buffer);
+      if (node instanceof RegExp) {
+        try {
+          place(new RegExp(node.source, node.flags));
+        } catch (error) {
+          throw boundaryError(`${nodePath} is a Proxy-wrapped RegExp; only plain data or explicit capabilities cross`);
+        }
+        continue;
       }
-      return new value.constructor(value);
-    }
-    if (typeof Map !== "undefined" && value instanceof Map) {
-      const clone = new Map();
-      seen.set(value, clone);
-      for (const [key, entry] of value) {
-        clone.set(
-          this.cloneValue(key, `${path}.<key>`, direction, seen),
-          this.cloneValue(entry, `${path}.<value>`, direction, seen)
-        );
+      if (typeof ArrayBuffer !== "undefined" && node instanceof ArrayBuffer) {
+        try {
+          place(node.slice(0));
+        } catch (error) {
+          throw boundaryError(`${nodePath} is a Proxy-wrapped ArrayBuffer; only plain data or explicit capabilities cross`);
+        }
+        continue;
       }
-      return clone;
-    }
-    if (typeof Set !== "undefined" && value instanceof Set) {
-      const clone = new Set();
-      seen.set(value, clone);
-      for (const entry of value) {
-        clone.add(this.cloneValue(entry, `${path}.<value>`, direction, seen));
+      if (typeof ArrayBuffer !== "undefined" && ArrayBuffer.isView(node)) {
+        // Buffer carries its own prototype with host-only methods; clone it
+        // into a plain Uint8Array so only standard view semantics cross.
+        try {
+          if (typeof Buffer !== "undefined" && node instanceof Buffer) {
+            place(new Uint8Array(node));
+            continue;
+          }
+          if (typeof DataView !== "undefined" && node instanceof DataView) {
+            const buffer = node.buffer.slice(node.byteOffset, node.byteOffset + node.byteLength);
+            place(new DataView(buffer));
+            continue;
+          }
+          // Strip subclass prototypes the same way: only standard view
+          // semantics cross, never host-added subclass methods.
+          const constructor = VIEW_BASE_CONSTRUCTORS.indexOf(node.constructor) !== -1
+            ? node.constructor
+            : VIEW_BASE_CONSTRUCTORS.find((Base) => node instanceof Base) || Uint8Array;
+          place(new constructor(node));
+          continue;
+        } catch (error) {
+          throw boundaryError(`${nodePath} is a Proxy-wrapped typed array; only plain data or explicit capabilities cross`);
+        }
       }
-      return clone;
-    }
-    if (value instanceof Error) return safeError(value);
-    if (!Array.isArray(value) && !isPlainObject(value)) {
-      throw boundaryError(`${path} must contain only plain data or explicit capabilities`);
-    }
+      if (typeof Map !== "undefined" && node instanceof Map) {
+        try {
+          const clone = new Map();
+          seen.set(node, clone);
+          place(clone);
+          const entries = [];
+          for (const [key, entry] of node) {
+            entries.push({ key, entry });
+          }
+          // Reversed so key/value pairs pop in iteration order.
+          for (let index = entries.length - 1; index >= 0; index -= 1) {
+            const { key, entry } = entries[index];
+            const pair = { map: clone, key: undefined, value: undefined, keyDone: false, valueDone: false };
+            const maybeSet = () => {
+              if (pair.keyDone && pair.valueDone) pair.map.set(pair.key, pair.value);
+            };
+            pending.push({
+              value: key,
+              path: `${nodePath}.<key>`,
+              place: (clonedKey) => { pair.key = clonedKey; pair.keyDone = true; maybeSet(); },
+            });
+            pending.push({
+              value: entry,
+              path: `${nodePath}.<value>`,
+              place: (clonedEntry) => { pair.value = clonedEntry; pair.valueDone = true; maybeSet(); },
+            });
+          }
+          continue;
+        } catch (error) {
+          throw boundaryError(`${nodePath} is a Proxy-wrapped Map; only plain data or explicit capabilities cross`);
+        }
+      }
+      if (typeof Set !== "undefined" && node instanceof Set) {
+        try {
+          const clone = new Set();
+          seen.set(node, clone);
+          place(clone);
+          const entries = [];
+          for (const entry of node) entries.push(entry);
+          for (let index = entries.length - 1; index >= 0; index -= 1) {
+            pending.push({
+              value: entries[index],
+              path: `${nodePath}.<value>`,
+              place: (clonedEntry) => clone.add(clonedEntry),
+            });
+          }
+          continue;
+        } catch (error) {
+          throw boundaryError(`${nodePath} is a Proxy-wrapped Set; only plain data or explicit capabilities cross`);
+        }
+      }
+      if (node instanceof Error) {
+        try {
+          place(safeError(node));
+          continue;
+        } catch (error) {
+          throw boundaryError(`${nodePath} is a Proxy-wrapped Error; only plain data or explicit capabilities cross`);
+        }
+      }
+      if (!Array.isArray(node) && !isPlainObject(node)) {
+        throw boundaryError(`${nodePath} must contain only plain data or explicit capabilities`);
+      }
 
-    const clone = Array.isArray(value) ? new Array(value.length) : {};
-    seen.set(value, clone);
-    for (const key of OWN_KEYS(value)) {
-      if (typeof key === "symbol") throw boundaryError(`${path} contains a symbol property`);
-      if (Array.isArray(value) && key === "length") continue;
-      const descriptor = OBJECT_GET_OWN_PROPERTY_DESCRIPTOR(value, key);
-      if (!descriptor) continue;
-      if (!("value" in descriptor)) throw boundaryError(`${path}.${key} is an accessor`);
-      // Null-prototype descriptor: a plain literal would inherit
-      // guest-visible Object.prototype pollution and the host could
-      // reject it as a mixed descriptor.
-      const clonedDescriptor = OBJECT_CREATE(null);
-      clonedDescriptor.value = this.cloneValue(descriptor.value, `${path}.${key}`, direction, seen);
-      clonedDescriptor.writable = descriptor.writable;
-      clonedDescriptor.enumerable = descriptor.enumerable;
-      clonedDescriptor.configurable = descriptor.configurable;
-      OBJECT_DEFINE_PROPERTY(clone, key, clonedDescriptor);
+      const clone = Array.isArray(node) ? new Array(node.length) : {};
+      seen.set(node, clone);
+      place(clone);
+      const keys = OWN_KEYS(node);
+      for (let index = keys.length - 1; index >= 0; index -= 1) {
+        const key = keys[index];
+        if (typeof key === "symbol") throw boundaryError(`${nodePath} contains a symbol property`);
+        if (Array.isArray(node) && key === "length") continue;
+        const descriptor = OBJECT_GET_OWN_PROPERTY_DESCRIPTOR(node, key);
+        if (!descriptor) continue;
+        if (!("value" in descriptor)) throw boundaryError(`${nodePath}.${key} is an accessor`);
+        // Null-prototype descriptor: a plain literal would inherit
+        // guest-visible Object.prototype pollution and the host could
+        // reject it as a mixed descriptor.
+        const clonedDescriptor = OBJECT_CREATE(null);
+        clonedDescriptor.writable = descriptor.writable;
+        clonedDescriptor.enumerable = descriptor.enumerable;
+        clonedDescriptor.configurable = descriptor.configurable;
+        pending.push({
+          value: descriptor.value,
+          path: `${nodePath}.${key}`,
+          place: (clonedValue) => {
+            clonedDescriptor.value = clonedValue;
+            OBJECT_DEFINE_PROPERTY(clone, key, clonedDescriptor);
+          },
+        });
+      }
     }
-    return clone;
+    return result;
   }
 
   createCapability(record) {
