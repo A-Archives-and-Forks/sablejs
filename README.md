@@ -1,8 +1,8 @@
 ![LOGO](./logo.jpg)
 
-[![Ubuntu CI](https://github.com/sablejs/sablejs/actions/workflows/ci.yml/badge.svg)](https://github.com/sablejs/sablejs/actions/workflows/ci.yml)
-[![Version](https://img.shields.io/npm/v/sablejs.svg?sanitize=true)](https://www.npmjs.com/package/sablejs)
-[![License](https://img.shields.io/github/license/sablejs/sablejs)](LICENSE)
+[![Ubuntu CI](https://github.com/ErosZy/sablejs/actions/workflows/ci.yml/badge.svg)](https://github.com/ErosZy/sablejs/actions/workflows/ci.yml)
+[![License](https://img.shields.io/github/license/ErosZy/sablejs)](LICENSE)
+[![Release](https://img.shields.io/github/v/release/ErosZy/sablejs)](https://github.com/ErosZy/sablejs/releases)
 
 sablejs is a **small AOT-compiled execution layer** for running **user-authored and AI-generated JavaScript** in browsers. It combines a **stable ES5.1 contract**, **explicit capabilities**, and **Worker isolation** for **rules, plugins, formulas, and other untrusted logic**.
 
@@ -29,6 +29,34 @@ modern source -> Babel/SWC -> ES5.1 -> sablejs AOT -> browser bundle -> dedicate
                                                                        v
                                                                   application UI
 ```
+
+## Install and build
+
+Install the published package from npm:
+
+```sh
+npm install sablejs
+```
+
+For the ES6+ downlevel and bundling step you also want `@babel/core`, `@babel/preset-env`, and `esbuild` as devDependencies.
+
+### Build from source
+
+```sh
+git clone git@github.com:ErosZy/sablejs.git
+cd sablejs
+npm ci
+npm run build
+```
+
+`npm run build` bundles the publishable single-file artifacts into `dist/`:
+
+| artifact | description |
+| --- | --- |
+| `dist/runtime.js` | standalone runtime only (no compiler), for Worker and browser use |
+| `dist/compiler.js` | full package bundle (compiler + runtime + worker helpers) |
+
+`npm publish` runs the build automatically via `prepublishOnly`.
 
 ## Quick start
 
