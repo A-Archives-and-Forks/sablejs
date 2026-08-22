@@ -27,8 +27,9 @@ modern JS -> ES5.1 -> sablejs AOT -> Worker -> application
 
 ## Install and build
 
-Install the published v2 beta from npm (the v2 series is in beta; `latest`
-still points at the v1 line until 2.0.0 goes stable):
+Install the published v2 beta from npm (currently `2.0.0-beta.1`; the v2
+series is in beta, and `latest` still points at the v1 line until 2.0.0
+goes stable):
 
 ```sh
 npm install sablejs@beta
