@@ -28,8 +28,14 @@ jobs:
         run: npm run upstream:fetch -- test262
       - name: Run ES5.1 Test262 gate
         run: npm run test262
+      - name: Run differential semantics smoke
+        run: npm run test:differential
+      - name: Run differential sandbox-boundary smoke
+        run: npm run test:differential:boundary
       - name: Run performance smoke test
         run: npm run benchmark:smoke
+      - name: Check compiled bundle-size budget
+        run: npm run benchmark:size -- --check
 
   runtimes:
     name: Node, Deno, and Bun E2E

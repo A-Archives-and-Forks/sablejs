@@ -15,7 +15,6 @@ const fs = require("fs");
 const path = require("path");
 const { performance } = require("perf_hooks");
 const { compile } = require("../../src/compiler");
-const { getQuickJS } = require("quickjs-emscripten");
 
 const runtimeModule = path.resolve(__dirname, "../../src/runtime");
 const failureDirectory = path.resolve(__dirname, "../../.cache/differential-failures");
@@ -188,21 +187,31 @@ function runSableJS(source) {
 }
 
 async function createQuickJS() {
-  const QuickJS = await getQuickJS();
+  const { newQuickJSWASMModule } = require("quickjs-emscripten/variants");
   // One context per case: a WASM stack overflow (infinite recursion in a
   // generated program) surfaces as a native throw that leaves the runtime
   // dirty; a dirty context cannot even be disposed, so it is intentionally
-  // leaked and a fresh context serves the next case.
+  // leaked and a fresh context serves the next case. The module itself
+  // survives a few such aborts but eventually stops producing trustworthy
+  // results (every eval returns an error whose name dumps as ""), so any
+  // dirty event or empty-name error recreates the whole isolated module.
+  let modulePromise = newQuickJSWASMModule();
   return {
-    run(source) {
+    async run(source) {
+      let module = await modulePromise;
       let context;
       let dirty = false;
       try {
-        context = QuickJS.newContext();
+        context = module.newContext();
         const result = context.evalCode(source, "fuzz.js");
         if (result.error) {
           const error = context.dump(result.error);
           result.error.dispose();
+          if (error && error.name === "") {
+            // Poisoned-module signature: repeated wasm aborts left the
+            // module returning corrupt exceptions; never trust it again.
+            dirty = true;
+          }
           return { ok: false, error: error && error.name };
         }
         const value = context.dump(result.value);
@@ -212,8 +221,8 @@ async function createQuickJS() {
         dirty = true;
         return { ok: false, error: error && error.name };
       } finally {
-        // A dirty runtime aborts the process if disposed; leak it instead.
         if (context && !dirty) context.dispose();
+        if (dirty) modulePromise = newQuickJSWASMModule();
       }
     },
     dispose() {},
@@ -262,7 +271,7 @@ async function main() {
     const source = new Generator(caseSeed).program();
     const native = runNative(source);
     const sable = runSableJS(source);
-    const quick = quickjs.run(source);
+    const quick = await quickjs.run(source);
 
     if (!same(native, sable)) {
       mismatches.push({ seed: caseSeed, source, native, sable, quick });
@@ -292,7 +301,7 @@ async function main() {
   if (mismatches.length) process.exitCode = 1;
 }
 
-module.exports = { Generator, minimize, runNative, runSableJS, same };
+module.exports = { Generator, argument, createQuickJS, minimize, mulberry32, pick, runNative, runSableJS, same };
 
 if (require.main === module) {
   main().catch((error) => {
