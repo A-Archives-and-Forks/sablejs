@@ -23,7 +23,7 @@ The 2026-08-22 top-10 priorities are all done:
 ## Current snapshot (2026-08-22)
 
 - **Security**: a full boundary audit ([Security](security.md), Historical audit record) found no usable escape; the adversarial regression battery lives in `test/unit/security.test.js` (127 tests, 0 skipped), now including the boundary-internals sweep and the clone-shape sweep (P0-S1–S4).
-- **Performance**: V8 Benchmark Suite 7 sandbox 1,395, trusted 2,070; Octane/SunSpider/Kraken comparison system across sandbox/trusted/QuickJS in place; the sandbox beats QuickJS-WASM on all 8 real-world workloads after the boundary fast paths, plus the guest-provenance write fast path (local-safe IR distinction, 2026-08-22). Details in [Performance](performance.md).
+- **Performance**: V8 Benchmark Suite 7 sandbox 1,497, trusted 2,256 (2026-08-22 refresh); Octane/SunSpider/Kraken comparison system across sandbox/trusted/QuickJS in place; the sandbox beats QuickJS-WASM on all 8 real-world workloads after the boundary fast paths, plus the guest-provenance write fast path (local-safe IR distinction, 2026-08-22). Details in [Performance](performance.md).
 - **Semantics**: the pinned Test262 gate passes; the 33 pre-existing failures were confirmed unrelated to this work by A/B comparison.
 
 ## Next priorities

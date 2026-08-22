@@ -8,20 +8,20 @@ Three complete measured runs were used for each backend. The v1 column is a migr
 
 | Suite | v1 baseline | sandbox O2 | trusted O2 | QuickJS-WASM |
 | --- | ---: | ---: | ---: | ---: |
-| Richards | 162 | 835 | 1,158 | 932 |
-| Crypto | 198 | 3,593 | 7,200 | 936 |
-| RayTrace | 371 | 384 | 444 | 1,226 |
-| NavierStokes | 266 | 5,092 | 10,726 | 1,549 |
-| DeltaBlue | 174 | 946 | 1,184 | 958 |
-| **Geometric score** | **224** | **1,395** | **2,070** | **1,083** |
+| Richards | 162 | 939 | 1,228 | 973 |
+| Crypto | 198 | 3,445 | 7,674 | 950 |
+| RayTrace | 371 | 401 | 446 | 1,261 |
+| NavierStokes | 266 | 5,742 | 11,712 | 1,617 |
+| DeltaBlue | 174 | 1,034 | 1,170 | 1,019 |
+| **Geometric score** | **224** | **1,497** | **2,256** | **1,133** |
 
-Full-suite scores were:
+Full-suite scores were (2026-08-22 refresh, all three backends re-measured on the same machine):
 
-- sablejs O2 sandbox: 1,186, 1,395, 1,423 (median 1,395).
-- sablejs O2 trusted: 1,745, 2,070, 2,195 (median 2,070).
-- QuickJS-WASM: 1,052, 1,083, 1,104 (median 1,083).
+- sablejs O2 sandbox: 1,315, 1,497, 1,510 (median 1,497).
+- sablejs O2 trusted: 1,883, 2,256, 2,273 (median 2,256).
+- QuickJS-WASM: 1,107, 1,133, 1,141 (median 1,133).
 
-Sandbox retains 67.4% of trusted throughput, is 6.23x the removed v1 baseline, and is 1.29x the QuickJS-WASM reference. Property and call guards are kept on optimized locals; only prototype-sensitive reads and host crossings use the full boundary.
+Sandbox retains 66.4% of trusted throughput, is 6.68x the removed v1 baseline, and is 1.32x the QuickJS-WASM reference. Property and call guards are kept on optimized locals; only prototype-sensitive reads and host crossings use the full boundary.
 
 ### Boundary profile
 
@@ -47,7 +47,7 @@ Two boundary hot paths were profiled and specialized without changing sandbox se
 - **Pure-intrinsic call fast path.** Intrinsics that appear in no guard set (`MUTATES_ARGUMENT_ZERO`, `MUTATES_RECEIVER`, `INSPECTS_ARGUMENT_ZERO`, the `Function.prototype.call/apply/bind` and `Reflect.apply/construct` rewrites, `Error.captureStackTrace`, `Function.prototype.toString`) skip the per-call argument and receiver inspections. Classification is computed lazily per target and cached in a `WeakMap`; a monomorphic identity cache in `boundary.call` lets single-intrinsic loops skip dispatch entirely. Guarded targets keep the full checks.
 - **Shared intrinsic graph.** The protected-intrinsic graph walk consumed ~48% of `createInstance` time and is now captured once and shared by every instance: sandbox `createInstance` + `dispose` dropped from 387 µs to 33.6 µs (trusted is 23.2 µs). Contract: the host must not extend intrinsic prototypes after the first instance is created (see [Security](security.md)).
 
-- **Guest-provenance write fast path** (the local-safe IR distinction, v1). The O2/Os provenance pass (`src/backend/guest-provenance.js`, after the last SSA pass) proves which GETLOCAL outputs are guest-created — object/array/regexp literals, closures, and AND-meet phi joins — and marks them on the HIR. Sandbox `SETPROP`/`SETPROP_S` into a provably guest target lower to a slim `$setGuest` helper: `setSandboxPropertyValue` minus `writeTarget`, keeping `secureValue` on function values and strict/sloppy writer dispatch. Marked ⇒ guest-created ⇒ never a wrapper, capability token, or protected intrinsic, so `writeTarget` would be a no-op; nothing unmarked takes the fast path, and value-side handling is byte-identical between the two paths. Coverage on the V8 suite: 36 fast-path sites in the whole-suite compile, all one-time setup writes (harness config, class enums, `Klass.prototype = ...`); the write-dominated suites' hot loops write `this`-targeted fields and `new` results. Regression evidence: with the fast path disabled, the `writeTargets`/`calls` boundary-counter ratios for Crypto, RayTrace, and DeltaBlue are identical to 4 significant digits (A/B over adaptive-iteration runs); re-measured sandbox median 1,387 vs the documented 1,395 and trusted 2,226 vs 2,070, both inside the documented sample spreads; `benchmark:smoke` green; adversarial `security.test.js` cases at all four optimization levels plus both differential smokes (2,300 generated programs, zero mismatches/failures) pin that unmarked writes (intrinsics, capability tokens, globals, parameters) stay on the guarded path.
+- **Guest-provenance write fast path** (the local-safe IR distinction, v1). The O2/Os provenance pass (`src/backend/guest-provenance.js`, after the last SSA pass) proves which GETLOCAL outputs are guest-created — object/array/regexp literals, closures, and AND-meet phi joins — and marks them on the HIR. Sandbox `SETPROP`/`SETPROP_S` into a provably guest target lower to a slim `$setGuest` helper: `setSandboxPropertyValue` minus `writeTarget`, keeping `secureValue` on function values and strict/sloppy writer dispatch. Marked ⇒ guest-created ⇒ never a wrapper, capability token, or protected intrinsic, so `writeTarget` would be a no-op; nothing unmarked takes the fast path, and value-side handling is byte-identical between the two paths. Coverage on the V8 suite: 36 fast-path sites in the whole-suite compile, all one-time setup writes (harness config, class enums, `Klass.prototype = ...`); the write-dominated suites' hot loops write `this`-targeted fields and `new` results. Regression evidence: with the fast path disabled, the `writeTargets`/`calls` boundary-counter ratios for Crypto, RayTrace, and DeltaBlue are identical to 4 significant digits (A/B over adaptive-iteration runs); the A/B re-measurement (sandbox 1,387, trusted 2,226) and the 2026-08-22 full refresh (sandbox 1,497, trusted 2,256) both sit inside or above the earlier sample spreads; `benchmark:smoke` green; adversarial `security.test.js` cases at all four optimization levels plus both differential smokes (2,300 generated programs, zero mismatches/failures) pin that unmarked writes (intrinsics, capability tokens, globals, parameters) stay on the guarded path.
 
 These changes took the Octane sandbox geometric score from 1,613 to 1,772, the Kraken sandbox total from 28.6 s to 20.8 s, and every real-world workload above the QuickJS-WASM reference (below).
 
@@ -81,10 +81,10 @@ The O2 per-scope premium buys throughput: V8 Benchmark Suite 7 sandbox scores by
 | --- | ---: | ---: |
 | O0 | 25.5 | 589.7 KB |
 | O1 | 26.3 | 582.9 KB |
-| O2 | 1,387 (median) | 593.4 KB |
+| O2 | 1,497 (median) | 593.4 KB |
 | Os | 884 | 360.9 KB |
 
-The per-scope choice at O2 is the right trade: the same suite with shared factories scores 1,035 (single run) — +34% throughput for +55% raw CJS. Os keeps shared factories and still lands at 884, i.e. O2's other optimizations buy +17% over Os at 3.9x the min-IIFE delta. Factory safe-sharing — emitting a shared factory only when frame layouts are provably identical — is the next size lever: it could recover most of the O2 premium for scopes whose frames happen to match, without the score loss of forcing all-shared.
+The per-scope choice at O2 is the right trade: the same suite with shared factories scores 1,035 (single run) — +45% throughput (median vs shared single run) for +55% raw CJS. Os keeps shared factories and still lands at 884, i.e. O2's other optimizations buy +17% over Os at 3.9x the min-IIFE delta. Factory safe-sharing — emitting a shared factory only when frame layouts are provably identical — is the next size lever: it could recover most of the O2 premium for scopes whose frames happen to match, without the score loss of forcing all-shared.
 
 ## Source vs compiled artifact on the wire
 
@@ -105,17 +105,17 @@ Octane is pinned to final revision `570ad1ccfe86e3eecba0636c8f932ac08edec517`. O
 
 | Suite | sablejs O2 trusted | sablejs O2 sandbox | QuickJS-WASM |
 | --- | ---: | ---: | ---: |
-| Richards | 110 | 858 | 899 |
-| DeltaBlue | 1,346 | 1,013 | 977 |
-| Crypto | 7,685 | 3,506 | 891 |
-| RayTrace | 460 | 252 | 1,175 |
-| RegExp | 5,096 | 2,414 | 237 |
-| Splay | 1,752 | 1,376 | 2,670 |
-| NavierStokes | 11,901 | 4,683 | 1,507 |
-| Box2D | 2,861 | 2,230 | 3,329 |
-| **Geometric score** | **2,205** | **1,772** | **1,413** |
+| Richards | 1,294 | 929 | 897 |
+| DeltaBlue | 1,321 | 1,088 | 992 |
+| Crypto | 3,919 | 3,440 | 897 |
+| RayTrace | 442 | 410 | 713 |
+| RegExp | 4,927 | 3,371 | 442 |
+| Splay | 1,749 | 1,628 * | 2,832 * |
+| NavierStokes | 11,700 | 5,730 | 1,572 |
+| Box2D | 3,017 | 2,296 | 3,608 |
+| **Geometric score** | **2,674** | **2,088** | **1,472** |
 
-Sandbox retains 80.4% of trusted throughput on the Octane subset and scores 1.25x QuickJS-WASM. All generated scopes used structured or straight-line codegen (`fallbackScopes=0`). Octane figures are single measured runs; the other suites below use three-sample medians.
+Sandbox retains 78.1% of trusted throughput on the Octane subset and scores 1.42x QuickJS-WASM. All generated scopes used structured or straight-line codegen (`fallbackScopes=0`). Octane figures are single measured runs; the other suites below use three-sample medians. (* Splay for sandbox/QuickJS is derived from the same run's geometric score — the printed score is the geometric mean over the nine metrics including SplayLatency — with under 1% derivation error, smaller than the run-to-run variance.)
 
 ## SunSpider 1.0 subset
 
@@ -123,11 +123,11 @@ SunSpider is pinned from the `Action-Kamen/JavaScript-Benchmarks` mirror (`bench
 
 | Backend | Total (23 tests) |
 | --- | ---: |
-| sablejs O2 trusted | 302.9 ms |
-| sablejs O2 sandbox | 482.3 ms |
-| QuickJS-WASM | 619.0 ms |
+| sablejs O2 trusted | 276.0 ms |
+| sablejs O2 sandbox | 442.2 ms |
+| QuickJS-WASM | 588.1 ms |
 
-Sandbox runs at 62.8% of trusted throughput and 1.28x QuickJS-WASM. Trusted mode passes all 23 tests; the `$v1_30` temporary-scoping bug that failed `string-unpack-code` was fixed by a `temporaryRegions` visibility check (see [Roadmap](roadmap.md), Recent fixes).
+Sandbox runs at 62.4% of trusted throughput and 1.33x QuickJS-WASM. Trusted mode passes all 23 tests; the `$v1_30` temporary-scoping bug that failed `string-unpack-code` was fixed by a `temporaryRegions` visibility check (see [Roadmap](roadmap.md), Recent fixes).
 
 ## Kraken 1.1 subset
 
@@ -135,11 +135,11 @@ Kraken is pinned from `mozilla/krakenbenchmark.mozilla.org` (`tests/kraken-1.1`)
 
 | Backend | Total (14 tests) |
 | --- | ---: |
-| sablejs O2 trusted | 6,094.2 ms |
-| sablejs O2 sandbox | 20,829.8 ms |
-| QuickJS-WASM | 22,402.1 ms |
+| sablejs O2 trusted | 5,641.8 ms |
+| sablejs O2 sandbox | 19,750.7 ms |
+| QuickJS-WASM | 22,087.8 ms |
 
-Sandbox runs at 29.3% of trusted throughput and 1.08x QuickJS-WASM on the Kraken subset. The imaging tests dominate the sandbox total: their per-pixel property writes pay the boundary write guard on every element, which is exactly the cost the sandbox tax section tracks on the V8 suite. The pure-intrinsic call fast path took the sandbox total from 28.6 s to 20.8 s.
+Sandbox runs at 28.6% of trusted throughput and 1.12x QuickJS-WASM on the Kraken subset. The imaging tests dominate the sandbox total: their per-pixel property writes pay the boundary write guard on every element, which is exactly the cost the sandbox tax section tracks on the V8 suite. The pure-intrinsic call fast path took the sandbox total from 28.6 s to 20.8 s.
 
 ## Real-world workloads
 

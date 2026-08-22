@@ -199,17 +199,17 @@ Three-run medians on the Linux x64 reference machine (methodology, exclusions, a
 
 | Backend | V8 Benchmark Suite 7 score | vs sandbox |
 | --- | ---: | ---: |
-| sablejs O2 sandbox | 1,395 | — |
-| sablejs O2 trusted | 2,070 | 1.48x |
-| QuickJS-WASM 0.32.0 | 1,083 | 0.78x |
+| sablejs O2 sandbox | 1,497 | — |
+| sablejs O2 trusted | 2,256 | 1.51x |
+| QuickJS-WASM 0.32.0 | 1,133 | 0.76x |
 
 | Suite | sablejs trusted | sablejs sandbox | QuickJS-WASM |
 | --- | ---: | ---: | ---: |
-| Octane 2.0 geometric score | 2,205 | 1,772 | 1,413 |
-| SunSpider 1.0 total (23 tests, ms) | 302.9 | 482.3 | 619.0 |
-| Kraken 1.1 total (14 tests, ms) | 6,094.2 | 20,829.8 | 22,402.1 |
+| Octane 2.0 geometric score | 2,674 | 2,030 | 1,522 |
+| SunSpider 1.0 total (23 tests, ms) | 276.0 | 442.2 | 588.1 |
+| Kraken 1.1 total (14 tests, ms) | 5,641.8 | 19,750.7 | 22,087.8 |
 
-Sandbox retains 67.4% of trusted throughput on V8 Benchmark Suite 7 under this harness, and beats QuickJS-WASM on all eight real-world workloads. These numbers characterize this benchmark and harness, not universal application performance. A 137 KB benchmark source compiles to a 593 KB minified sandbox bundle (81.5 KB gzipped; the size-optimized `Os` level: 361 KB / 58.8 KB). Compiled bundle sizes are gated in CI — `npm run benchmark:size -- --check` fails any artifact that exceeds its recorded budget by 5%.
+Sandbox retains 66.4% of trusted throughput on V8 Benchmark Suite 7 under this harness, and beats QuickJS-WASM on all eight real-world workloads. These numbers characterize this benchmark and harness, not universal application performance. A 137 KB benchmark source compiles to a 593 KB minified sandbox bundle (81.5 KB gzipped; the size-optimized `Os` level: 361 KB / 58.8 KB). Compiled bundle sizes are gated in CI — `npm run benchmark:size -- --check` fails any artifact that exceeds its recorded budget by 5%.
 
 ## Security
 
