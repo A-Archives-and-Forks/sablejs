@@ -946,3 +946,172 @@ describe("sablejs OpSpec and AOT backend", function() {
     instance.dispose();
   });
 });
+
+describe("sablejs guest-object provenance (local-safe write distinction)", function () {
+  function sandboxCompile(source, options = {}) {
+    return compileProgram(source, { security: "sandbox", runtimeModule, ...options });
+  }
+
+  function scriptScope(hir) {
+    return hir.scopes.find((scope) => scope.script);
+  }
+
+  it("marks literal-held locals at O2/Os and emits the writeTarget-free guest helper", function () {
+    for (const optimization of ["O2", "Os"]) {
+      const result = sandboxCompile("var o = {}; o.x = 1; o.x;", { optimization, includeHIR: true });
+      // Both GETLOCAL reads of `o` are proven guest-created: the write target
+      // and the final read.
+      assert.equal(result.stats.guestProvenance.markedLoads, 2, optimization);
+      const marked = scriptScope(result.hir).instructions.filter((instruction) => instruction.guestObjectOutput);
+      assert.equal(marked.length, 2, optimization);
+      assert.ok(marked.every((instruction) => instruction.op === "GETLOCAL"), optimization);
+      assert.match(result.code, /setGuestPropertyValue/, optimization);
+      assert.doesNotMatch(result.code, /setSandboxPropertyValue/, optimization);
+      // This evaluates already-generated test output (see load above).
+      const generatedModule = { exports: {} };
+      new Function("require", "module", "exports", result.code)(require, generatedModule, generatedModule.exports);
+      assert.equal(generatedModule.exports.createInstance().run(), 1);
+    }
+  });
+
+  it("never marks globals, injected data, or kill-reassigned locals", function () {
+    const result = sandboxCompile(
+      "var o = {}; o = Math.PI; o.x = 1; var t = g; t.x = 1; cap.foo = 1; Math.y = 2;",
+      { optimization: "O2", includeHIR: true }
+    );
+    assert.equal(result.stats.guestProvenance.markedLoads, 0);
+    assert.ok(!result.hir.scopes.some((scope) =>
+      scope.instructions.some((instruction) => instruction.guestObjectOutput)
+    ));
+    assert.match(result.code, /setSandboxPropertyValue/);
+    assert.doesNotMatch(result.code, /setGuestPropertyValue/);
+  });
+
+  it("leaves parameter slots unmarked (no seed flows into them)", function () {
+    const result = sandboxCompile("function f(o) { o.x = 1; return o.x; } f({ a: 1 });", {
+      optimization: "O2",
+      includeHIR: true,
+    });
+    const functionScope = result.hir.scopes.find((scope) => !scope.script);
+    assert.equal(functionScope.parameterCount, 1);
+    assert.ok(!functionScope.instructions.some((instruction) => instruction.guestObjectOutput));
+    assert.match(result.code, /setSandboxPropertyValue/);
+  });
+
+  it("marks phi joins only when every input is guest-created", function () {
+    const joined = sandboxCompile("var o = (g.flag ? {} : {}); o.x = 1; o.x;", {
+      optimization: "O2",
+      includeHIR: true,
+    });
+    assert.ok(joined.stats.guestProvenance.markedLoads >= 1);
+    assert.match(joined.code, /setGuestPropertyValue/);
+    assert.doesNotMatch(joined.code, /setSandboxPropertyValue/);
+
+    // A host value (Math.PI) on one arm kills the join mark: the load after
+    // the reassignment must stay unmarked and the write must stay guarded.
+    const mixed = sandboxCompile("var o = (g.flag ? {} : Math.PI); o.x = 1; o.x;", {
+      optimization: "O2",
+      includeHIR: true,
+    });
+    assert.equal(mixed.stats.guestProvenance.markedLoads, 0);
+    assert.match(mixed.code, /setSandboxPropertyValue/);
+    assert.doesNotMatch(mixed.code, /setGuestPropertyValue/);
+  });
+
+  it("keeps the provenance marks off O0/O1 output (no direct mode)", function () {
+    for (const optimization of ["O0", "O1"]) {
+      const result = sandboxCompile("var o = {}; o.x = 1; o.x;", { optimization, includeHIR: true });
+      assert.equal(result.stats.guestProvenance, undefined, optimization);
+      assert.ok(!result.hir.scopes.some((scope) =>
+        scope.instructions.some((instruction) => instruction.guestObjectOutput)
+      ), optimization);
+      // The guarded runtime write path ($r.setPropertyStatic -> writeTarget)
+      // is unchanged at O0/O1; no guest helper exists there.
+      assert.match(result.code, /setPropertyStatic/, optimization);
+      assert.doesNotMatch(result.code, /setGuestPropertyValue/, optimization);
+    }
+  });
+});
+
+describe("sablejs generated-code inspection mode (dumpDir)", function() {
+  const fs = require("fs");
+  const os = require("os");
+
+  function tempDumpDir() {
+    return fs.mkdtempSync(path.join(os.tmpdir(), "sablejs-dump-test-"));
+  }
+
+  it("writes hir.txt, mir.txt, and code.js for O2", function() {
+    const dir = tempDumpDir();
+    try {
+      const result = compile(
+        "var o = {}; o.x = 1; var t = (o.g ? 1 : 2) + 3; function f(a) { return a + 1; } f(41);",
+        { optimization: "O2", security: "sandbox", dumpDir: dir }
+      );
+      // The dump is a side channel; the result object is unchanged unless the
+      // graph-returning options are requested.
+      assert.equal(result.hir, undefined);
+      assert.equal(result.mir, undefined);
+      const files = fs.readdirSync(dir).sort();
+      assert.deepStrictEqual(files, ["code.js", "hir.txt", "mir.txt"]);
+
+      const hir = fs.readFileSync(path.join(dir, "hir.txt"), "utf8");
+      assert.match(hir, /^ProgramHIR version=1 entry=#0 scopes=2\n/);
+      assert.match(hir, /scope "" #0 codeLength=\d+/);
+      assert.match(hir, /NEWOBJECT/);
+      assert.match(hir, /SETPROP_S "x"/);
+      // Nested scopes print as references, not JSON graphs.
+      assert.match(hir, /CLOSURE scope:"f" #1/);
+      assert.doesNotMatch(hir, /\{"kind":"FunctionHIR"/);
+      // The provenance mark is visible in the dump.
+      assert.match(hir, /GETLOCAL 1\s+; guest/);
+
+      const mir = fs.readFileSync(path.join(dir, "mir.txt"), "utf8");
+      assert.match(mir, /^MIR scopes=2\n/);
+      assert.match(mir, /block \d+\.\.\d+/);
+      // The ternary join produces a phi (block with pred=[...] succ=[...]).
+      assert.match(mir, /pred=\[.*\] succ=\[/);
+      assert.match(mir, /phi #\S+ slot=\d+ <- \[/);
+
+      const code = fs.readFileSync(path.join(dir, "code.js"), "utf8");
+      assert.match(code, /"use strict";/);
+      assert.match(code, /\$createProgram\(/);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("works at every optimization level including O0", function() {
+    for (const optimization of ["O0", "O1", "O2", "Os"]) {
+      const dir = tempDumpDir();
+      try {
+        compile("var a = 1 + 2; a;", { optimization, dumpDir: dir });
+        const hir = fs.readFileSync(path.join(dir, "hir.txt"), "utf8");
+        assert.match(hir, /^ProgramHIR/, optimization);
+        assert.match(fs.readFileSync(path.join(dir, "mir.txt"), "utf8"), /^MIR scopes=1\n/, optimization);
+        assert.match(fs.readFileSync(path.join(dir, "code.js"), "utf8"), /"use strict";/, optimization);
+      } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+    }
+  });
+
+  it("mirrors the graph dumps when dumpIR/includeHIR are also set", function() {
+    const dir = tempDumpDir();
+    try {
+      const result = compile("var o = { a: 1 }; o.a;", {
+        optimization: "O2",
+        security: "sandbox",
+        dumpDir: dir,
+        dumpIR: "all",
+      });
+      assert.ok(result.hir);
+      assert.ok(result.mir);
+      const mir = fs.readFileSync(path.join(dir, "mir.txt"), "utf8");
+      assert.match(mir, /mir scope #0 /);
+      assert.match(mir, /NEWOBJECT/);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});

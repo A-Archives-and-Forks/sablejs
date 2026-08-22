@@ -65,7 +65,10 @@ describe("sablejs sandbox security boundary", function () {
     );
     assert.match(loaded.result.code, /getSandboxPropertyValue/);
     assert.match(loaded.result.code, /applySandboxValue/);
-    assert.match(loaded.result.code, /setSandboxPropertyValue/);
+    // The written object is provably guest-created (literal stored in a
+    // local), so the write takes the writeTarget-free guest path; reads and
+    // calls of the same object stay mediated.
+    assert.match(loaded.result.code, /setGuestPropertyValue/);
     assert.match(loaded.result.code, /\["read"\]/);
     assert.doesNotMatch(loaded.result.code, /\$r\.(?:getProperty|call|setProperty)/);
     assert.equal(loaded.program.createInstance().run(), 2);
@@ -815,5 +818,374 @@ describe("sablejs sandbox known issues (audit 2026-08-22)", function () {
     const instance = loaded.program.createInstance({ globals: {} });
     assert.deepStrictEqual(instance.run()(), [2, 2]);
     instance.dispose();
+  });
+});
+
+describe("sablejs sandbox boundary-internals and clone sweep (P0 audit 2026-08-22)", function () {
+  // P0-S1: the boundary used to tag wrappers with a symbol (`HOST_TARGET`)
+  // that guest proxies could observe in traps and that enumeration paths
+  // could reveal. The mapping now lives in a WeakMap (trap-free and
+  // unforgeable); these regressions pin the old reveal closed.
+
+  it("reveals no boundary symbols through enumeration on wrappers or intrinsics", function () {
+    // The only symbol a guest may observe on a mediated intrinsic is the
+    // intrinsic's own spec tag (Math[Symbol.toStringTag]); a boundary tag
+    // would be a foreign symbol on every entry in this list.
+    const result = run(
+      "var tag = (typeof Symbol === 'function' && Symbol.toStringTag) || null;" +
+      "var list = [Array.prototype.push, Object.prototype.toString, ({}).constructor, Math, JSON];" +
+      "list.map(function (w) {" +
+      "  var own = Object.getOwnPropertySymbols(w);" +
+      "  var all = Reflect.ownKeys(w);" +
+      "  var foreign = 0;" +
+      "  for (var i = 0; i < all.length; i += 1) {" +
+      "    if (typeof all[i] === 'symbol' && all[i] !== tag) foreign += 1;" +
+      "  }" +
+      "  var foreignOwn = 0;" +
+      "  for (var j = 0; j < own.length; j += 1) {" +
+      "    if (own[j] !== tag) foreignOwn += 1;" +
+      "  }" +
+      "  var foreignDesc = (typeof Object.getOwnPropertyDescriptors === 'function')" +
+      "    ? Reflect.ownKeys(Object.getOwnPropertyDescriptors(w))" +
+      "        .filter(function (k) { return typeof k === 'symbol' && k !== tag; }).length" +
+      "    : 0;" +
+      "  return [foreignOwn, foreign, foreignDesc];" +
+      "});"
+    ).value;
+    assert.deepStrictEqual(result, [[0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0]]);
+  });
+
+  it("never fires guest proxy get traps with boundary internals during writes", function () {
+    const result = run(
+      "var log = [];" +
+      "var p = new Proxy({ x: 1 }, {" +
+      "  get: function (t, k) { log.push(k); return t[k]; }," +
+      "  set: function (t, k, v) { t[k] = v; return true; }" +
+      "});" +
+      "p.x = 2;" +
+      "var duringWrite = log.length;" +
+      "Object.getOwnPropertySymbols(p);" +
+      "var duringSymbols = log.length;" +
+      "p.x;" +
+      "[duringWrite, duringSymbols, log[log.length - 1], p.x];"
+    ).value;
+    assert.deepStrictEqual(result, [0, 0, "x", 2]);
+  });
+
+  it("keeps write-target resolution trap-free so guest traps cannot steer writes", function () {
+    // A get trap returning a mediated wrapper must not let the write resolve
+    // to the wrapper's host target (old behaviour: boundary error, or a write
+    // into a shared intrinsic). The write lands per the guest's own trap
+    // semantics on its own target.
+    const result = run(
+      "var boundaryPush = Array.prototype.push;" +
+      "var target = {};" +
+      "var p = new Proxy(target, {" +
+      "  get: function (t, k) { return boundaryPush; }," +
+      "  set: function (t, k, v) { t[k] = v; return true; }" +
+      "});" +
+      "p.steer = 42;" +
+      "target.steer;"
+    ).value;
+    assert.equal(result, 42);
+  });
+
+  it("mediates writes made inside guest proxy traps the same as any guest write", function () {
+    const outcome = attempt(
+      "var p = new Proxy({}, {" +
+      "  set: function (t, k, v) { Math.polluted = 1; return true; }" +
+      "});" +
+      "p.x = 1;"
+    );
+    assert.equal(outcome.outcome, "throw");
+    assert.match(outcome.message, /cannot modify a shared intrinsic/);
+  });
+
+  // P0-S3: clone edge shapes — sparse, huge, deep, exotic.
+
+  it("clones sparse arrays with holes preserved and huge lengths without iterating holes", function () {
+    const sparse = new Array(5);
+    sparse[1] = "a";
+    sparse[3] = "b";
+    assert.deepStrictEqual(
+      run(
+        "var a = input; a[0] = 'x';" +
+        "[a.length, (0 in a), (1 in a), a[1], a[3], a[4]];",
+        { input: sparse }
+      ).value,
+      [5, true, true, "a", "b", undefined]
+    );
+
+    const huge = [];
+    huge.length = 100000;
+    huge[99999] = 7;
+    assert.deepStrictEqual(
+      run(
+        "var a = input; a[50000] = 1;" +
+        "[a.length, a[99999], (50000 in a), (0 in a)];",
+        { input: huge }
+      ).value,
+      [100000, 7, true, false]
+    );
+  });
+
+  it("clones huge plain object graphs", function () {
+    const big = {};
+    for (let i = 0; i < 50000; i += 1) big["k" + i] = i;
+    assert.deepStrictEqual(
+      run("[Object.keys(input).length, input.k49999, input.k0, input.missing];", { input: big }).value,
+      [50000, 49999, 0, undefined]
+    );
+  });
+
+  it("clones deeply nested graphs iteratively without stack overflow", function () {
+    let deep = { leaf: true };
+    for (let i = 0; i < 100000; i += 1) deep = { child: deep };
+    deep.self = deep;
+    assert.equal(run("typeof input;", { input: deep }).value, "object");
+    const walk = run(
+      "var d = input; var n = 0;" +
+      "while (typeof d === 'object') { d = d.child; n += 1; }" +
+      "[n, d];",
+      { input: deep }
+    ).value;
+    assert.deepStrictEqual(walk, [100001, undefined]);
+  });
+
+  it("handles null-prototype objects, class instances, and specials nested in plain data", function () {
+    const nullProto = Object.create(null);
+    nullProto.value = 1;
+    assert.equal(
+      run("Object.getPrototypeOf(input) === Object.prototype;", { input: nullProto }).value,
+      true
+    );
+
+    class HostClass {}
+    const instance = new HostClass();
+    instance.value = 1;
+    assert.equal(attempt("input;", { input: instance }).outcome, "throw");
+
+    const date = new Date(1700000000000);
+    assert.deepStrictEqual(
+      run("[input.a === input.b, input.a.getTime()];", { input: { a: date, b: date } }).value,
+      [false, 1700000000000]
+    );
+  });
+
+  // P0-S4: Map / Set / typed array / Buffer clone boundaries.
+
+  it("clones Map keys and values with identity preserved across the graph", function () {
+    const shared = { name: "shared" };
+    const inner = new Map([["x", 2]]);
+    const map = new Map([[shared, 1], ["inner", inner]]);
+    assert.deepStrictEqual(
+      run(
+        "var m = input.map;" +
+        "[m.get(input.shared), m.get('inner').get('x'), m.size, m.has(input.shared)];",
+        { input: { map, shared } }
+      ).value,
+      [1, 2, 2, true]
+    );
+
+    const cyclic = new Map();
+    cyclic.set("self", cyclic);
+    assert.equal(
+      run("input.m.get('self') === input.m;", { input: { m: cyclic } }).value,
+      true
+    );
+  });
+
+  it("clones Sets with member identity preserved", function () {
+    const a = { name: "a" };
+    const b = { name: "b" };
+    assert.deepStrictEqual(
+      run("[input.s.has(input.a), input.s.has(input.b), input.s.size];", {
+        input: { s: new Set([a, b]), a, b }
+      }).value,
+      [true, true, 2]
+    );
+  });
+
+  it("clones typed arrays with standard prototypes and DataView bytes", function () {
+    const floats = new Float64Array([1.5, 2.5]);
+    class MyBytes extends Uint8Array {}
+    const sub = new MyBytes([1, 2, 3]);
+    const view = new DataView(new ArrayBuffer(3));
+    view.setUint8(0, 0);
+    view.setUint8(1, 255);
+    view.setUint8(2, 128);
+    assert.deepStrictEqual(
+      run(
+        "[" +
+        "  input.floats.length, input.floats[0], input.floats[1]," +
+        "  Object.getPrototypeOf(input.floats) === Float64Array.prototype," +
+        "  Object.getPrototypeOf(input.sub) === Uint8Array.prototype," +
+        "  input.sub.length, input.sub[2]," +
+        "  input.view.getUint8(1), input.view.byteLength" +
+        "];",
+        { input: { floats, sub, view } }
+      ).value,
+      [2, 1.5, 2.5, true, true, 3, 3, 255, 3]
+    );
+  });
+
+  it("clones guest Maps, Sets, and typed arrays back to the host", function () {
+    const result = run(
+      "var k = { id: 1 };" +
+      "var m = new Map(); m.set(k, 'v');" +
+      "var s = new Set([k]);" +
+      "var f = new Float32Array([0.5]);" +
+      "[m, s, f, k];"
+    ).value;
+    assert.equal(result[0] instanceof Map, true);
+    assert.equal(result[0].get(result[3]), "v");
+    assert.equal(result[1] instanceof Set, true);
+    assert.equal(result[1].has(result[3]), true);
+    assert.equal(result[2] instanceof Float32Array, true);
+    assert.deepStrictEqual(Array.from(result[2]), [0.5]);
+  });
+});
+
+describe("sablejs sandbox fuzzer regressions (boundary facet campaign 2026-08-22)", function () {
+  // Fuzz-boundary campaign findings: mediated calls whose target overflows
+  // the stack used to corrupt the reported error (the sanitization path
+  // itself ran on an exhausted stack and threw "Invalid regular
+  // expression" SyntaxError instead of the engine's RangeError), and proxy
+  // arguments over branded containers leaked raw receiver TypeErrors from
+  // the clone internals instead of the documented boundary rejection.
+
+  it("preserves the engine's own error when a mediated call exhausts the stack", function () {
+    const source =
+      "function f0(a, b) {" +
+      "  Object.defineProperty({}, 'x', { value: f0(1, 2) });" +
+      "  return 3;" +
+      "}" +
+      "f0(0, 0);";
+    for (const optimization of ["O0", "O1", "O2", "Os"]) {
+      const trusted = load(source, { optimization, security: "trusted" });
+      let trustedError;
+      try { trusted.program.createInstance({}).run(); } catch (error) { trustedError = error; }
+      assert.ok(trustedError, `${optimization} trusted recursion did not fail`);
+      assert.equal(trustedError.name, "RangeError");
+
+      const sandbox = load(source, { optimization, security: "sandbox" });
+      let sandboxError;
+      try { sandbox.program.createInstance({}).run(); } catch (error) { sandboxError = error; }
+      assert.ok(sandboxError, `${optimization} sandbox recursion did not fail`);
+      assert.equal(sandboxError.name, "RangeError",
+        `${optimization} sandbox corrupted the stack-overflow error`);
+      assert.equal(sandboxError.message, trustedError.message,
+        `${optimization} sandbox changed the stack-overflow error`);
+    }
+  });
+
+  it("rejects Proxy-wrapped branded containers with the documented boundary error", function () {
+    const cases = [
+      ["new Set([1, 'a'])", "Set"],
+      ["new Map([['k', 1]])", "Map"],
+      ["new Date(1234567890)", "Date"],
+      ["new ArrayBuffer(8)", "ArrayBuffer"],
+    ];
+    for (const [expression, tag] of cases) {
+      const result = run(
+        "var fn = g;" +
+        "try { fn(new Proxy(" + expression + ", { get: function (t, k) { return t[k]; } })); }" +
+        "catch (e) { e.message; }",
+        { g: sablejs.capability(function () {}, { name: "g" }) }
+      );
+      assert.equal(
+        result.value,
+        "sablejs sandbox boundary: g.args[0] is a Proxy-wrapped " + tag +
+          "; only plain data or explicit capabilities cross",
+        `${expression} did not produce the proxy boundary rejection`
+      );
+    }
+  });
+
+  it("reports the proxy rejection as a TypeError with a stable boundary message", function () {
+    const result = run(
+      "var caught = null;" +
+      "try { fn(new Proxy(new Set([1]), { get: function (t, k) { return t[k]; } })); }" +
+      "catch (e) { caught = [e.name, e.message]; }" +
+      "caught;",
+      { fn: sablejs.capability(function () {}, { name: "fn" }) }
+    );
+    assert.deepStrictEqual(result.value, [
+      "TypeError",
+      "sablejs sandbox boundary: fn.args[0] is a Proxy-wrapped Set; only plain data or explicit capabilities cross",
+    ]);
+  });
+
+  it("still clones proxies over plain data as the data they present", function () {
+    const result = run(
+      "var got = null;" +
+      "var v = fn(new Proxy({ a: 1, b: [2] }, { get: function (t, k) { return t[k]; } }));" +
+      "[v.a, v.b[0], typeof v];",
+      { fn: sablejs.capability(function (x) { return x; }, { name: "fn" }) }
+    );
+    assert.deepStrictEqual(result.value, [1, 2, "object"]);
+  });
+});
+
+describe("sablejs guest-object write fast path (local-safe IR distinction)", function () {
+  it("keeps protected-intrinsic writes blocked at every optimization level", function () {
+    assertSandboxBlocked("Math.PI = 3;");
+    // The `__proto__` read is sensitive, so its result carries a mediated
+    // origin and the write to the shared Object.prototype stays guarded.
+    assertSandboxBlocked("({}).__proto__.x = 1;");
+    assertSandboxBlocked("var p = Object.getPrototypeOf({}); p.x = 1;");
+  });
+
+  it("keeps capability-token, injected-data, and captured-locals writes on the guarded path", function () {
+    const loaded = load(
+      "cap.foo = 1; g.x = 1; var t = g; t.y = 2;" +
+      "function outer() { var o = {}; return function () { o.x = 1; return o.x; }; }" +
+      "outer()();",
+      { optimization: "O2" }
+    );
+    assert.match(loaded.result.code, /setSandboxPropertyValue/);
+    assert.doesNotMatch(loaded.result.code, /setGuestPropertyValue/);
+    assert.equal(
+      loaded.program.createInstance({
+        globals: { cap: sablejs.capability(() => 1), g: { a: 1 } },
+      }).run(),
+      1
+    );
+  });
+
+  it("still secures stored host functions on the guest write path", function () {
+    // Reading `[].map` off a guest array yields the raw host function; the
+    // slim guest write path must still wrap it before storing, so the stored
+    // value is a wrapper, not the raw function.
+    assert.equal(
+      run("var o = {}; o.f = [].map; o.f === [].map;", undefined, { optimization: "O2" }).value,
+      false
+    );
+    for (const optimization of ["O0", "O1", "O2", "Os"]) {
+      assert.deepStrictEqual(
+        run("var o = {}; o.f = [].map; o.f.call([1], String);", undefined, { optimization }).value,
+        ["1"]
+      );
+    }
+  });
+
+  it("writes through closures as guest targets at every optimization level", function () {
+    for (const optimization of ["O0", "O1", "O2", "Os"]) {
+      assert.equal(
+        run("function f() {} f.x = 1; f.x === 1;", undefined, { optimization }).value,
+        true
+      );
+    }
+  });
+
+  it("fast-paths phi-joined guest objects and keeps mixed joins guarded", function () {
+    const joined = run("var o = (g.flag ? {} : {}); o.x = 1; o.x;", { g: { flag: 1 } }, { optimization: "O2" });
+    assert.equal(joined.value, 1);
+    assert.match(joined.result.code, /setGuestPropertyValue/);
+    assert.doesNotMatch(joined.result.code, /setSandboxPropertyValue/);
+
+    const mixed = run("var o = (g.flag ? {} : Math.PI); o.x = 1; o.x;", { g: { flag: 1 } }, { optimization: "O2" });
+    assert.equal(mixed.value, 1);
+    assert.match(mixed.result.code, /setSandboxPropertyValue/);
   });
 });

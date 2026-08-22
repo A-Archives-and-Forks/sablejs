@@ -15,6 +15,17 @@ const runtimeModule = path.join(repositoryRoot, "src/runtime");
 const source = `
 var total = 0;
 
+// Bundled runs hoist "use strict" over the whole bundle, which turns the
+// runtime's arguments capture strict; this probe keeps the sloppy ES5
+// arguments semantics regression (callee, mapped parameters) covered there.
+function probeArgs(a, b) {
+  var mapped = arguments;
+  a = 9;
+  return [mapped.length, mapped[0], mapped.callee === probeArgs].join(":");
+}
+
+var argsProbe = probeArgs(2, 3);
+
 function Counter(start) {
   this.value = start;
 }
@@ -37,7 +48,7 @@ for (var index = 0; index < 4; index += 1) {
   total += twice(counter.add(index));
 }
 
-({ total: total, finalValue: counter.value, label: platformLabel });
+({ total: total, finalValue: counter.value, label: platformLabel, argsProbe: argsProbe });
 `;
 
 const compiled = compile(source, { optimization: "O2", runtimeModule });
@@ -63,10 +74,12 @@ const actual = {
   total: value.total,
   finalValue: value.finalValue,
   label: value.label,
+  argsProbe: value.argsProbe,
 };
-const expected = { total: 76, finalValue: 13, label: "portable" };
+const expected = { total: 76, finalValue: 13, label: "portable", argsProbe: "2:9:true" };
 
 if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+  console.log("sablejs E2E debug: actual=" + JSON.stringify(actual));
   throw new Error("sablejs E2E mismatch: " + JSON.stringify(actual));
 }
 
