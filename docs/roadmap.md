@@ -116,6 +116,7 @@ The 2026-08-22 top-10 priorities are all done:
 
 ### P3 — Release quality
 
+- ✅ Release pipeline automated (2026-08-22): a `v*` tag push triggers `release.yml` — tag/version verification, unit tests, `npm run build`, npm publish via Trusted Publishing (OIDC), and a GitHub release carrying the `dist/` artifacts; hyphenated versions land on the `beta` dist-tag, stable versions on `latest`. npm allows one trusted publisher per package, so `release.yml` is the only publishing workflow (the earlier master-green auto-publish workflow was removed to match that constraint).
 - ⬜ Release checklist: Test262, E2E browser matrix, security regression, benchmark regression, bundle-size regression, fuzz smoke; archive benchmark JSON + environment info; auto-generate the performance markdown; flag security-sensitive changes in release notes.
 
 ## Recent fixes (2026-08-22)

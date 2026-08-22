@@ -238,6 +238,16 @@ npm run benchmark:size # artifact sizes; --check enforces the CI budgets
 
 Semantic changes must also pass the pinned Test262 gate, and performance changes use three measured runs — both command lists are in [Architecture](docs/architecture.md) (Verification) and [Performance](docs/performance.md) (Reproduction). Keep dependencies directed through `frontend -> ir -> backend -> compiler -> runtime`, add focused regression tests, and update the concise English documentation. The repository uses `package-lock.json` as its only lockfile.
 
+### Releasing
+
+Bump the version in `package.json` (sync `package-lock.json` too), push to master, and wait for Ubuntu CI to go green. Then tag the release and push the tag:
+
+```sh
+git tag v2.0.0-beta.1 && git push origin v2.0.0-beta.1
+```
+
+The `release.yml` workflow verifies the tag against `package.json`, runs the unit tests, builds `dist/`, publishes to npm via Trusted Publishing (OIDC), and creates the GitHub release with the bundled artifacts. Versions containing a hyphen (e.g. `2.0.0-beta.1`) publish under the `beta` dist-tag; stable versions publish as `latest`. npm allows exactly one trusted publisher per package — `release.yml` is that registered workflow, so it is the only path that publishes to npm.
+
 ## License
 
 [Apache-2.0](LICENSE)
