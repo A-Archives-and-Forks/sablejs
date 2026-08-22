@@ -89,4 +89,6 @@ module.exports = {
   JFALSE: 85,
   LOC: 86,
   RETURN: 87,
+  REFVAR: 88,
+  PUTVAR: 89,
 };

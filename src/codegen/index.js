@@ -105,7 +105,7 @@ function callForInstruction(instruction, context = null) {
       : `$r.evalStatic($f, $exec${nested.id}, $meta${nested.id});`;
   }
   const args = instruction.args.map((value, index) => {
-    if (index === 0 && ["HASVAR", "GETVAR", "SETVAR", "DELVAR"].includes(instruction.op) &&
+    if (index === 0 && ["HASVAR", "GETVAR", "SETVAR", "DELVAR", "REFVAR", "PUTVAR"].includes(instruction.op) &&
         context && context.bindingName) {
       return jsLiteral(context.bindingName(value));
     }
@@ -1763,6 +1763,51 @@ function generate(program, options = {}) {
     dynamicChain.set(scope.id, dynamic);
     return dynamic;
   };
+  // With/eval environments are pushed at runtime and shadow name resolution
+  // for every function nested under them, not just siblings in the with block.
+  // Fast frames omit the environment chain, so any scope that could resolve a
+  // name through one must stay out of the fast path.
+  const withEvalChain = new Map();
+  const hasWithEvalAncestor = (scope) => {
+    if (withEvalChain.has(scope.id)) return withEvalChain.get(scope.id);
+    const dynamic = scope.instructions.some((instruction) =>
+      instruction.op === "WITH" || instruction.op === "ENDWITH" || instruction.op === "EVAL"
+    ) || (scope.parentId != null && hasWithEvalAncestor(scopesById.get(scope.parentId)));
+    withEvalChain.set(scope.id, dynamic);
+    return dynamic;
+  };
+  // A catch environment shadows exactly one name: its parameter. A nested
+  // scope that resolves that name at runtime needs the environment chain;
+  // scopes that resolve other names (or none) are unaffected by the catch
+  // env and keep the fast path.
+  const resolveNameOperations = new Set([
+    "GETVAR", "SETVAR", "HASVAR", "DELVAR", "REFVAR", "PUTVAR",
+  ]);
+  const ancestorCatchNames = new Map();
+  const collectAncestorCatchNames = (scope) => {
+    if (ancestorCatchNames.has(scope.id)) return ancestorCatchNames.get(scope.id);
+    const names = new Set();
+    if (scope.parentId != null) {
+      const parent = scopesById.get(scope.parentId);
+      parent.instructions.forEach((instruction) => {
+        if (instruction.op === "CATCH" && instruction.args[0] != null) {
+          names.add(instruction.args[0]);
+        }
+      });
+      collectAncestorCatchNames(parent).forEach((name) => names.add(name));
+    }
+    ancestorCatchNames.set(scope.id, names);
+    return names;
+  };
+  const resolvesAncestorCatchName = (scope) => {
+    const names = collectAncestorCatchNames(scope);
+    if (names.size === 0) return false;
+    return scope.instructions.some((instruction) =>
+      resolveNameOperations.has(instruction.op) &&
+      instruction.args[0] != null &&
+      names.has(instruction.args[0])
+    );
+  };
   const directVariableScopeIds = new Set(program.scopes
     .filter((scope) => !hasDynamicChain(scope))
     .map((scope) => scope.id));
@@ -1787,6 +1832,8 @@ function generate(program, options = {}) {
     const fastFrame = ["O2", "Os"].includes(codegenOptions.optimization) &&
       (scope.lightweight || scope.script) &&
       !scope.instructions.some((instruction) => DYNAMIC_LOCAL_OPERATIONS.has(instruction.op)) &&
+      !hasWithEvalAncestor(scope) &&
+      !resolvesAncestorCatchName(scope) &&
       !/\$r\.(?:call|construct|getLocal|getVar|hasVar|beginWith)|\$r\.evalStatic/.test(code);
     if (fastFrame) codegenStats.fastFrameScopes += 1;
     const stackReferences = code.match(/\$s\b/g) || [];

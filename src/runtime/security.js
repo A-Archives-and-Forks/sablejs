@@ -362,13 +362,15 @@ class SandboxBoundary {
     };
     wrapper[HOST_TARGET] = target;
     // Redact the wrapper's own source so direct toString reads disclose
-    // nothing about boundary internals.
-    OBJECT_DEFINE_PROPERTY(wrapper, "toString", {
-      value: this.redactedToString,
-      writable: false,
-      enumerable: false,
-      configurable: true,
-    });
+    // nothing about boundary internals. Null-prototype descriptor: a plain
+    // literal would inherit guest-visible Object.prototype pollution and
+    // the host could reject it as a mixed descriptor.
+    const toStringDescriptor = OBJECT_CREATE(null);
+    toStringDescriptor.value = this.redactedToString;
+    toStringDescriptor.writable = false;
+    toStringDescriptor.enumerable = false;
+    toStringDescriptor.configurable = true;
+    OBJECT_DEFINE_PROPERTY(wrapper, "toString", toStringDescriptor);
     this.hostFunctionWrappers.set(target, wrapper);
     return wrapper;
   }
@@ -599,12 +601,15 @@ class SandboxBoundary {
       const descriptor = OBJECT_GET_OWN_PROPERTY_DESCRIPTOR(value, key);
       if (!descriptor) continue;
       if (!("value" in descriptor)) throw boundaryError(`${path}.${key} is an accessor`);
-      OBJECT_DEFINE_PROPERTY(clone, key, {
-        value: this.cloneValue(descriptor.value, `${path}.${key}`, direction, seen),
-        writable: descriptor.writable,
-        enumerable: descriptor.enumerable,
-        configurable: descriptor.configurable,
-      });
+      // Null-prototype descriptor: a plain literal would inherit
+      // guest-visible Object.prototype pollution and the host could
+      // reject it as a mixed descriptor.
+      const clonedDescriptor = OBJECT_CREATE(null);
+      clonedDescriptor.value = this.cloneValue(descriptor.value, `${path}.${key}`, direction, seen);
+      clonedDescriptor.writable = descriptor.writable;
+      clonedDescriptor.enumerable = descriptor.enumerable;
+      clonedDescriptor.configurable = descriptor.configurable;
+      OBJECT_DEFINE_PROPERTY(clone, key, clonedDescriptor);
     }
     return clone;
   }

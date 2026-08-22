@@ -37,6 +37,30 @@ class Emitter {
   }
 
   emitLocal(scope, opLoc, opVar, node) {
+    this.validateLocalName(scope, node, opLoc);
+
+    const index = findLocal(node.name, scope);
+    if (index < 0) {
+      this.emitString(scope, opVar, node);
+    } else {
+      this.emit(scope, opLoc);
+      this.emit(scope, index);
+    }
+  }
+
+  // Identifier stores in a scope that contains a with/catch/eval must resolve
+  // the reference base BEFORE the right-hand side evaluates (ES5 8.7.2: the
+  // Reference is created when the left-hand side evaluates, and PutValue uses
+  // it even if the binding disappears in between). Emits REFVAR to capture
+  // the base and PUTVAR to write through it.
+  emitLocalRef(scope, opcode, node) {
+    // PUTVAR is a store: validate it with the write opcode so strict-mode
+    // read-only checks on 'arguments'/'eval' still apply.
+    this.validateLocalName(scope, node, opcode == OPCODE.PUTVAR ? OPCODE.SETLOCAL : opcode);
+    this.emitString(scope, opcode, node);
+  }
+
+  validateLocalName(scope, node, opLoc) {
     const isArguments = node.name == "arguments";
     const isEval = node.name == "eval";
 
@@ -59,14 +83,6 @@ class Emitter {
 
     if (isEval) {
       throw new Error(`invalid use of 'eval'`);
-    }
-
-    const index = findLocal(node.name, scope);
-    if (index < 0) {
-      this.emitString(scope, opVar, node);
-    } else {
-      this.emit(scope, opLoc);
-      this.emit(scope, index);
     }
   }
 

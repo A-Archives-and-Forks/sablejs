@@ -37,7 +37,7 @@ function run(source, globals, options) {
 
 describe("sablejs OpSpec and AOT backend", function() {
   it("describes every frontend opcode", function() {
-    assert.equal(OpSpec.count, 88);
+    assert.equal(OpSpec.count, 90);
     OpSpec.byCode.forEach((spec, code) => {
       assert.equal(spec.code, code);
       assert(spec.name);
@@ -48,8 +48,8 @@ describe("sablejs OpSpec and AOT backend", function() {
 
   it("has an exhaustive opcode-to-direct-call or static-control lowering", function() {
     assert.deepStrictEqual(validateLoweringCoverage(), LOWERING_COVERAGE);
-    assert.equal(LOWERING_COVERAGE.total, 88);
-    assert.equal(LOWERING_COVERAGE.directHelpers, 80);
+    assert.equal(LOWERING_COVERAGE.total, 90);
+    assert.equal(LOWERING_COVERAGE.directHelpers, 82);
     assert.equal(LOWERING_COVERAGE.staticControl, 8);
     OpSpec.byCode.forEach((spec) => {
       assert(STATIC_CONTROL_OPS.has(spec.name) || spec.helper, `missing lowering for ${spec.name}`);

@@ -6,7 +6,7 @@ const { buildCFG, verifyCFG } = require("./cfg");
 const PUSH_OPERATIONS = new Set([
   "INTEGER", "NUMBER", "STRING", "CLOSURE", "NEWARRAY", "NEWOBJECT", "NEWREGEXP",
   "EMPTY", "UNDEF", "NULL", "TRUE", "FALSE", "THIS", "CURRENT", "GETLOCAL",
-  "GETLOCAL2", "DELLOCAL", "DELLOCAL2", "HASVAR", "GETVAR", "DELVAR",
+  "GETLOCAL2", "DELLOCAL", "DELLOCAL2", "HASVAR", "GETVAR", "DELVAR", "REFVAR",
 ]);
 const PEEK_OPERATIONS = new Set(["SETLOCAL", "SETLOCAL2", "SETVAR"]);
 const UNARY_OPERATIONS = new Set([
@@ -261,7 +261,7 @@ function lowerScope(scope) {
         requireDepth(2, instruction);
         const inputs = stack.splice(stack.length - 2, 2);
         stack.push(emit(instruction, inputs, [valueTypeForOperation(instruction.op)])[0]);
-      } else if (["SETPROP", "SETPROP_S"].includes(instruction.op)) {
+      } else if (["SETPROP", "SETPROP_S", "PUTVAR"].includes(instruction.op)) {
         const count = instruction.op === "SETPROP" ? 3 : 2;
         requireDepth(count, instruction);
         const inputs = stack.splice(stack.length - count, count);

@@ -1,19 +1,35 @@
-name: Release
+name: Publish
 
+# Publishes the current package.json version to npm once the Ubuntu CI gate
+# has gone fully green on master. Running the whole suite is left to the
+# CI workflow (workflow_run reuses its result instead of re-running tests).
+# Version bumps on master publish automatically; repeated pushes on the
+# same version are no-ops. Tagging and GitHub release creation stay on the
+# Release workflow (tag push), which skips its own publish when this
+# workflow already published the version.
 on:
-  push:
-    tags: ["v*"]
+  workflow_run:
+    workflows: ["Ubuntu CI"]
+    types: [completed]
+    branches: [master]
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: npm-publish
+  cancel-in-progress: false
 
 jobs:
   publish:
-    name: Build and publish release
+    name: Publish to npm
     runs-on: ubuntu-latest
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: master
       - uses: actions/setup-node@v6
         with:
           node-version: 24.x
@@ -21,29 +37,18 @@ jobs:
           cache: npm
       - name: Install locked dependencies
         run: npm ci
-      - name: Verify tag matches package version
-        run: |
-          tag=${GITHUB_REF#refs/tags/v}
-          pkg=$(node -p "require('./package.json').version")
-          if [ "$tag" != "$pkg" ]; then
-            echo "Tag v$tag does not match package.json version $pkg"
-            exit 1
-          fi
-      - name: Run unit tests
-        run: npm test
       - name: Check whether this version is already published
         id: check
         run: |
           pkg=$(node -p "require('./package.json').version")
+          echo "version=$pkg" >> "$GITHUB_OUTPUT"
           if npm view sablejs@$pkg version >/dev/null 2>&1; then
             echo "sablejs@$pkg is already on the registry; skipping publish"
             echo "should_publish=false" >> "$GITHUB_OUTPUT"
           else
+            echo "Publishing sablejs@$pkg"
             echo "should_publish=true" >> "$GITHUB_OUTPUT"
           fi
-      - name: Build artifacts
-        if: steps.check.outputs.should_publish == 'true'
-        run: npm run build
       - name: Publish to npm
         if: steps.check.outputs.should_publish == 'true'
         run: |
@@ -54,8 +59,3 @@ jobs:
           esac
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-      - name: Create GitHub release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: dist/*
-          generate_release_notes: true

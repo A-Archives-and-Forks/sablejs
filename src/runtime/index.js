@@ -8,6 +8,9 @@ const { SandboxBoundary, capability } = require("./security");
 
 const ABI_VERSION = "2.0.0-aot.3";
 const EMPTY = Symbol("sable.empty");
+// Brand for REFVAR/PUTVAR reference tokens; a with/catch object can never
+// hold this module-private symbol, so token identity is unambiguous.
+const REF_TOKEN = Symbol("sable.reference");
 const ARRAY_PUSH = Array.prototype.push;
 const ARRAY_POP = Array.prototype.pop;
 const ARRAY_SPLICE = Array.prototype.splice;
@@ -499,32 +502,35 @@ function createSloppyAccessors(runtime) {
 
 function initializeCompiledFunction(runtime, compiled, metadata) {
   if (metadata.name) {
-    OBJECT_DEFINE_PROPERTY(compiled, "name", {
-      value: metadata.name, writable: false, enumerable: false, configurable: true,
-    });
+    // Descriptors must be null-prototype: a plain literal inherits
+    // Object.prototype, so guest-visible pollution (e.g. a "value" property)
+    // would make the host see an invalid mixed descriptor and throw.
+    OBJECT_DEFINE_PROPERTY(compiled, "name", dataDescriptor(metadata.name, false, false, true));
   }
   // ES5.1 13.2 step 15: a compiled function's length is not writable,
   // enumerable, or configurable. Native host functions use newer descriptor
   // rules, but compiled functions retain the target language semantics.
-  OBJECT_DEFINE_PROPERTY(compiled, "length", {
-    value: metadata.parameterCount, writable: false, enumerable: false, configurable: false,
-  });
+  OBJECT_DEFINE_PROPERTY(
+    compiled,
+    "length",
+    dataDescriptor(metadata.parameterCount, false, false, false)
+  );
   if (metadata.strict) {
-    OBJECT_DEFINE_PROPERTY(compiled, "caller", {
-      get: RESTRICTED_ACCESSOR, set: RESTRICTED_ACCESSOR, enumerable: false, configurable: false,
-    });
-    OBJECT_DEFINE_PROPERTY(compiled, "arguments", {
-      get: RESTRICTED_ACCESSOR, set: RESTRICTED_ACCESSOR, enumerable: false, configurable: false,
-    });
+    OBJECT_DEFINE_PROPERTY(
+      compiled, "caller", accessorDescriptor(RESTRICTED_ACCESSOR, RESTRICTED_ACCESSOR, false, false)
+    );
+    OBJECT_DEFINE_PROPERTY(
+      compiled, "arguments", accessorDescriptor(RESTRICTED_ACCESSOR, RESTRICTED_ACCESSOR, false, false)
+    );
   } else {
     const accessors = runtime.sloppyAccessors ||
       (runtime.sloppyAccessors = createSloppyAccessors(runtime));
-    OBJECT_DEFINE_PROPERTY(compiled, "caller", {
-      get: accessors.caller, enumerable: false, configurable: false,
-    });
-    OBJECT_DEFINE_PROPERTY(compiled, "arguments", {
-      get: accessors.arguments, enumerable: false, configurable: false,
-    });
+    OBJECT_DEFINE_PROPERTY(
+      compiled, "caller", accessorDescriptor(accessors.caller, undefined, false, false)
+    );
+    OBJECT_DEFINE_PROPERTY(
+      compiled, "arguments", accessorDescriptor(accessors.arguments, undefined, false, false)
+    );
   }
   if (runtime.boundary) runtime.boundary.registerGuestFunction(compiled);
   return compiled;
@@ -905,6 +911,34 @@ class RuntimeInstance {
     } else {
       this.writeProperty(frame, binding.object, binding.name, value);
     }
+  }
+
+  // Captures the identifier reference base before an assignment's rval
+  // evaluates. ES5 8.7.2 creates the Reference when the left-hand side
+  // evaluates and PutValue uses it even if the binding disappears in between
+  // (e.g. `with (o) { x = (delete o.x, 2) }` must store into o).
+  refVar(frame, name) {
+    const binding = this.findBinding(frame, name);
+    if (binding && binding.kind === "local") {
+      frame.stack.push({ [REF_TOKEN]: true, frame: binding.frame, index: binding.index });
+    } else {
+      frame.stack.push(binding ? binding.object : null);
+    }
+  }
+
+  putVar(frame, name) {
+    const value = frame.stack.pop();
+    const token = frame.stack.pop();
+    if (token === null) {
+      if (frame.metadata.strict) throw new ReferenceError(`${name} is not defined`);
+      this.writeProperty(frame, this.global, name, value);
+    } else if (token[REF_TOKEN]) {
+      token.frame.locals[token.index] = value;
+    } else {
+      this.writeProperty(frame, token, name, value);
+    }
+    // The assignment expression's value is the expression result.
+    frame.stack.push(value);
   }
 
   deleteVar(frame, name) {

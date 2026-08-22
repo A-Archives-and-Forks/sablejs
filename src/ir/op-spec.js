@@ -91,6 +91,8 @@ const definitions = [
   ["JFALSE", ["jumpTarget"], -1, "control", null, "branchFalse"],
   ["LOC", ["line", "column"], 0, "control", "location"],
   ["RETURN", [], -1, "control", null, "return"],
+  ["REFVAR", ["stringIndex"], 1, "read", "refVar"],
+  ["PUTVAR", ["stringIndex"], -1, "write", "putVar"],
 ];
 
 const byCode = [];

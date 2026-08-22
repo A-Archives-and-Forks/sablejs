@@ -136,8 +136,17 @@ class Compiler {
       }
 
       if (init) {
-        this.Expression(init, scope);
-        this.emitter.emitLocal(scope, OPCODE.SETLOCAL, OPCODE.SETVAR, id);
+        if (scope.hasWith) {
+          // The initializer assignment resolves the identifier reference
+          // dynamically; capture the base before evaluating it so the store
+          // survives a binding that disappears mid-expression.
+          this.emitter.emitLocalRef(scope, OPCODE.REFVAR, id);
+          this.Expression(init, scope);
+          this.emitter.emitLocalRef(scope, OPCODE.PUTVAR, id);
+        } else {
+          this.Expression(init, scope);
+          this.emitter.emitLocal(scope, OPCODE.SETLOCAL, OPCODE.SETVAR, id);
+        }
         this.emitter.emit(scope, OPCODE.POP);
       }
     }
@@ -642,6 +651,11 @@ class Compiler {
 
   WithStatement(node, scope) {
     scope.lightweight = false;
+    // Identifiers inside a with body may resolve to the with object; stores
+    // must capture the reference base before the rval evaluates (ES5 8.7.2).
+    // Script scopes are already non-lightweight, so this marks the signal
+    // explicitly rather than relying on `lightweight`.
+    scope.hasWith = true;
     if (scope.strict) {
       throw new Error(`'with' statements are not allowed in strict mode`);
     }
@@ -1067,9 +1081,14 @@ class Compiler {
   PrefixIncExpression(node, scope) {
     const { argument } = node;
     if (argument.type == "Identifier") {
+      if (scope.hasWith) this.emitter.emitLocalRef(scope, OPCODE.REFVAR, argument);
       this.emitter.emitLocal(scope, OPCODE.GETLOCAL, OPCODE.GETVAR, argument);
       this.emitter.emit(scope, OPCODE.INC);
-      this.emitter.emitLocal(scope, OPCODE.SETLOCAL, OPCODE.SETVAR, argument);
+      if (scope.hasWith) {
+        this.emitter.emitLocalRef(scope, OPCODE.PUTVAR, argument);
+      } else {
+        this.emitter.emitLocal(scope, OPCODE.SETLOCAL, OPCODE.SETVAR, argument);
+      }
     } else if (argument.type == "MemberExpression") {
       const { object, property } = argument;
       if (!argument.computed) {
@@ -1094,9 +1113,14 @@ class Compiler {
   PrefixDecExpression(node, scope) {
     const { argument } = node;
     if (argument.type == "Identifier") {
+      if (scope.hasWith) this.emitter.emitLocalRef(scope, OPCODE.REFVAR, argument);
       this.emitter.emitLocal(scope, OPCODE.GETLOCAL, OPCODE.GETVAR, argument);
       this.emitter.emit(scope, OPCODE.DEC);
-      this.emitter.emitLocal(scope, OPCODE.SETLOCAL, OPCODE.SETVAR, argument);
+      if (scope.hasWith) {
+        this.emitter.emitLocalRef(scope, OPCODE.PUTVAR, argument);
+      } else {
+        this.emitter.emitLocal(scope, OPCODE.SETLOCAL, OPCODE.SETVAR, argument);
+      }
     } else if (argument.type == "MemberExpression") {
       const { object, property } = argument;
       if (!argument.computed) {
@@ -1121,10 +1145,18 @@ class Compiler {
   PostIncExpression(node, scope) {
     const { argument } = node;
     if (argument.type == "Identifier") {
+      if (scope.hasWith) this.emitter.emitLocalRef(scope, OPCODE.REFVAR, argument);
       this.emitter.emitLocal(scope, OPCODE.GETLOCAL, OPCODE.GETVAR, argument);
       this.emitter.emit(scope, OPCODE.POSTINC);
-      this.emitter.emit(scope, OPCODE.ROT2);
-      this.emitter.emitLocal(scope, OPCODE.SETLOCAL, OPCODE.SETVAR, argument);
+      // With a captured token the stack is [token, new, old]; ROT3 lifts
+      // `old` (the expression result) below the token so PUTVAR pops
+      // value+token.
+      this.emitter.emit(scope, scope.hasWith ? OPCODE.ROT3 : OPCODE.ROT2);
+      if (scope.hasWith) {
+        this.emitter.emitLocalRef(scope, OPCODE.PUTVAR, argument);
+      } else {
+        this.emitter.emitLocal(scope, OPCODE.SETLOCAL, OPCODE.SETVAR, argument);
+      }
       this.emitter.emit(scope, OPCODE.POP);
     } else if (argument.type == "MemberExpression") {
       const { object, property } = argument;
@@ -1154,10 +1186,18 @@ class Compiler {
   PostDecExpression(node, scope) {
     const { argument } = node;
     if (argument.type == "Identifier") {
+      if (scope.hasWith) this.emitter.emitLocalRef(scope, OPCODE.REFVAR, argument);
       this.emitter.emitLocal(scope, OPCODE.GETLOCAL, OPCODE.GETVAR, argument);
       this.emitter.emit(scope, OPCODE.POSTDEC);
-      this.emitter.emit(scope, OPCODE.ROT2);
-      this.emitter.emitLocal(scope, OPCODE.SETLOCAL, OPCODE.SETVAR, argument);
+      // With a captured token the stack is [token, new, old]; ROT3 lifts
+      // `old` (the expression result) below the token so PUTVAR pops
+      // value+token.
+      this.emitter.emit(scope, scope.hasWith ? OPCODE.ROT3 : OPCODE.ROT2);
+      if (scope.hasWith) {
+        this.emitter.emitLocalRef(scope, OPCODE.PUTVAR, argument);
+      } else {
+        this.emitter.emitLocal(scope, OPCODE.SETLOCAL, OPCODE.SETVAR, argument);
+      }
       this.emitter.emit(scope, OPCODE.POP);
     } else if (argument.type == "MemberExpression") {
       const { object, property } = argument;
@@ -1304,8 +1344,17 @@ class Compiler {
     const { left, right, operator } = node;
     if (operator == "=") {
       if (left.type == "Identifier") {
-        this.Expression(right, scope);
-        this.emitter.emitLocal(scope, OPCODE.SETLOCAL, OPCODE.SETVAR, left);
+        if (scope.hasWith) {
+          // ES5 8.7.2: PutValue uses the Reference created when the left-hand
+          // side evaluates, even if the binding is gone by the time rval
+          // finishes (e.g. `with (o) { x = (delete o.x, 2) }` must write o.x).
+          this.emitter.emitLocalRef(scope, OPCODE.REFVAR, left);
+          this.Expression(right, scope);
+          this.emitter.emitLocalRef(scope, OPCODE.PUTVAR, left);
+        } else {
+          this.Expression(right, scope);
+          this.emitter.emitLocal(scope, OPCODE.SETLOCAL, OPCODE.SETVAR, left);
+        }
       } else if (left.type == "MemberExpression") {
         if (!left.computed) {
           this.Expression(left.object, scope);
@@ -1322,6 +1371,7 @@ class Compiler {
       }
     } else {
       if (left.type == "Identifier") {
+        if (scope.hasWith) this.emitter.emitLocalRef(scope, OPCODE.REFVAR, left);
         this.emitter.emitLocal(scope, OPCODE.GETLOCAL, OPCODE.GETVAR, left);
       } else if (left.type == "MemberExpression") {
         const { object, property } = left;
@@ -1381,7 +1431,11 @@ class Compiler {
 
       this.emitter.emit(scope, opcode);
       if (left.type == "Identifier") {
-        this.emitter.emitLocal(scope, OPCODE.SETLOCAL, OPCODE.SETVAR, left);
+        if (scope.hasWith) {
+          this.emitter.emitLocalRef(scope, OPCODE.PUTVAR, left);
+        } else {
+          this.emitter.emitLocal(scope, OPCODE.SETLOCAL, OPCODE.SETVAR, left);
+        }
       } else if (left.type == "MemberExpression") {
         if (!left.computed) {
           this.emitter.emitString(scope, OPCODE.SETPROP_S, left.property);
