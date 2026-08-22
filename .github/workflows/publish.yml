@@ -7,6 +7,9 @@ name: Publish
 # same version are no-ops. Tagging and GitHub release creation stay on the
 # Release workflow (tag push), which skips its own publish when this
 # workflow already published the version.
+#
+# Authentication uses npm Trusted Publishing (OIDC), configured on
+# registry.npmjs.org for this repository — no token secret required.
 on:
   workflow_run:
     workflows: ["Ubuntu CI"]
@@ -15,6 +18,7 @@ on:
 
 permissions:
   contents: read
+  id-token: write
 
 concurrency:
   group: npm-publish
@@ -57,5 +61,3 @@ jobs:
             *-*) npm publish --access public --tag beta ;;
             *)   npm publish --access public ;;
           esac
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

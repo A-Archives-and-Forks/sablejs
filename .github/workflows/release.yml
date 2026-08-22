@@ -1,11 +1,17 @@
 name: Release
 
+# Tag push releases: publish the tagged version to npm (skipped when the
+# Publish workflow already published it) and create the GitHub release.
+# Authentication uses npm Trusted Publishing (OIDC) — register this
+# workflow (release.yml) as a trusted publisher for the package on
+# registry.npmjs.org, alongside publish.yml.
 on:
   push:
     tags: ["v*"]
 
 permissions:
   contents: write
+  id-token: write
 
 jobs:
   publish:
@@ -52,8 +58,6 @@ jobs:
             *-*) npm publish --access public --tag beta ;;
             *)   npm publish --access public ;;
           esac
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
         with:
