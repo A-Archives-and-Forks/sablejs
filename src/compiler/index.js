@@ -1,7 +1,5 @@
 "use strict";
 
-const fs = require("fs");
-const path = require("path");
 const FrontendCompiler = require("../frontend/compiler");
 const decodeProgram = require("../ir/decode");
 const { verifyProgram } = require("../ir/verify");
@@ -101,7 +99,11 @@ class AOTCompiler {
       // Inspection mode: write the optimized HIR, the MIR the backend passes
       // reason about, and the generated code as text files. Independent of
       // dumpIR/includeHIR, which attach the graph objects to the result — the
-      // returned object is unchanged by dumpDir.
+      // returned object is unchanged by dumpDir. fs/path are required lazily:
+      // the browser bundle (dist/compiler.js, platform "browser" with these
+      // externals) must load without executing Node built-ins at module scope.
+      const fs = require("fs");
+      const path = require("path");
       const dumpMIR = mir || lowerProgramToMIR(hir);
       verifyMIR(dumpMIR);
       fs.mkdirSync(options.dumpDir, { recursive: true });

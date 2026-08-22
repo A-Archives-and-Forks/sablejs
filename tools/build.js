@@ -37,6 +37,10 @@ for (const { name, entryPoint, outputPath } of targets) {
     platform: "browser",
     target: ["es2020"],
     logLevel: "warning",
+    // Node built-ins stay as runtime require() calls (the compiler's
+    // dumpDir inspection mode needs them in Node); in a browser they only
+    // throw if that debug option is actually used.
+    external: ["fs", "path"],
   });
   report.push({ name, sizeKB: (fs.statSync(outputPath).size / 1000).toFixed(1) });
 }
