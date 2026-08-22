@@ -6,7 +6,7 @@ const { test, expect } = require("@playwright/test");
 
 const bundlePath = path.resolve(__dirname, "../../.cache/e2e/program.js");
 const bundle = fs.readFileSync(bundlePath, "utf8");
-const expected = { total: 76, finalValue: 13, label: "portable" };
+const expected = { total: 76, finalValue: 13, label: "portable", argsProbe: "2:9:true" };
 
 test("runs the compiled program on the browser main thread", async ({ page }) => {
   await page.addScriptTag({ content: bundle });
