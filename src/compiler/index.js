@@ -9,6 +9,21 @@ const { generate, normalizeIdentifierProtection } = require("../codegen");
 const { printProgram, printMIR } = require("../ir/print");
 const { ABI_VERSION } = require("../runtime");
 
+// Inspection-mode file adapter. compile() writes the HIR/MIR/code dumps
+// through this three-method surface, so the browser bundle never executes
+// Node built-ins at module scope: pass your own implementation (e.g. memfs)
+// as options.fs, or leave the default — which lazily requires Node's fs/path
+// only when a dump is actually written.
+function defaultInspectionFs() {
+  const fs = require("fs");
+  const path = require("path");
+  return {
+    mkdirSync: (directory, options) => fs.mkdirSync(directory, options),
+    writeFileSync: (file, text) => fs.writeFileSync(file, text),
+    join: (...parts) => path.join(...parts),
+  };
+}
+
 function normalizeSecurity(value) {
   if (value === undefined || value === "sandbox") return "sandbox";
   if (value === "trusted") return "trusted";
@@ -99,17 +114,16 @@ class AOTCompiler {
       // Inspection mode: write the optimized HIR, the MIR the backend passes
       // reason about, and the generated code as text files. Independent of
       // dumpIR/includeHIR, which attach the graph objects to the result — the
-      // returned object is unchanged by dumpDir. fs/path are required lazily:
-      // the browser bundle (dist/compiler.js, platform "browser" with these
-      // externals) must load without executing Node built-ins at module scope.
-      const fs = require("fs");
-      const path = require("path");
+      // returned object is unchanged by dumpDir. File access goes through the
+      // options.fs adapter so browser bundles can supply an in-memory
+      // implementation (the Node default is lazily required, see above).
+      const dumpFs = options.fs || defaultInspectionFs();
       const dumpMIR = mir || lowerProgramToMIR(hir);
       verifyMIR(dumpMIR);
-      fs.mkdirSync(options.dumpDir, { recursive: true });
-      fs.writeFileSync(path.join(options.dumpDir, "hir.txt"), printProgram(hir));
-      fs.writeFileSync(path.join(options.dumpDir, "mir.txt"), printMIR(dumpMIR));
-      fs.writeFileSync(path.join(options.dumpDir, "code.js"), code);
+      dumpFs.mkdirSync(options.dumpDir, { recursive: true });
+      dumpFs.writeFileSync(dumpFs.join(options.dumpDir, "hir.txt"), printProgram(hir));
+      dumpFs.writeFileSync(dumpFs.join(options.dumpDir, "mir.txt"), printMIR(dumpMIR));
+      dumpFs.writeFileSync(dumpFs.join(options.dumpDir, "code.js"), code);
     }
     return {
       code,

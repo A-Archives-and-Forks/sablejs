@@ -114,6 +114,7 @@ instance.run();
 | `dumpDir: "/path"` | writes `hir.txt` (optimized HIR, with pass annotations), `mir.txt` (SSA MIR: blocks, phis, operations), and `code.js` (generated CJS) into the directory |
 | `includeHIR` / `includeMIR` | attach the HIR / MIR graph objects to the compile result |
 | `dumpIR: "hir" \| "mir" \| "all"` | same, graph for the named forms only |
+| `fs: { mkdirSync, writeFileSync, join }` | inspection-mode file adapter; defaults to Node's `fs`/`path`, lazily required. Browser bundles can pass an in-memory implementation (e.g. `memfs`) so `dumpDir` works without Node built-ins |
 
 The dump is a side channel — the compile result is unchanged by `dumpDir`.
 

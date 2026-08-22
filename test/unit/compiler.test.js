@@ -1114,4 +1114,31 @@ describe("sablejs generated-code inspection mode (dumpDir)", function() {
       fs.rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  it("writes through a custom fs adapter instead of Node built-ins", function() {
+    // The adapter is the browser path: an in-memory implementation (e.g.
+    // memfs) lets dumpDir work without Node's fs/path in the bundle.
+    const calls = [];
+    const adapter = {
+      mkdirSync: (directory) => calls.push(["mkdir", directory]),
+      writeFileSync: (file, text) => calls.push(["write", file, text]),
+      join: (...parts) => parts.join("/"),
+    };
+    const result = compile("var a = 1 + 2; a;", {
+      optimization: "O2",
+      security: "sandbox",
+      dumpDir: "/virtual/dump",
+      fs: adapter,
+    });
+    // The dump is a side channel; the result object is unchanged.
+    assert.equal(result.hir, undefined);
+    assert.equal(calls.length, 4);
+    assert.deepStrictEqual(calls[0], ["mkdir", "/virtual/dump"]);
+    assert.deepStrictEqual(calls.slice(1).map((call) => call[1]), [
+      "/virtual/dump/hir.txt",
+      "/virtual/dump/mir.txt",
+      "/virtual/dump/code.js",
+    ]);
+    assert.match(calls[2][2], /^MIR scopes=1\n/);
+  });
 });

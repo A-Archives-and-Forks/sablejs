@@ -37,9 +37,10 @@ for (const { name, entryPoint, outputPath } of targets) {
     platform: "browser",
     target: ["es2020"],
     logLevel: "warning",
-    // Node built-ins stay as runtime require() calls (the compiler's
-    // dumpDir inspection mode needs them in Node); in a browser they only
-    // throw if that debug option is actually used.
+    // fs/path stay external: the compiler's dumpDir defaults to Node's
+    // fs/path through a lazily-required adapter factory, and browsers pass
+    // options.fs (in-memory) instead — so the bundle must neither resolve
+    // them at build time nor execute them at module scope.
     external: ["fs", "path"],
   });
   report.push({ name, sizeKB: (fs.statSync(outputPath).size / 1000).toFixed(1) });
