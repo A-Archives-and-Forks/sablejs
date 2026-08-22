@@ -203,13 +203,13 @@ Three-run medians on the Linux x64 reference machine (methodology, exclusions, a
 | sablejs O2 trusted | 2,256 | 1.51x |
 | QuickJS-WASM 0.32.0 | 1,133 | 0.76x |
 
-| Suite | sablejs trusted | sablejs sandbox | QuickJS-WASM |
+| Suite (direction) | sablejs trusted | sablejs sandbox | QuickJS-WASM |
 | --- | ---: | ---: | ---: |
-| Octane 2.0 geometric score | 2,674 | 2,030 | 1,522 |
-| SunSpider 1.0 total (23 tests, ms) | 276.0 | 442.2 | 588.1 |
-| Kraken 1.1 total (14 tests, ms) | 5,641.8 | 19,750.7 | 22,087.8 |
+| Octane 2.0 geometric score (higher is better) | 2,674 | 2,088 | 1,472 |
+| SunSpider 1.0 total, 23 tests (ms, lower is better) | 276.0 | 442.2 | 588.1 |
+| Kraken 1.1 total, 14 tests (ms, lower is better) | 5,641.8 | 19,750.7 | 22,087.8 |
 
-Sandbox retains 66.4% of trusted throughput on V8 Benchmark Suite 7 under this harness, and beats QuickJS-WASM on all eight real-world workloads. These numbers characterize this benchmark and harness, not universal application performance. A 137 KB benchmark source compiles to a 593 KB minified sandbox bundle (81.5 KB gzipped; the size-optimized `Os` level: 361 KB / 58.8 KB). Compiled bundle sizes are gated in CI — `npm run benchmark:size -- --check` fails any artifact that exceeds its recorded budget by 5%.
+Sandbox retains 66.4% of trusted throughput on V8 Benchmark Suite 7 under this harness, and beats QuickJS-WASM on seven of the eight real-world workloads (mini-parser sits at parity). On SunSpider and Kraken the sandbox totals are also faster than the QuickJS-WASM reference (1.33x and 1.12x) — the sandbox tax shows as a reduction *relative to the fully trusted sablejs backend*, not as a loss to QuickJS. These numbers characterize this benchmark and harness, not universal application performance. A 137 KB benchmark source compiles to a 593 KB minified sandbox bundle (81.5 KB gzipped; the size-optimized `Os` level: 361 KB / 58.8 KB). Compiled bundle sizes are gated in CI — `npm run benchmark:size -- --check` fails any artifact that exceeds its recorded budget by 5%.
 
 ## Security
 

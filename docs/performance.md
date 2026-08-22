@@ -49,7 +49,7 @@ Two boundary hot paths were profiled and specialized without changing sandbox se
 
 - **Guest-provenance write fast path** (the local-safe IR distinction, v1). The O2/Os provenance pass (`src/backend/guest-provenance.js`, after the last SSA pass) proves which GETLOCAL outputs are guest-created — object/array/regexp literals, closures, and AND-meet phi joins — and marks them on the HIR. Sandbox `SETPROP`/`SETPROP_S` into a provably guest target lower to a slim `$setGuest` helper: `setSandboxPropertyValue` minus `writeTarget`, keeping `secureValue` on function values and strict/sloppy writer dispatch. Marked ⇒ guest-created ⇒ never a wrapper, capability token, or protected intrinsic, so `writeTarget` would be a no-op; nothing unmarked takes the fast path, and value-side handling is byte-identical between the two paths. Coverage on the V8 suite: 36 fast-path sites in the whole-suite compile, all one-time setup writes (harness config, class enums, `Klass.prototype = ...`); the write-dominated suites' hot loops write `this`-targeted fields and `new` results. Regression evidence: with the fast path disabled, the `writeTargets`/`calls` boundary-counter ratios for Crypto, RayTrace, and DeltaBlue are identical to 4 significant digits (A/B over adaptive-iteration runs); the A/B re-measurement (sandbox 1,387, trusted 2,226) and the 2026-08-22 full refresh (sandbox 1,497, trusted 2,256) both sit inside or above the earlier sample spreads; `benchmark:smoke` green; adversarial `security.test.js` cases at all four optimization levels plus both differential smokes (2,300 generated programs, zero mismatches/failures) pin that unmarked writes (intrinsics, capability tokens, globals, parameters) stay on the guarded path.
 
-These changes took the Octane sandbox geometric score from 1,613 to 1,772, the Kraken sandbox total from 28.6 s to 20.8 s, and every real-world workload above the QuickJS-WASM reference (below).
+These changes took the Octane sandbox geometric score from 1,613 to 1,772, the Kraken sandbox total from 28.6 s to 20.8 s, and every real-world workload above the QuickJS-WASM reference at the time (the freshest measurements put mini-parser at parity; see below).
 
 ## Compiled size by optimization level
 
@@ -127,7 +127,7 @@ SunSpider is pinned from the `Action-Kamen/JavaScript-Benchmarks` mirror (`bench
 | sablejs O2 sandbox | 442.2 ms |
 | QuickJS-WASM | 588.1 ms |
 
-Sandbox runs at 62.4% of trusted throughput and 1.33x QuickJS-WASM. Trusted mode passes all 23 tests; the `$v1_30` temporary-scoping bug that failed `string-unpack-code` was fixed by a `temporaryRegions` visibility check (see [Roadmap](roadmap.md), Recent fixes).
+Totals are per-suite medians of three samples; **lower is better**. Sandbox runs at 62.4% of the fully trusted sablejs backend — that retention is relative to trusted, not a loss to the reference: the sandbox total is still 1.33x faster than QuickJS-WASM here. Trusted mode passes all 23 tests; the `$v1_30` temporary-scoping bug that failed `string-unpack-code` was fixed by a `temporaryRegions` visibility check (see [Roadmap](roadmap.md), Recent fixes).
 
 ## Kraken 1.1 subset
 
@@ -139,7 +139,7 @@ Kraken is pinned from `mozilla/krakenbenchmark.mozilla.org` (`tests/kraken-1.1`)
 | sablejs O2 sandbox | 19,750.7 ms |
 | QuickJS-WASM | 22,087.8 ms |
 
-Sandbox runs at 28.6% of trusted throughput and 1.12x QuickJS-WASM on the Kraken subset. The imaging tests dominate the sandbox total: their per-pixel property writes pay the boundary write guard on every element, which is exactly the cost the sandbox tax section tracks on the V8 suite. The pure-intrinsic call fast path took the sandbox total from 28.6 s to 20.8 s.
+Single measured runs; **lower is better**. Sandbox runs at 28.6% of the fully trusted sablejs backend — again relative to trusted: the sandbox total is still 1.12x faster than QuickJS-WASM on this subset. The imaging tests dominate the sandbox total: their per-pixel property writes pay the boundary write guard on every element, which is exactly the cost the sandbox tax section tracks on the V8 suite. The pure-intrinsic call fast path took the sandbox total from 28.6 s to 20.8 s.
 
 ## Real-world workloads
 
@@ -147,16 +147,16 @@ Eight self-contained ES5.1 workloads (`benchmark/workloads/`) model the product 
 
 | Workload | sablejs sandbox | sablejs trusted | QuickJS-WASM | native V8 |
 | --- | ---: | ---: | ---: | ---: |
-| json-transform | 233 | 259 | 245 | 16,377 |
-| pricing-rules | 245 | 267 | 147 | 4,697 |
-| form-validator | 22,114 | 31,147 | 16,469 | 1,327,580 |
-| spreadsheet-formulas | 7,033 | 8,447 | 3,315 | 44,057 |
-| workflow-rules | 4,749 | 5,203 | 2,552 | 244,789 |
-| template-logic | 12,522 | 12,461 | 10,012 | 291,445 |
-| data-aggregation | 70 | 76 | 63 | 5,453 |
-| mini-parser | 11,165 | 14,441 | 10,293 | 298,478 |
+| json-transform | 242 | 272 | 177 | 18,472 |
+| pricing-rules | 248 | 285 | 169 | 4,726 |
+| form-validator | 25,467 | 31,015 | 14,673 | 909,364 |
+| spreadsheet-formulas | 7,293 | 8,505 | 3,265 | 132,077 |
+| workflow-rules | 4,674 | 5,205 | 2,736 | 50,887 |
+| template-logic | 12,266 | 12,639 | 10,495 | 441,358 |
+| data-aggregation | 73 | 76 | 68 | 6,095 |
+| mini-parser | 9,388 | 11,814 | 10,868 | 303,890 |
 
-Sandbox now beats QuickJS-WASM on every workload: the string- and regex-heavy ones (form-validator, template-logic, mini-parser) were call-mediation dominated and gained 5–9x from the pure-intrinsic fast path, while form-validator additionally paid the per-instance graph walk (its 12 boundary calls per run are dwarfed by `createInstance`). Template-logic reaches trusted parity; the remaining sandbox tax on the rest is 8–29% (per-instance boundary setup, the mandated `globals` copy, and per-call dispatch). These workloads double as a lightweight differential check: a backend whose result diverges from the trusted reference fails the run.
+Sandbox beats QuickJS-WASM on seven of the eight workloads: 1.7x on form-validator and workflow-rules, 2.2x on spreadsheet-formulas, 1.4x–1.5x on json-transform and pricing-rules, 1.2x on template-logic, 1.1x on data-aggregation. The string- and regex-heavy ones (form-validator, template-logic) were call-mediation dominated before the pure-intrinsic call fast path, and form-validator additionally paid the per-instance graph walk (its 12 boundary calls per run are dwarfed by `createInstance`). Template-logic reaches trusted parity; the remaining sandbox tax is 4–21% (per-instance boundary setup, the mandated `globals` copy, and per-call dispatch). Mini-parser sits at parity — 9.4k–11.2k ops/sec sandbox vs 10.4k–10.9k QuickJS across runs, inside the run-to-run spread. These workloads double as a lightweight differential check: all four backends must return the trusted reference's result (JSON-stringified equality), and a backend that diverges fails the run — verified for every table row above (the comparison path was fixed on 2026-08-22: QuickJS's completion value is dumped before its handle is disposed, and the native timing path re-evaluates with indirect eval for the check, since the `Function` constructor never returns a body's completion value).
 
 ## Reproduction
 

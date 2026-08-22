@@ -24,7 +24,11 @@ async function createQuickJSRunner(emit) {
         result.error.dispose();
         throw new Error(`QuickJS evaluation failed: ${JSON.stringify(error)}`);
       }
+      // Dump (copy out of the WASM heap) before disposing the handle; the
+      // caller gets the completion value, not a discarded handle.
+      const value = context.dump(result.value);
       result.value.dispose();
+      return value;
     },
     dispose() {
       context.dispose();

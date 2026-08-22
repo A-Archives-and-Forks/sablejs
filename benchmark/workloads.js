@@ -143,12 +143,20 @@ async function main() {
     const programSource = assembleProgram(source, INPUTS[name]);
 
     let execute;
+    let verify = null;
     let boundaryTotals = null;
     if (backend === "quickjs") {
       const runner = await createQuickJSRunner(() => {});
       execute = () => runner.evaluate(programSource, `${name}.js`);
     } else if (backend === "native") {
+      // The Function constructor never returns the body's completion value
+      // (it is not eval), so timing runs a pre-built function while
+      // verification re-evaluates with indirect eval — which does return
+      // the completion value, exactly like the differential fuzzer's
+      // native oracle.
       execute = new Function(programSource);
+      const nativeEvaluate = globalThis.eval;
+      verify = () => nativeEvaluate(programSource);
     } else {
       const compiled = compile(programSource, { optimization: "O2", security, runtimeModule });
       const generatedModule = { exports: {} };
@@ -180,7 +188,7 @@ async function main() {
     const elapsedMs = performance.now() - startedAt;
 
     const reference = runSableJS("trusted", programSource);
-    const result = execute();
+    const result = verify ? verify() : execute();
     if (normalize(result) !== normalize(reference)) {
       console.error(`[workloads] ${name} diverged from the trusted reference`);
       process.exitCode = 1;
