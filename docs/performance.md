@@ -35,7 +35,7 @@ Sandbox retains 67.4% of trusted throughput, is 6.23x the removed v1 baseline, a
 | NavierStokes | 8.4k | 8.1k | 276 | 247 | 65.1M | 206 | 0 |
 | DeltaBlue | 37.1M | 35.7M | 1.4M | 734k | 7.2M | 194k | 64.5k |
 
-- **NavierStokes and Crypto are write-guard dominated** (65M/108M `writeTarget` resolutions). Their tax is the per-write target resolution and mutability assertion, not call mediation. Eliminating guards for provably guest-local objects (the local-safe IR distinction in the [roadmap](roadmap.md)) is the next optimization lever.
+- **NavierStokes and Crypto are write-guard dominated** (65M/108M `writeTarget` resolutions). Their tax is the per-write target resolution and mutability assertion, not call mediation. The local-safe IR distinction shipped (guest-provenance write fast path, below), but on these suites it currently fires only on one-time setup writes: their hot loops write `this`-targeted fields and `new` results, which are the next levers (constructor-is-guest-function provenance).
 - **Richards and DeltaBlue are call-dispatch dominated** (19M/37M guest calls). The tax is the guest-first dispatch plus the entry counter; argument copies and wrapper creations are negligible.
 - **RayTrace is host-call and construction heavy** (3.2M host calls into `Math` intrinsics, 2.8M constructions) with 2.7M prototype-sensitive reads.
 - DeltaBlue's 64.5k wrapper creations come from host functions first delivered through mediated reads; wrapper reuse keeps this a one-time cost.
@@ -47,20 +47,44 @@ Two boundary hot paths were profiled and specialized without changing sandbox se
 - **Pure-intrinsic call fast path.** Intrinsics that appear in no guard set (`MUTATES_ARGUMENT_ZERO`, `MUTATES_RECEIVER`, `INSPECTS_ARGUMENT_ZERO`, the `Function.prototype.call/apply/bind` and `Reflect.apply/construct` rewrites, `Error.captureStackTrace`, `Function.prototype.toString`) skip the per-call argument and receiver inspections. Classification is computed lazily per target and cached in a `WeakMap`; a monomorphic identity cache in `boundary.call` lets single-intrinsic loops skip dispatch entirely. Guarded targets keep the full checks.
 - **Shared intrinsic graph.** The protected-intrinsic graph walk consumed ~48% of `createInstance` time and is now captured once and shared by every instance: sandbox `createInstance` + `dispose` dropped from 387 µs to 33.6 µs (trusted is 23.2 µs). Contract: the host must not extend intrinsic prototypes after the first instance is created (see [Security](security.md)).
 
+- **Guest-provenance write fast path** (the local-safe IR distinction, v1). The O2/Os provenance pass (`src/backend/guest-provenance.js`, after the last SSA pass) proves which GETLOCAL outputs are guest-created — object/array/regexp literals, closures, and AND-meet phi joins — and marks them on the HIR. Sandbox `SETPROP`/`SETPROP_S` into a provably guest target lower to a slim `$setGuest` helper: `setSandboxPropertyValue` minus `writeTarget`, keeping `secureValue` on function values and strict/sloppy writer dispatch. Marked ⇒ guest-created ⇒ never a wrapper, capability token, or protected intrinsic, so `writeTarget` would be a no-op; nothing unmarked takes the fast path, and value-side handling is byte-identical between the two paths. Coverage on the V8 suite: 36 fast-path sites in the whole-suite compile, all one-time setup writes (harness config, class enums, `Klass.prototype = ...`); the write-dominated suites' hot loops write `this`-targeted fields and `new` results. Regression evidence: with the fast path disabled, the `writeTargets`/`calls` boundary-counter ratios for Crypto, RayTrace, and DeltaBlue are identical to 4 significant digits (A/B over adaptive-iteration runs); re-measured sandbox median 1,387 vs the documented 1,395 and trusted 2,226 vs 2,070, both inside the documented sample spreads; `benchmark:smoke` green; adversarial `security.test.js` cases at all four optimization levels plus both differential smokes (2,300 generated programs, zero mismatches/failures) pin that unmarked writes (intrinsics, capability tokens, globals, parameters) stay on the guarded path.
+
 These changes took the Octane sandbox geometric score from 1,613 to 1,772, the Kraken sandbox total from 28.6 s to 20.8 s, and every real-world workload above the QuickJS-WASM reference (below).
 
 ## Compiled size by optimization level
 
-The input is the same 137.1 KB V8 Benchmark Suite 7 source. Generated CJS excludes the external runtime. Minified browser IIFE figures include the runtime and were produced by esbuild 0.28.2.
+The input is the same 137.1 KB V8 Benchmark Suite 7 source. Generated CJS excludes the external runtime. Minified browser IIFE figures bundle the runtime with esbuild 0.28.2 — `npm run benchmark:size` reproduces every number, and the same script gates CI on the recorded budgets (`--check`, +5% tolerance). All bytes are deterministic for pinned tool versions.
 
 | Level | Sandbox CJS | Sandbox min IIFE | Trusted CJS | Trusted min IIFE |
 | --- | ---: | ---: | ---: | ---: |
-| O0 | 854.1 KB | 598.3 KB | 854.1 KB | 598.3 KB |
-| O1 | 844.8 KB | 591.4 KB | 844.8 KB | 591.4 KB |
-| O2 | 1,214.3 KB | 571.2 KB | 1,105.5 KB | 515.6 KB |
-| Os | 640.3 KB | 369.0 KB | 585.3 KB | 343.6 KB |
+| O0 | 834.0 KB | 589.7 KB | 834.0 KB | 589.7 KB |
+| O1 | 824.9 KB | 582.9 KB | 824.9 KB | 582.9 KB |
+| O2 | 1,225.7 KB | 593.4 KB | 1,062.0 KB | 501.2 KB |
+| Os | 617.1 KB | 360.9 KB | 565.5 KB | 337.4 KB |
 
-Sandbox O2 emits selective prototype guards and per-scope inline frame factories, adding 55.6 KB to the minified bundle versus trusted O2 and 129.5 KB versus the previous sandbox O2 artifact. Os selects shared factories and remains the smallest sandbox artifact, essentially unchanged (369.0 KB versus 368.2 KB).
+O2 sandbox is +3.9% minified versus the 2026-08-21 record (571.2 KB): the boundary fast paths (shared intrinsic graph, pure-intrinsic call fast path, guest-object write helper) grew the runtime and guards; raw CJS is +0.9% (1,214.3 KB). Os selects shared factories and remains the smallest sandbox artifact.
+
+### Factory strategies and the size/score Pareto
+
+The compiler's size optimizer chooses per-scope vs shared frame factories per level (raw CJS bytes):
+
+| Level × security | per-scope | shared | winner |
+| --- | ---: | ---: | ---: |
+| Sandbox O2 | 1,225.7 KB | 789.5 KB | per-scope (+55% — the deliberate speed-for-size trade) |
+| Sandbox Os | 1,053.4 KB | 617.1 KB | shared |
+| Trusted O2 | 1,062.0 KB | 728.2 KB | per-scope (+46%) |
+| Trusted Os | 899.4 KB | 565.5 KB | shared |
+
+The O2 per-scope premium buys throughput: V8 Benchmark Suite 7 sandbox scores by level (single runs, same harness):
+
+| Level | Sandbox score | Sandbox min IIFE |
+| --- | ---: | ---: |
+| O0 | 25.5 | 589.7 KB |
+| O1 | 26.3 | 582.9 KB |
+| O2 | 1,387 (median) | 593.4 KB |
+| Os | 884 | 360.9 KB |
+
+The per-scope choice at O2 is the right trade: the same suite with shared factories scores 1,035 (single run) — +34% throughput for +55% raw CJS. Os keeps shared factories and still lands at 884, i.e. O2's other optimizations buy +17% over Os at 3.9x the min-IIFE delta. Factory safe-sharing — emitting a shared factory only when frame layouts are provably identical — is the next size lever: it could recover most of the O2 premium for scopes whose frames happen to match, without the score loss of forcing all-shared.
 
 ## Source vs compiled artifact on the wire
 
@@ -69,11 +93,11 @@ Gzip is level 9, minification by esbuild 0.28.2. The compiled IIFE figures bundl
 | Artifact | Raw | Minified | Minified gzip |
 | --- | ---: | ---: | ---: |
 | benchmark source (`v8-suite.js`) | 137.1 KB | 57.4 KB | 18.1 KB |
-| compiled sandbox O2 (CJS, no runtime) | 1,214.3 KB | 607.8 KB | 76.0 KB |
-| compiled sandbox O2 (IIFE + runtime) | 571.2 KB | 571.2 KB | 82.1 KB |
-| compiled trusted O2 (IIFE + runtime) | 515.6 KB | 515.6 KB | 76.0 KB |
+| compiled sandbox O2 (CJS, no runtime) | 1,225.7 KB | 524.9 KB | 56.4 KB |
+| compiled sandbox O2 (IIFE + runtime) | 593.4 KB | 593.4 KB | 81.5 KB |
+| compiled trusted O2 (IIFE + runtime) | 501.2 KB | 501.2 KB | 75.2 KB |
 
-The deployable sandbox artifact costs about 64 KB gzipped over the minified source: AOT compilation removes the parser and dispatch loop from the client, but the generated code, guards, and runtime remain. Os narrows this further for size-sensitive deployments.
+The deployable sandbox artifact costs about 63 KB gzipped over the minified source: AOT compilation removes the parser and dispatch loop from the client, but the generated code, guards, and runtime remain. Os narrows this further for size-sensitive deployments (sandbox Os IIFE 360.9 KB, 58.8 KB gzipped).
 
 ## Octane 2.0 applicable subset
 

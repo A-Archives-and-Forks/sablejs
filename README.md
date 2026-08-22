@@ -4,30 +4,25 @@
 [![License](https://img.shields.io/github/license/ErosZy/sablejs)](LICENSE)
 [![Release](https://img.shields.io/github/v/release/ErosZy/sablejs)](https://github.com/ErosZy/sablejs/releases)
 
-sablejs is a **small AOT-compiled execution layer** for running **user-authored and AI-generated JavaScript** in browsers. It combines a **stable ES5.1 contract**, **explicit capabilities**, and **Worker isolation** for **rules, plugins, formulas, and other untrusted logic**.
+sablejs is a **small AOT-compiled execution layer** for running **user-authored and AI-generated JavaScript** in browsers. Guest code gets **standard ECMAScript objects, copied data, and explicit capabilities** — not ambient access to the host object graph or platform APIs. It is built for **rules, plugins, formulas, and other untrusted logic**.
 
 ## Why sablejs
 
-- **Versus `eval` / `new Function`**: these compile and execute source at runtime inside a privileged JavaScript environment. sablejs moves source compilation to build time, ships no runtime evaluator, rejects dynamically generated source, and mediates access to host capabilities.
-- **Versus an iframe sandbox**: an iframe isolates and restricts a browsing context. sablejs instead exposes copied data, protected intrinsics, and explicit capabilities — guest code receives no browser realm, so a dedicated Worker can serve as the entire guest environment.
-- **Versus QuickJS-WASM**: QuickJS-WASM embeds a complete JavaScript interpreter inside WebAssembly. sablejs instead AOT-compiles ES5.1 into direct JavaScript for the host engine, trading interpreter/parser/dispatch overhead for larger generated code and a deliberately stable ES5.1 source contract.
+sablejs AOT-compiles untrusted JavaScript into direct host JavaScript while limiting guest access to **standard ECMAScript objects, copied data, and explicit capabilities**.
+
+- No runtime `eval`/`new Function`. 
+- No ambient browser APIs. 
+- No embedded JavaScript VM.
 
 ## Use cases
 
-sablejs is built for products that execute code the operator did not author:
-
-- **AI executors and agents** — run LLM-generated JavaScript (data transforms, formulas, API-call scripts, UI automation steps) as an untrusted artifact: compile the model's output ahead of time, execute it in a Worker, and get copied results back with no page access. AOT produces a stable, cacheable executable artifact, while the fixed ES5.1 contract makes generated code easier to validate and repair.
-- **User plugins and extensions** — Figma and design-tool plugins, and embeddable plugin systems with user-defined behavior.
-- **Rules and formula engines** — low-code rules, spreadsheet formulas, validators, workflow steps, and pricing logic.
-- **Code playgrounds and learning tools** — sandboxed execution with no host access.
-
-The best fit is small or medium programs, an ES5.1-compatible feature set, repeated execution, and a narrow host API:
+- **AI-generated code**: safely run LLM-generated transforms, formulas, and automation logic.
+- **User plugins**: execute user-defined extensions without exposing the host environment directly.
+- **Rules and formulas**: power validators, pricing logic, workflows, and spreadsheet-like expressions.
+- **Code playgrounds**: run interactive user code in a constrained browser environment.
 
 ```text
-modern source -> Babel/SWC -> ES5.1 -> sablejs AOT -> browser bundle -> dedicated Worker
-                                                                       | explicit messages only
-                                                                       v
-                                                                  application UI
+modern JS -> ES5.1 -> sablejs AOT -> Worker -> application
 ```
 
 ## Install and build
@@ -77,7 +72,8 @@ const instance = program.createInstance({
 });
 
 try {
-  console.log(instance.run()); // { total: 120 } — synchronous, returns the value
+   // { total: 120 } — synchronous, returns the value
+  console.log(instance.run());
 } finally {
   instance.dispose();
 }
@@ -93,8 +89,10 @@ End the program with a function expression and `run()` returns a callable. Call 
 const program = require("./program.cjs");
 // program source: "function price(input) { return { total: input.price * 1.2 }; } price;"
 const instance = program.createInstance({ globals: {} });
-const price = instance.run();      // synchronous — returns the callable
-price({ price: 100 });             // { total: 120 } — synchronous call
+// synchronous — returns the callable
+const price = instance.run();
+// { total: 120 } — synchronous call
+price({ price: 100 });
 instance.dispose();
 ```
 
@@ -103,8 +101,21 @@ Guest functions keep reference semantics between their own frames; only host-ini
 ```js
 // program source: "function price(input) { return { total: input.price * 1.2 }; } price(input);"
 const instance = program.createInstance({ globals: { input: { price: 100 } } });
-instance.run();                    // { total: 120 } — synchronous
+// { total: 120 } — synchronous
+instance.run();
 ```
+
+## Inspecting the compiled program
+
+`compile()` accepts inspection options for debugging generated code:
+
+| option | effect |
+| --- | --- |
+| `dumpDir: "/path"` | writes `hir.txt` (optimized HIR, with pass annotations), `mir.txt` (SSA MIR: blocks, phis, operations), and `code.js` (generated CJS) into the directory |
+| `includeHIR` / `includeMIR` | attach the HIR / MIR graph objects to the compile result |
+| `dumpIR: "hir" \| "mir" \| "all"` | same, graph for the named forms only |
+
+The dump is a side channel — the compile result is unchanged by `dumpDir`.
 
 ## Exposing host operations: capability()
 
@@ -180,6 +191,8 @@ The ES5.1 core is a deliberate, stable surface: small enough to keep the securit
 
 Optional globals such as typed arrays, `Map`, `Promise`, and `Intl` follow host availability.
 
+The conformance gate's corpus policy — which Test262 tests are eligible, which are excluded (the dynamic-code policy), which expectations are pinned to ES5.1, and how failures are A/B-attributed — is the contract in executable form: [Compatibility](docs/compatibility.md).
+
 ## Performance
 
 Three-run medians on the Linux x64 reference machine (methodology, exclusions, and variance: [Performance](docs/performance.md)):
@@ -196,23 +209,30 @@ Three-run medians on the Linux x64 reference machine (methodology, exclusions, a
 | SunSpider 1.0 total (23 tests, ms) | 302.9 | 482.3 | 619.0 |
 | Kraken 1.1 total (14 tests, ms) | 6,094.2 | 20,829.8 | 22,402.1 |
 
-Sandbox retains 67.4% of trusted throughput on V8 Benchmark Suite 7 under this harness, and beats QuickJS-WASM on all eight real-world workloads. These numbers characterize this benchmark and harness, not universal application performance. A 137 KB benchmark source compiles to a 571 KB minified sandbox bundle — 82 KB gzipped.
+Sandbox retains 67.4% of trusted throughput on V8 Benchmark Suite 7 under this harness, and beats QuickJS-WASM on all eight real-world workloads. These numbers characterize this benchmark and harness, not universal application performance. A 137 KB benchmark source compiles to a 593 KB minified sandbox bundle (81.5 KB gzipped; the size-optimized `Os` level: 361 KB / 58.8 KB). Compiled bundle sizes are gated in CI — `npm run benchmark:size -- --check` fails any artifact that exceeds its recorded budget by 5%.
 
 ## Security
 
-An internal boundary audit completed on 2026-08-22 found no known usable escape within the tested threat model — no host-code execution and no host-object-graph access through the reviewed paths. The adversarial battery of 100+ probes runs across the O0/O1/O2/Os optimization levels (110 tests, 0 skipped), and a differential fuzzer compares sablejs against native V8 and QuickJS on generated programs. Security depends on the combination: `sandbox` mode + a dedicated Worker + narrow capabilities + correct host integration. Threat model, trust boundaries, and policies: [Security](docs/security.md).
+An internal boundary audit completed on 2026-08-22 found no known usable escape within the tested threat model — no host-code execution and no host-object-graph access through the reviewed paths. The adversarial battery of 100+ probes runs across the O0/O1/O2/Os optimization levels (127 tests, 0 skipped), including the boundary-internals sweep (wrapper and intrinsic enumeration, proxy-trap observation and steering) and the clone-shape sweep (sparse, huge, deep, exotic, Map/Set/typed-array identities), and a differential fuzzer compares sablejs against native V8 and QuickJS on generated programs. Security depends on the combination: `sandbox` mode + a dedicated Worker + narrow capabilities + correct host integration. Threat model, trust boundaries, and policies: [Security](docs/security.md).
 
 ## Documentation
 
-[Architecture](docs/architecture.md) · [Performance](docs/performance.md) · [Security](docs/security.md) · [Worker isolation](docs/worker-isolation.md) · [Roadmap](docs/roadmap.md)
+- [Architecture](docs/architecture.md) 
+- [Compatibility](docs/compatibility.md) 
+- [Fuel budgets](docs/fuel-budget.md) 
+- [Performance](docs/performance.md) 
+- [Security](docs/security.md) 
+- [Worker isolation](docs/worker-isolation.md) 
+- [Roadmap](docs/roadmap.md)
 
 ## Development
 
 ```sh
 npm ci
-npm test                        # unit + adversarial battery
+npm test # unit + adversarial battery
 npm run test:e2e:build && npm run test:e2e:node
 npm run benchmark:smoke
+npm run benchmark:size # artifact sizes; --check enforces the CI budgets
 ```
 
 Semantic changes must also pass the pinned Test262 gate, and performance changes use three measured runs — both command lists are in [Architecture](docs/architecture.md) (Verification) and [Performance](docs/performance.md) (Reproduction). Keep dependencies directed through `frontend -> ir -> backend -> compiler -> runtime`, add focused regression tests, and update the concise English documentation. The repository uses `package-lock.json` as its only lockfile.

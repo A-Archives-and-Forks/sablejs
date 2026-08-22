@@ -182,6 +182,59 @@ function runWithBudgets(source, input, budgets) {
 }
 ```
 
+### Timeout-wrapping long or never-ending capabilities
+
+A capability whose host promise never settles hangs the guest call forever:
+the boundary awaits the promise before cloning the result back. Budgeting
+that is the host's job, not the boundary's. Two cases, two tools:
+
+- **Async capabilities (promise-returning)** — wrap the host function in a
+  `Promise.race` against a timer, so the guest call fails with a
+  guest-visible error instead of hanging:
+
+  ```js
+  const { capability } = require("sablejs");
+
+  function timeoutCapability(hostFunction, { name, timeoutMs, onTimeout } = {}) {
+    return capability(async function (...args) {
+      let timer;
+      const timeout = new Promise((_, reject) => {
+        timer = setTimeout(() => {
+          const error = new Error(`capability ${name} timed out after ${timeoutMs} ms`);
+          error.name = "TimeoutError";
+          if (onTimeout) onTimeout(error, args);   // host-side bookkeeping
+          reject(error);
+        }, timeoutMs);
+      });
+      try {
+        return await Promise.race([Promise.resolve(hostFunction(...args)), timeout]);
+      } finally {
+        clearTimeout(timer);
+      }
+    }, { name });
+  }
+
+  // The guest sees a sanitized TimeoutError instead of a permanent hang.
+  const lookup = timeoutCapability(async (id) => querySlowBackend(id), {
+    name: "lookup",
+    timeoutMs: 250,
+  });
+  ```
+
+  Two caveats that matter: `Promise.race` does **not** cancel the underlying
+  operation — the host promise keeps running and its effects still happen;
+  pass an `AbortSignal` through to the host function when cancellation is
+  required. And keep the capability timeout well below the Worker's
+  `timeoutMs`, so the failure surfaces as a guest-visible error first and
+  the Worker kill is the backstop, not the primary mechanism.
+
+- **Synchronous capabilities (busy loops, blocking I/O)** — no in-process
+  wrapper can preempt these: while the host function spins, the event loop
+  never gets to run the race timer. The Worker timeout is the only
+  enforcement here; keep sync-blocking work short and run it inside the
+  `timeoutMs` envelope of a dedicated Worker that you terminate on expiry
+  (never reuse a terminated Worker).
+
 ## What the Worker does not provide
 
 The Worker isolates CPU time and memory, not the semantics of the language boundary. The sandbox mode and the Worker are complementary layers: the boundary restricts reach, the Worker restricts resources. Neither protects secrets placed in client-side bundles.
