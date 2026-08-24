@@ -27,7 +27,7 @@ modern JS -> ES5.1 -> sablejs AOT -> Worker -> application
 
 ## Install and build
 
-Install the published v2 beta from npm (currently `2.0.0-beta.1`; the v2
+Install the published v2 beta from npm (currently `2.0.0-beta.2`; the v2
 series is in beta, and `latest` still points at the v1 line until 2.0.0
 goes stable):
 
@@ -201,17 +201,17 @@ Three-run medians on the Linux x64 reference machine (methodology, exclusions, a
 
 | Backend | V8 Benchmark Suite 7 score | vs sandbox |
 | --- | ---: | ---: |
-| sablejs O2 sandbox | 1,497 | — |
-| sablejs O2 trusted | 2,256 | 1.51x |
-| QuickJS-WASM 0.32.0 | 1,133 | 0.76x |
+| sablejs O2 sandbox | 2,202 | — |
+| sablejs O2 trusted | 2,783 | 1.26x |
+| QuickJS-WASM 0.32.0 | 1,181 | 0.54x |
 
 | Suite (direction) | sablejs trusted | sablejs sandbox | QuickJS-WASM |
 | --- | ---: | ---: | ---: |
 | Octane 2.0 geometric score (higher is better) | 2,674 | 2,088 | 1,472 |
-| SunSpider 1.0 total, 23 tests (ms, lower is better) | 276.0 | 442.2 | 588.1 |
-| Kraken 1.1 total, 14 tests (ms, lower is better) | 5,641.8 | 19,750.7 | 22,087.8 |
+| SunSpider 1.0 total, 23 tests (ms, lower is better) | 396.1 | 515.5 | 597.7 |
+| Kraken 1.1 total, 14 tests (ms, lower is better) | 5,370.9 | 15,935.3 | 27,081.9 |
 
-Sandbox retains 66.4% of trusted throughput on V8 Benchmark Suite 7 under this harness, and beats QuickJS-WASM on seven of the eight real-world workloads (mini-parser sits at parity). On SunSpider and Kraken the sandbox totals are also faster than the QuickJS-WASM reference (1.33x and 1.12x) — the sandbox tax shows as a reduction *relative to the fully trusted sablejs backend*, not as a loss to QuickJS. These numbers characterize this benchmark and harness, not universal application performance. A 137 KB benchmark source compiles to a 593 KB minified sandbox bundle (81.5 KB gzipped; the size-optimized `Os` level: 361 KB / 58.8 KB). Compiled bundle sizes are gated in CI — `npm run benchmark:size -- --check` fails any artifact that exceeds its recorded budget by 5%.
+Sandbox retains 79.1% of trusted throughput on V8 Benchmark Suite 7 under this harness, and beats QuickJS-WASM on seven of the eight real-world workloads (mini-parser sits at parity). On SunSpider and Kraken the sandbox totals are also faster than the QuickJS-WASM reference (1.16x and 1.70x) — the sandbox tax shows as a reduction *relative to the fully trusted sablejs backend*, not as a loss to QuickJS. These numbers characterize this benchmark and harness, not universal application performance. A 137 KB benchmark source compiles to a 657 KB minified sandbox bundle (87.5 KB gzipped; the size-optimized `Os` level: 386 KB / 60.7 KB). Compiled bundle sizes are gated in CI — `npm run benchmark:size -- --check` fails any artifact that exceeds its recorded budget by 5%.
 
 ## Security
 
@@ -244,7 +244,7 @@ Semantic changes must also pass the pinned Test262 gate, and performance changes
 Bump the version in `package.json` (sync `package-lock.json` too), push to master, and wait for Ubuntu CI to go green. Then tag the release and push the tag:
 
 ```sh
-git tag v2.0.0-beta.1 && git push origin v2.0.0-beta.1
+git tag v2.0.0-beta.2 && git push origin v2.0.0-beta.2
 ```
 
 The `release.yml` workflow verifies the tag against `package.json`, runs the unit tests, builds `dist/`, publishes to npm via Trusted Publishing (OIDC), and creates the GitHub release with the bundled artifacts. Versions containing a hyphen (e.g. `2.0.0-beta.1`) publish under the `beta` dist-tag; stable versions publish as `latest`. npm allows exactly one trusted publisher per package — `release.yml` is that registered workflow, so it is the only path that publishes to npm.

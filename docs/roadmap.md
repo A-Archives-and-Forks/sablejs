@@ -3,7 +3,7 @@
 Status markers: ✅ Done · ◐ Partial · ⬜ Not started.
 Priority principle: **security correctness > semantic correctness > real-world evidence > DX > performance > benchmark scores**.
 
-Last updated 2026-08-22.
+Last updated 2026-08-24.
 
 ## Status summary
 
@@ -20,17 +20,18 @@ The 2026-08-22 top-10 priorities are all done:
 9. ✅ README positioning (versus eval/iframe/QuickJS, ES5.1 core strategy)
 10. ✅ ES5.1 strategy documented (README + [Security](security.md))
 
-## Current snapshot (2026-08-22)
+## Current snapshot (2026-08-24)
 
-- **Security**: a full boundary audit ([Security](security.md), Historical audit record) found no usable escape; the adversarial regression battery lives in `test/unit/security.test.js` (127 tests, 0 skipped), now including the boundary-internals sweep and the clone-shape sweep (P0-S1–S4).
-- **Performance**: V8 Benchmark Suite 7 sandbox 1,497, trusted 2,256 (2026-08-22 refresh); Octane/SunSpider/Kraken comparison system across sandbox/trusted/QuickJS in place; the sandbox beats QuickJS-WASM on 7 of the 8 real-world workloads after the boundary fast paths (mini-parser at parity on the freshest measurements), plus the guest-provenance write fast path (local-safe IR distinction, 2026-08-22). Details in [Performance](performance.md).
+- **Security**: a full boundary audit ([Security](security.md), Historical audit record) found no usable escape; the adversarial regression battery lives in `test/unit/security.test.js` (78 tests, 0 skipped, 158/158 across the unit suite), now including the boundary-internals sweep, the clone-shape sweep (P0-S1–S4), the provenance-v2 write fast-path pins, the arity-specialized dispatch pins, and the object-literal folding pins.
+- **Performance**: V8 Benchmark Suite 7 sandbox 2,202, trusted 2,783 (three-run medians, [Performance](performance.md)); the sandbox beats QuickJS-WASM on 7 of the 8 real-world workloads (mini-parser at parity). The 2026-08-23/24 optimization batch (items 1–19, fully recorded in the [Optimization history](optimization.md)) shipped guest-provenance v2, arity-specialized call/NEW dispatch, literal folding, local promotion, slot-provenance write stamps, the inline guest-stamp write path, the literal-init fast path and its inlined/deep-folded successors, the sandbox-only host-intrinsic call inlines, frame-stack sync simplification, and branch-test round-trip elimination; item 16 measured flat and was rolled back. Cumulative Octane A/B vs the pre-items HEAD: **+37% geomean** across 8 suites (Splay 2.25×, EarleyBoyer 2.14×, RayTrace 1.67×, NavierStokes 1.48×; Richards −12% unattributable). The loop exited at item 19 — a refreshed real-speed decomposition found the remaining costs intrinsic (interp dispatch + guest-function/property sandbox mediation). **Measurement protocol: all in-session A/Bs are pinned to one core (`taskset -c 11`) — the machine runs other projects' benchmark jobs, so unpinned numbers are unreliable.**
 - **Semantics**: the pinned Test262 gate passes; the 33 pre-existing failures were confirmed unrelated to this work by A/B comparison.
 
 ## Next priorities
 
-1. ✅ **Local-safe IR distinction** (v1 shipped 2026-08-22) — the guest-object provenance pass proves which GETLOCAL outputs are guest-created (literals, closures, phi joins) and sandbox property writes to them skip `writeTarget` via the slim `$setGuest` helper, keeping `secureValue` + strict/sloppy dispatch. Security tests pin that unmarked writes (intrinsics, capability tokens, globals, parameters) stay on the guarded path byte-for-byte. The remaining write-guard levers — marking `new` results (constructor-is-guest-function proof) and `this`-targeted writes — are the next step (see P1 Sandbox tax).
-2. **Facet fuzzing** — extend the differential fuzzer to parser / optimizer / sandbox boundary / capability serializer facets, add generated-code syntax validation, and a nightly campaign.
-3. **Benchmark reporting automation** — automatically generate the performance markdown and archive benchmark JSON with environment info.
+1. ✅ **Local-safe IR distinction** (v1 shipped 2026-08-22) — the guest-object provenance pass proves which GETLOCAL outputs are guest-created (literals, closures, phi joins) and sandbox property writes to them skip `writeTarget` via the slim `$setGuest` helper, keeping `secureValue` + strict/sloppy dispatch. Security tests pin that unmarked writes (intrinsics, capability tokens, globals, parameters) stay on the guarded path byte-for-byte.
+2. ◐ **Backend optimization batch** (2026-08-23) — complete design for the next backend batch in [Optimization history](optimization.md): guest-provenance v2 (`new` results + `this`-targeted writes, **shipped**), strict-mode parameter propagation (**shipped**), guest direct-call fast path (**shipped** as arity-specialized dispatch), object-literal folding (**shipped**), intrinsic-read LICM, local promotion, and the smaller items. Implementation order and per-item evidence gates are defined there; each item ships with security regressions at all four levels plus differential smokes.
+3. **Facet fuzzing** — extend the differential fuzzer to parser / optimizer / sandbox boundary / capability serializer facets, add generated-code syntax validation, and a nightly campaign.
+4. **Benchmark reporting automation** — automatically generate the performance markdown and archive benchmark JSON with environment info.
 
 ## Open work by priority
 
@@ -78,7 +79,13 @@ The 2026-08-22 top-10 priorities are all done:
 - ✅ Tax formula automated in `benchmark/release.js`; NavierStokes/Crypto profiled (write-guard dominated) and Richards/DeltaBlue/RayTrace profiled (call/construct dominated).
 - ✅ Pure-intrinsic call fast path + shared intrinsic graph (2026-08-22): call-heavy workloads gained 3–9x and now beat QuickJS-WASM across the board (7 of 8 on the freshest measurements, mini-parser at parity); `createInstance` dropped from 387 µs to 33.6 µs.
 - ✅ Guest-provenance write fast path (2026-08-22, the local-safe IR distinction v1): O2/Os provenance pass after the last SSA pass marks GETLOCAL outputs that are provably guest-created; sandbox `SETPROP`/`SETPROP_S` into them lower to a slim `$setGuest` helper (sandbox write minus `writeTarget`; `secureValue` and strict/sloppy writer dispatch kept). Marked ⇒ guest-created ⇒ never a wrapper, capability token, or protected intrinsic ⇒ `writeTarget` provably a no-op. On the V8 suite the 36 fast-path sites are all one-time setup writes (harness config, class enums, `Klass.prototype = ...`); the write-dominated suites' hot loops write `this`-targeted fields and `new` results, so the per-iteration counters are unchanged to 4 significant digits (A/B with the fast path disabled) and the sandbox median re-measured 1,387 vs the documented 1,395 (within sample spread). Regression battery: `security.test.js` adversarial cases at all four levels + differential smokes.
-- ⬜ Next write-guard levers: marking `new` results and `this`-targeted writes (needs constructor-is-guest-function provenance), provenance through property-read chains, INITPROP object-literal fast path, array-index fast path, numeric-local specialization. Never break sandbox invariants for a score.
+- ✅ Write-guard levers v2 (2026-08-23) — provenance v2 ([Optimization history](optimization.md) item 1: `new`-result marks + the per-call `thisIsGuest` frame stamp; Richards −82.7%, DeltaBlue −21.5% per-call writes, +7.6%/+2.7% scores) and slot-provenance write stamps (item 9: per-store classification, NavierStokes +49.7%, Crypto +23.4%, full-suite `writeTargets` 210.4M → 10.0M); item 10 inlined the classified write natively (full-suite A/B +9.9%). Remaining levers: provenance through property-read chains, the array-index fast path, construct-only `THIS` provenance. Never break sandbox invariants for a score.
+- ✅ Call fast path v2 (2026-08-23) — arity-specialized guest-call dispatch (item 2: Richards +6.3%, DeltaBlue +8.4%) and NEW dispatch (item 8: RayTrace's constructions 99.99% on the fast path). The identity-guard and per-site-memo designs measured as negative results in the plan.
+- ✅ Object-literal folding (2026-08-23) — item 3: V8 suites flat, but a 2,000-property data literal compiles to 27.9 KB instead of 205.6 KB (7.4× generated-code reduction).
+- ✅ Local promotion, phases 1 + 2 + 3 (2026-08-23) — item 6: locals compile out of `$f.locals` into `$exec` prologue variables (strict-mode parameters in phase 2, sandbox in phase 3); trusted NavierStokes +45%, sandbox +47.6%, suite score 2,256 → 2,451.
+- ✅ Slot-provenance write stamps (2026-08-23) — item 9; see the write-guard entry above.
+- ✅ Literal-init fast path (2026-08-23) — item 11: json-transform 1.89×/1.93×, pricing-rules 2.53×/2.63×, 0 slow-path hits across all 8 workloads; the remaining-levers scout after items 17+18 closed at item 19.
+- ✅ Frame-stack sync simplification (2026-08-23) — item 12: json-transform 1.97×/2.13×, data-aggregation 1.78×/1.88× after the honest re-measurement (the clobbered-baseline lesson).
 
 ### P1 — Real-world workloads
 
@@ -98,6 +105,7 @@ The 2026-08-22 top-10 priorities are all done:
 - ✅ IR explicitly distinguishes local-safe from boundary-sensitive operations (2026-08-22, v1): the guest-object provenance pass (`src/backend/guest-provenance.js`, after the last SSA pass, O2/Os) writes `guestObjectOutput` marks onto the HIR; codegen replays them as temporary origins and picks the slim `$setGuest` write helper only for provably guest-created targets. Soundness: marked values are never folded/DCE'd/copy-propagated, so the mark cannot go stale; unmarked operands keep today's guarded path. Follow-ups: provenance through property-read chains and `new` results, INITPROP fast path.
 - ✅ Each optimization pass documents its semantic invariants (2026-08-22): every pass in `src/backend/optimizer.js` carries a contract note — what it proves, what it preserves, and which instruction fields it may write; the security-sensitive guest-object-provenance pass documents its mark soundness and has adversarial regression tests at all four optimization levels plus differential coverage.
 - ✅ IR dump / generated-code inspection mode (2026-08-22): `compile({ dumpDir })` writes `hir.txt` (annotated optimized HIR), `mir.txt` (MIR blocks/phis/operations), and `code.js`; `includeHIR`/`includeMIR`/`dumpIR: "hir"|"mir"|"all"` attach the graph objects (`dumpIR: "all"` now includes both forms). The text printer lives in `src/ir/print.js`; covered in `test/unit/compiler.test.js`.
+- ✅ Backend optimization batch (2026-08-23/24): strict-mode parameter propagation, guest-provenance v2, intrinsic-read LICM (validated out), local promotion (frame-shape specialization, all three phases), dead-store elimination, dense `JCASE` switch lowering, leaf-frame pooling, the NEW-dispatch arity specialization, slot-provenance write stamps, the inline guest-stamp write path, the literal-init fast path, the frame-stack sync simplification, the inlined literal-init fast path, and the sandbox-only host-intrinsic call inline shipped (plan items 4, 1, 5, 6, 7a, 7b, 7c, 8, 9, 10, 11, 12, 13, 14); the entry-counter investigation was closed (already gated) — full designs, soundness arguments, and per-item evidence gates in [Optimization history](optimization.md).
 
 ### P2 — API / DX
 
