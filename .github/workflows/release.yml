@@ -142,6 +142,13 @@ jobs:
             cat release-bundle/npm-publish.log
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$publish_status" -ne 0 ]; then
+            publish_error=$(tail -n 25 release-bundle/npm-publish.log | tr '\n' ' ')
+            publish_error=${publish_error//'%'/'%25'}
+            publish_error=${publish_error//$'\r'/'%0D'}
+            publish_error=${publish_error//$'\n'/'%0A'}
+            echo "::error file=.github,line=22,title=npm publish failed::$publish_error"
+          fi
           exit "$publish_status"
       - name: Create GitHub release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
