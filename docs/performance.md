@@ -93,7 +93,7 @@ Gzip is level 9, minification by esbuild 0.28.2. The compiled IIFE figures bundl
 | Artifact | Raw | Minified | Minified gzip |
 | --- | ---: | ---: | ---: |
 | benchmark source (`v8-suite.js`) | 137.1 KB | 55.8 KB | 17.6 KB |
-| compiled sandbox O2 (CJS, no runtime) | 1,380.5 KB | — | — |
+| compiled sandbox O2 (CJS, no runtime) | 1,380.5 KB | 624.6 KB | 75.5 KB |
 | compiled sandbox O2 (IIFE + runtime) | 657.1 KB | 657.1 KB | 87.5 KB |
 | compiled trusted O2 (IIFE + runtime) | 521.3 KB | 521.3 KB | 74.4 KB |
 
