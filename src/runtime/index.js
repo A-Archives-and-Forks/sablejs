@@ -4,7 +4,7 @@ const {
   captureArgumentsObject: CAPTURE_ARGUMENTS_OBJECT,
   writePropertyValue: HOST_WRITE_SLOPPY_PROPERTY_VALUE,
 } = require("./sloppy");
-const { SandboxBoundary, capability, sanitizeHostError } = require("./security");
+const { SandboxBoundary, brandRuntimeCallable, capability, sanitizeHostError, unwrapCapabilities } = require("./security");
 
 const ABI_VERSION = "2.0.0-aot.5";
 const EMPTY = Symbol("sable.empty");
@@ -362,7 +362,7 @@ function createGlobal(injected, boundary = null) {
   defineData(globalObject, "NaN", NaN, false, false, false);
   defineData(globalObject, "Infinity", Infinity, false, false, false);
   defineData(globalObject, "undefined", undefined, false, false, false);
-  const imported = boundary ? boundary.importGlobals(injected) : injected;
+  const imported = boundary ? boundary.importGlobals(injected) : unwrapCapabilities(injected);
   if (imported != null) {
     ARRAY_FOR_EACH(REFLECT_OWN_KEYS(imported), (key) => {
       OBJECT_DEFINE_PROPERTY(
@@ -875,6 +875,10 @@ function createSloppyAccessors(runtime) {
 }
 
 function initializeCompiledFunction(runtime, compiled, metadata) {
+  // Brand unconditionally (also in trusted mode, which never registers guest
+  // functions): a guest closure must be recognizable as runtime-owned when a
+  // different instance re-injects it via globals.
+  brandRuntimeCallable(compiled);
   if (metadata.name) {
     // Descriptors must be null-prototype: a plain literal inherits
     // Object.prototype, so guest-visible pollution (e.g. a "value" property)

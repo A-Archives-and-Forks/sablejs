@@ -119,28 +119,43 @@ instance.run();
 
 The dump is a side channel — the compile result is unchanged by `dumpDir`.
 
-## Exposing host operations: capability()
+## Exposing host operations: capabilities
 
-Sandbox programs cannot touch host functions or ambient objects. Expose exactly the operations they need as capabilities:
+Sandbox programs cannot touch host functions or ambient objects. Any host function in `globals` becomes a capability automatically, so the same literal works in both security modes:
 
 ```js
-const { capability } = require("sablejs");
-
 const instance = program.createInstance({
   globals: {
     input: { price: 100 },
-    save: capability(async function (record) {
+    save: async function (record) {
       const response = await fetch("/api/records", {
         method: "POST",
         body: JSON.stringify(record),
       });
       return { saved: response.ok };
-    }, { name: "save" }),
+    },
   },
 });
 ```
 
-Capability arguments and results are copied, thrown errors are sanitized, and wrappers are revoked after `instance.dispose()`. For fully trusted integrations that need reference identity and the lowest overhead, compile with `security: "trusted"` — this restores raw `globals` pass-through.
+In sandbox mode every host function found anywhere in `globals` (nested objects, arrays, `Map`/`Set` included) is wrapped as a capability: arguments and results are copied, thrown errors are sanitized, and the wrapper is revoked after `instance.dispose()`. The wrapper's name is the function's own `name`, else the property path it was found at, else `"capability"`; bare functions are called with no receiver, and only the function value crosses — its own properties do not.
+
+Wrap explicitly with `capability()` when you need to control those details — a custom name, or `{ thisValue }` for functions that need a receiver:
+
+```js
+const save = capability(
+  async function (record) {
+    const response = await fetch("/api/records", {
+      method: "POST",
+      body: JSON.stringify(record),
+    });
+    return { saved: response.ok };
+  },
+  { name: "save", thisValue: api }
+);
+```
+
+Explicit tokens work in both modes. In trusted mode, `globals` are passed through by reference and capability tokens are unwrapped back to the raw host functions, so one literal serves sandbox (copied data, mediated calls) and trusted (reference identity, lowest overhead) unchanged.
 
 ## Isolating CPU and memory: the Worker
 
@@ -159,7 +174,7 @@ await sandbox.run({ price: 100 }); // { total: 120 }
 await sandbox.evaluate(artifactCode, { price: 100 });
 ```
 
-`run` and `evaluate` return promises (a message round-trip), unlike the in-process `instance.run()` above, which is synchronous. Per-run timeouts terminate the Worker, responses are validated, and each message runs a fresh instance — the worker survives many calls. The full build pipeline (Babel downlevel, esbuild bundling) and size budgets are in [Worker isolation](docs/worker-isolation.md). Do not place secrets in client-side bundles.
+`run` and `evaluate` return promises (a message round-trip), unlike the in-process `instance.run()` above, which is synchronous. Per-run timeouts terminate the Worker, responses are validated, and each message runs a fresh instance — the worker survives many calls. The message channel carries plain data only, so functions cannot cross it: capabilities are an in-process feature, and the Worker is for compute-only programs (see [Worker isolation](docs/worker-isolation.md) for injecting capabilities worker-side). The full build pipeline (Babel downlevel, esbuild bundling) and size budgets are in [Worker isolation](docs/worker-isolation.md). Do not place secrets in client-side bundles.
 
 ## Sandbox semantics
 
@@ -169,12 +184,12 @@ ES5.1 defines ECMAScript built-ins, not a universal set of browser or applicatio
 | --- | --- |
 | ES5.1 built-ins | `Object`, `Array`, strings, numbers, `Math`, `Date`, `RegExp`, errors, `JSON`, and URI/number helpers are available through protected intrinsics. Static `Function` source can be AOT-compiled; runtime-generated source and global `eval` are unavailable. |
 | Newer ECMAScript built-ins | Typed arrays, `Map`, `Set`, `Promise`, `Symbol`, `BigInt`, `Reflect`, `Proxy`, `Atomics`, `WeakRef`, and `Intl` are available when the host implements them. Shared intrinsic mutation remains blocked. |
-| Injected data | Primitives, plain objects, arrays, `Date`, `RegExp`, buffers/views, `Map`, `Set`, and sanitized errors are copied into the guest. |
+| Injected data | Primitives, plain objects, arrays, `Date`, `RegExp`, buffers/views, `Map`, `Set`, and sanitized errors are copied into the guest. Host functions are wrapped as capabilities. |
 | Host/platform objects | `window`, `document`, DOM nodes, `Response`, `File`, `WebSocket`, Figma APIs, Node `process`/`fs`, and class instances are not injected directly. Expose narrow operations with `capability()` and return plain data. |
 
 `Proxy` is available when the host implements it, under a reviewed policy: the guest may wrap its own objects, wrapping protected intrinsics is blocked, and trap bodies execute as guest code with mediated entries (see [Security](docs/security.md)). If your guest does not need `Proxy`, treat it like any other optional intrinsic and keep its host availability in mind when reviewing the surface you expose.
 
-`security: "trusted"` can use arbitrary host objects by reference, including their methods, accessors, and prototype chains. Use it only when the compiled program is fully trusted. The threat model, policies, and audit record are in [Security](docs/security.md).
+`security: "trusted"` can use arbitrary host objects by reference, including their methods, accessors, and prototype chains. Capability tokens in `globals` are unwrapped to their raw host functions, so the same `globals` literal works in both modes. Use it only when the compiled program is fully trusted. The threat model, policies, and audit record are in [Security](docs/security.md).
 
 ## ES5.1 core and Babel downlevel
 

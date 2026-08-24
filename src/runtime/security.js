@@ -1,6 +1,19 @@
 "use strict";
 
 const CAPABILITY_RECORDS = new WeakMap();
+
+// Every callable the sablejs runtime itself manufactures is branded here:
+// capability wrappers, mediated host-function wrappers, guest closures
+// (sandbox and trusted), the dynamic-constructor guard, and the redacted
+// toString. Module-level rather than per-boundary, so a callable surfaced by
+// instance A is recognized by instance B — auto-wrap must never wrap a
+// runtime-owned callable, and such callables stay rejected when re-injected
+// into a different instance (cross-instance smuggling).
+const RUNTIME_CALLABLES = new WeakSet();
+function brandRuntimeCallable(callable) {
+  RUNTIME_CALLABLES.add(callable);
+  return callable;
+}
 // Wrapper -> raw host target, stored in a WeakMap rather than as a
 // symbol-keyed property. A property read on a guest-owned proxy invokes the
 // guest's get trap with the key, so a symbol tag would be observable (and
@@ -151,6 +164,17 @@ function capability(callable, options = {}) {
   return token;
 }
 
+// Auto-wrapped capability name derivation: the callable's own name wins,
+// then the last path segment the clone reached it through (e.g. "save" for
+// globals.input.save), then the generic fallback. The <key>/<value>
+// placeholders cloneValue uses for Map and Set tasks never become names.
+function capabilityName(callable, path) {
+  if (typeof callable.name === "string" && callable.name !== "") return callable.name;
+  const dot = path.lastIndexOf(".");
+  const segment = dot === -1 ? path : path.slice(dot + 1);
+  return segment !== "" && segment !== "<key>" && segment !== "<value>" ? segment : "capability";
+}
+
 function safeError(error) {
   let name = "Error";
   let message = "Host capability failed";
@@ -168,6 +192,257 @@ function safeError(error) {
 function isPlainObject(value) {
   const prototype = OBJECT_GET_PROTOTYPE_OF(value);
   return prototype === OBJECT_PROTOTYPE || prototype === null;
+}
+
+// Trusted mode: capability tokens in injected globals are replaced by their
+// recorded callables so capability-style host code runs unchanged in trusted
+// mode. The host's object graph is never mutated: only containers on token
+// paths are rebuilt (shallow plain-object/array/Map/Set copies); every other
+// subtree is shared by reference, preserving the trusted pass-through
+// contract. Tokens nested inside class instances or accessor closures are
+// not traversed and therefore not unwrapped.
+const BOUND_CALLABLES = new WeakMap();
+
+function resolveCapabilityToken(record) {
+  // Without a thisValue the raw callable itself is returned, so trusted mode
+  // keeps reference identity. With a thisValue, memoize one bound function
+  // per token so every occurrence of the same token resolves to the same
+  // callable — sandbox honors thisValue via REFLECT_APPLY, so trusted must
+  // too, or method-style capabilities silently change behavior.
+  if (record.thisValue === undefined) return record.callable;
+  let bound = BOUND_CALLABLES.get(record);
+  if (bound === undefined) {
+    bound = FUNCTION_BIND.call(record.callable, record.thisValue);
+    BOUND_CALLABLES.set(record, bound);
+  }
+  return bound;
+}
+
+function isContainer(value) {
+  if (Array.isArray(value)) return true;
+  if (isPlainObject(value)) return true;
+  try { return value instanceof Map || value instanceof Set; } catch (_) { return false; }
+}
+
+function containerChildren(node) {
+  if (Array.isArray(node)) return node;
+  try {
+    if (node instanceof Map) {
+      const out = [];
+      for (const entry of node) out.push(entry[0], entry[1]);
+      return out;
+    }
+    if (node instanceof Set) {
+      const out = [];
+      for (const value of node) out.push(value);
+      return out;
+    }
+  } catch (_) { return []; }
+  const out = [];
+  try {
+    for (const key of OWN_KEYS(node)) {
+      const descriptor = OBJECT_GET_OWN_PROPERTY_DESCRIPTOR(node, key);
+      if (!descriptor) continue;
+      if ("value" in descriptor) {
+        if (isObject(descriptor.value)) out.push(descriptor.value);
+      } else {
+        if (isObject(descriptor.get)) out.push(descriptor.get);
+        if (isObject(descriptor.set)) out.push(descriptor.set);
+      }
+    }
+  } catch (_) {}
+  return out;
+}
+
+// Iterative token scan with an explicit stack. A node is marked on-stack
+// before its children are pushed, so cycles terminate; when a token is found,
+// every frame currently on the stack (the ancestor chain) is marked true
+// immediately, so an ancestor can never miss a token that a cycle member hid
+// behind a back-edge. Returns the WeakMap memo (node -> hasTokenBelow).
+function scanHasToken(root) {
+  const memo = new WeakMap();
+  const complete = new WeakSet();
+  const onStack = new WeakSet();
+  const stack = [{ node: root }];
+  while (stack.length > 0) {
+    const frame = stack[stack.length - 1];
+    const node = frame.node;
+    // `complete` tracks children fully walked; `memo` may already be true
+    // from propagation without the walk being done, so it cannot gate the
+    // frame (skipping would leave sibling subtrees unscanned and the rebuild
+    // would misplace them by reference).
+    if (complete.has(node)) {
+      stack.length -= 1;
+      continue;
+    }
+    // Re-entry of a frame that already pushed children: resume the walk.
+    if (frame.pushed) {
+      let pending = null;
+      for (const child of frame.children) {
+        if (isObject(child) && !complete.has(child) && !onStack.has(child)) {
+          pending = child;
+          break;
+        }
+      }
+      if (pending !== null) {
+        stack.push({ node: pending });
+        continue;
+      }
+      if (!memo.has(node)) {
+        memo.set(node, frame.children.some((child) => memo.get(child) === true));
+      }
+      complete.add(node);
+      stack.length -= 1;
+      continue;
+    }
+    if (CAPABILITY_RECORDS.has(node)) {
+      memo.set(node, true);
+      // A token anywhere below an open frame marks every frame on the stack
+      // (its ancestor chain) true, so an ancestor can never miss a token a
+      // cycle member hid behind a back-edge.
+      for (const ancestor of stack) memo.set(ancestor.node, true);
+      complete.add(node);
+      stack.length -= 1;
+      continue;
+    }
+    if (!isContainer(node)) {
+      memo.set(node, false);
+      complete.add(node);
+      stack.length -= 1;
+      continue;
+    }
+    if (onStack.has(node)) {
+      stack.length -= 1;
+      continue;
+    }
+    onStack.add(node);
+    frame.children = containerChildren(node);
+    frame.pushed = true;
+  }
+  return memo;
+}
+
+function defineSlot(shell, key, value, descriptor) {
+  // Null-prototype descriptor: a plain literal would inherit
+  // Object.prototype pollution and the host could reject it as mixed.
+  const holder = OBJECT_CREATE(null);
+  if ("get" in descriptor) {
+    holder.get = descriptor.get;
+    holder.set = descriptor.set;
+  } else {
+    holder.value = value;
+    holder.writable = descriptor.writable;
+  }
+  holder.enumerable = descriptor.enumerable;
+  holder.configurable = descriptor.configurable;
+  OBJECT_DEFINE_PROPERTY(shell, key, holder);
+}
+
+function materializeShell(node) {
+  if (Array.isArray(node)) return new Array(node.length);
+  try {
+    if (node instanceof Map) return new Map();
+    if (node instanceof Set) return new Set();
+  } catch (_) {}
+  return OBJECT_CREATE(OBJECT_GET_PROTOTYPE_OF(node));
+}
+
+// Fills a shell: token-free children are copied by reference with their
+// original descriptor attributes (accessors verbatim, array holes absent);
+// only token-path children become tasks that replace the slot once rebuilt.
+function fillShell(shell, node, stack, hasTokenBelow) {
+  if (Array.isArray(node) || isPlainObject(node)) {
+    let keys;
+    try { keys = OWN_KEYS(node); } catch (_) { keys = []; }
+    for (const key of keys) {
+      if (Array.isArray(node) && key === "length") continue;
+      let descriptor;
+      try { descriptor = OBJECT_GET_OWN_PROPERTY_DESCRIPTOR(node, key); } catch (_) { descriptor = null; }
+      if (!descriptor) continue;
+      if ("value" in descriptor) {
+        const value = descriptor.value;
+        if (isObject(value) && hasTokenBelow.get(value)) {
+          stack.push({
+            node: value,
+            place: (resolved) => defineSlot(shell, key, resolved, descriptor),
+          });
+        } else {
+          defineSlot(shell, key, value, descriptor);
+        }
+      } else {
+        defineSlot(shell, key, descriptor.get, descriptor);
+      }
+    }
+    return;
+  }
+  try {
+    if (node instanceof Map) {
+      for (const [key, value] of node) {
+        const keyNeeds = isObject(key) && hasTokenBelow.get(key);
+        const valueNeeds = isObject(value) && hasTokenBelow.get(value);
+        if (!keyNeeds && !valueNeeds) {
+          shell.set(key, value);
+        } else if (keyNeeds && valueNeeds) {
+          stack.push({
+            node: key,
+            place: (resolvedKey) => {
+              stack.push({ node: value, place: (resolvedValue) => shell.set(resolvedKey, resolvedValue) });
+            },
+          });
+        } else if (keyNeeds) {
+          stack.push({ node: key, place: (resolvedKey) => shell.set(resolvedKey, value) });
+        } else {
+          stack.push({ node: value, place: (resolvedValue) => shell.set(key, resolvedValue) });
+        }
+      }
+      return;
+    }
+    if (node instanceof Set) {
+      for (const value of node) {
+        if (isObject(value) && hasTokenBelow.get(value)) {
+          stack.push({ node: value, place: (resolvedValue) => shell.add(resolvedValue) });
+        } else {
+          shell.add(value);
+        }
+      }
+    }
+  } catch (_) {}
+}
+
+function unwrapCapabilities(value) {
+  if (value === null || typeof value !== "object") return value;
+  const hasTokenBelow = scanHasToken(value);
+  if (!hasTokenBelow.get(value)) return value;
+  const seen = new WeakMap();
+  let result;
+  const stack = [{
+    node: value,
+    place: (resolved) => { result = resolved; },
+  }];
+  while (stack.length > 0) {
+    const frame = stack[stack.length - 1];
+    stack.length -= 1;
+    const node = frame.node;
+    const record = CAPABILITY_RECORDS.get(node);
+    if (record) {
+      frame.place(resolveCapabilityToken(record));
+      continue;
+    }
+    if (!isContainer(node) || !hasTokenBelow.get(node)) {
+      frame.place(node);
+      continue;
+    }
+    const existing = seen.get(node);
+    if (existing !== undefined) {
+      frame.place(existing);
+      continue;
+    }
+    const shell = materializeShell(node);
+    seen.set(node, shell);
+    frame.place(shell);
+    fillShell(shell, node, stack, hasTokenBelow);
+  }
+  return result;
 }
 
 function isObject(value) {
@@ -268,7 +543,7 @@ class SandboxBoundary {
 
   registerGuestFunction(callable) {
     this.guestFunctions.add(callable);
-    return callable;
+    return brandRuntimeCallable(callable);
   }
 
   consumeInternalGuestEntry() {
@@ -280,7 +555,7 @@ class SandboxBoundary {
   importGlobals(globals) {
     if (globals == null) return null;
     if (typeof globals !== "object") throw boundaryError("globals must be an object");
-    return this.cloneValue(globals, "globals", "host-to-guest", new WeakMap());
+    return this.cloneValue(globals, "globals", "host-to-guest", new WeakMap(), { wrapFunctions: true });
   }
 
   exposeIntrinsic(value) {
@@ -434,7 +709,7 @@ class SandboxBoundary {
     toStringDescriptor.configurable = true;
     OBJECT_DEFINE_PROPERTY(wrapper, "toString", toStringDescriptor);
     this.hostFunctionWrappers.set(target, wrapper);
-    return wrapper;
+    return brandRuntimeCallable(wrapper);
   }
 
   call(callable, thisValue, args) {
@@ -599,7 +874,7 @@ class SandboxBoundary {
     return result;
   }
 
-  cloneValue(value, path, direction, seen) {
+  cloneValue(value, path, direction, seen, options = null) {
     if ((typeof value !== "object" || value === null) && typeof value !== "function") return value;
 
     // Iterative clone: an explicit work stack bounds depth by memory instead
@@ -636,6 +911,31 @@ class SandboxBoundary {
         continue;
       }
       if (typeof node === "function") {
+        // Globals import may auto-wrap raw host functions as capabilities so
+        // the same globals literal serves sandbox and trusted modes. The
+        // ambient and CAPABILITY_RECORDS branches above still take
+        // precedence; runtime-owned callables (another instance's wrappers or
+        // guest closures) are never re-wrapped.
+        if (direction === "host-to-guest" && options && options.wrapFunctions && !RUNTIME_CALLABLES.has(node)) {
+          const existing = seen.get(node);
+          if (existing !== undefined) {
+            place(existing);
+            continue;
+          }
+          const wrapper = this.createCapability({
+            callable: node,
+            name: capabilityName(node, nodePath),
+            thisValue: undefined,
+          });
+          seen.set(node, wrapper);
+          place(wrapper);
+          continue;
+        }
+        if (direction === "host-to-guest" && options && options.wrapFunctions) {
+          throw boundaryError(
+            `${nodePath} contains a function owned by the sablejs runtime; only host functions or capability() tokens may cross`
+          );
+        }
         const kind = direction === "host-to-guest"
           ? "function; wrap it with capability()"
           : "guest function";
@@ -829,4 +1129,4 @@ class SandboxBoundary {
   }
 }
 
-module.exports = { SandboxBoundary, boundaryError, capability, sanitizeHostError };
+module.exports = { SandboxBoundary, boundaryError, brandRuntimeCallable, capability, sanitizeHostError, unwrapCapabilities };

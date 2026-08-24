@@ -350,14 +350,14 @@ async function main() {
     const { source, prelude, usesFn } = new BoundaryGenerator(caseSeed).program();
     const hostValues = buildGlobals(prelude, usesFn);
     const globals = { input: hostValues.input };
-    // Capabilities are a sandbox mechanism: the boundary unwraps the
-    // token at call time. Trusted mode exposes globals directly, so it
-    // must receive the raw host function — a token would throw "is not a
-    // function" there and produce a false mismatch.
-    const trustedGlobals = usesFn ? { input: hostValues.input, fn: hostValues.fn } : globals;
-    if (usesFn) globals.fn = capability(hostValues.fn, { name: "fn" });
+    if (usesFn) {
+      // Unified DX: the same globals object literal serves both modes.
+      // Sandbox auto-wraps raw host functions; trusted unwraps capability
+      // tokens. Alternate raw and token forms so both paths stay fuzzed.
+      globals.fn = caseSeed % 2 === 0 ? capability(hostValues.fn, { name: "fn" }) : hostValues.fn;
+    }
     const native = runNative(source, prelude);
-    const trusted = runSableJS(source, "trusted", trustedGlobals);
+    const trusted = runSableJS(source, "trusted", globals);
     const sandbox = runSableJS(source, "sandbox", globals);
     const quick = await quickjs.run(joinProgram(source, prelude));
 

@@ -36,11 +36,11 @@ Unknown calls, property access, dynamic environments, captured values, parameter
 ## Runtime and security boundary
 
 - Generated modules contain no `eval`, `new Function`, or bytecode dispatch loop.
-- `security: "sandbox"` is the default. It copies plain `globals` data, mediates built-ins, blocks dynamic code-constructor escapes, and rejects implicit host functions.
+- `security: "sandbox"` is the default. It copies plain `globals` data, mediates built-ins, blocks dynamic code-constructor escapes, and auto-wraps raw host functions in `globals` as capabilities (rejecting callables the runtime itself manufactured).
 - Hot boundary paths stay monomorphic: guest calls dispatch through `guestFunctions` first, wrapper-to-target resolution uses a guest-invisible symbol tag instead of a WeakMap probe, argument arrays are secured by copy-on-write, and property writes resolve and assert their target in a single pass.
-- `capability(fn)` is the only supported function crossing. Arguments and results are copied, errors are sanitized, and disposal revokes the guest wrapper.
+- `capability(fn)` is the explicit function crossing; raw host functions in `globals` are auto-wrapped with the same machinery. Arguments and results are copied, errors are sanitized, and disposal revokes the guest wrapper.
 - Direct static ES5 `eval`/`Function` inputs may be compiled ahead of time. Runtime-generated source is rejected.
-- `security: "trusted"` is an explicit compatibility mode. It preserves raw host identity, prototypes, getters, functions, and mutation behavior.
+- `security: "trusted"` is an explicit compatibility mode. It preserves raw host identity, prototypes, getters, functions, and mutation behavior, and unwraps capability tokens in `globals` back to their raw callables so one literal serves both modes.
 - ES5.1 does not standardize browser or application host objects. DOM, Figma, network, and Node APIs must cross sandbox mode as narrow `capability()` functions that consume and return copied data.
 - A Worker remains required for CPU and memory budgets. Terminate it when a program exceeds its limit.
 - Identifier protection is deterministic aliasing, not encryption. Minification, private source maps, and delivery controls belong in the deployment layer.

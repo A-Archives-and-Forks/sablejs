@@ -148,6 +148,60 @@ await call("discount", { base: 100, off: 30 }); // { base: 100, off: 30 }
 
 Results come back as plain data (functions cannot cross the message channel; the in-process "return a function from `run()`" pattern in the README does not apply here). Each message runs a fresh instance, so calls are stateless by design — persist state on the host between calls. Await each call before issuing the next unless concurrent execution is intended.
 
+## Capabilities and the Worker
+
+The message channel carries structured-cloneable data only — functions, raw or wrapped, cannot cross it — so the stock handler injects just `input` (see Worker script above). Capabilities are an in-process feature of `createInstance`: the unified `globals` DX — raw host functions auto-wrap in sandbox mode, capability tokens unwrap in trusted mode — applies wherever you construct an instance yourself.
+
+When a program needs host operations and resource budgets together, write a custom worker script that builds the instance with its own globals, and let the Worker enforce the budgets (terminate on timeout):
+
+```js
+// budget.worker.js — custom handler, capabilities built worker-side
+const { capability } = require("sablejs");
+const program = require("./.sable/program.cjs");
+
+const save = capability(async function (record) {
+  const response = await fetch("/api/records", {
+    method: "POST",
+    body: JSON.stringify(record),
+  });
+  return { saved: response.ok };
+}, { name: "save" });
+
+self.onmessage = (event) => {
+  const message = event.data;
+  if (!message || typeof message.id !== "number") return;
+  let instance;
+  try {
+    // Same globals literal as in-process code: raw functions auto-wrap,
+    // explicit capability tokens are honored as-is.
+    instance = program.createInstance({
+      globals: { 
+        save, 
+        input: message.input 
+      },
+    });
+    self.postMessage({ 
+      id: message.id, 
+      ok: true, 
+      value: instance.run() 
+    });
+  } catch (error) {
+    // Errors crossing the message channel must be sanitized strings.
+    self.postMessage({
+      id: message.id,
+      ok: false,
+      error: String((error && error.message) || error),
+    });
+  } finally {
+    if (instance) instance.dispose();
+  }
+};
+```
+
+`globals` are fixed when the worker script is written — keep per-call data in `input`. Drive this handler with the same host client (`createSandboxClient(new Worker("/budget.worker.js"), ...)`), and it inherits per-run timeouts, response validation, and terminate-on-expiry.
+
+Two caveats. First, in sandbox mode the guest never holds the raw host function: the auto-wrapped capability is a per-instance guest wrapper, so calls stay mediated inside the worker exactly as in-process. Second, `timeoutMs` budgets the whole run — keep it above the longest capability call so legitimate work is not killed (see Timeout-wrapping below for the per-call version).
+
 ## Evaluating other programs
 
 `run` executes the one program the worker was built with. `evaluate` executes any compiled artifact through the same worker — useful for many-short-program workloads such as AI-generated code:
@@ -186,7 +240,11 @@ function runWithBudgets(source, input, budgets) {
 
 A capability whose host promise never settles hangs the guest call forever:
 the boundary awaits the promise before cloning the result back. Budgeting
-that is the host's job, not the boundary's. Two cases, two tools:
+that is the host's job, not the boundary's. Two cases, two tools. The
+explicit `capability()` form is used below rather than the auto-wrap in
+`globals` because the timeout wrapper needs its own `name` (surfaced in the
+error the guest sees) — raw functions you pass in `globals` are wrapped with
+the same machinery, but with no receiver and a derived name:
 
 - **Async capabilities (promise-returning)** — wrap the host function in a
   `Promise.race` against a timer, so the guest call fails with a

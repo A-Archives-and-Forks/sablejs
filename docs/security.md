@@ -5,7 +5,7 @@ sablejs compiles ES5.1 source ahead of time into direct JavaScript. The security
 ## Threat model
 
 - **Attacker**: the author of the compiled program. They may write any ES5.1 program, including malicious reflection (`constructor` chains), prototype pollution, exotic objects (proxies, accessors), oversized inputs, and infinite loops.
-- **Trusted**: the compiler and its output-generation, the runtime module, the host application that loads the compiled module, and every function wrapped with `capability()`.
+- **Trusted**: the compiler and its output-generation, the runtime module, the host application that loads the compiled module, and every host function injected as a capability (explicitly or auto-wrapped).
 - **Untrusted**: everything the guest program constructs at runtime, plus all values it imports from `globals` (copied, so mutations cannot reach host data).
 - **Out of scope**: CPU and memory exhaustion. A Worker supplies time and memory budgets and forceful termination; the language boundary alone does not. Secrets must never be embedded in client-side bundles, because generated code ships to the client.
 
@@ -17,7 +17,7 @@ sablejs compiles ES5.1 source ahead of time into direct JavaScript. The security
 | Generated code | Untrusted | Runs guest semantics through the runtime. Contains no `eval`, `new Function`, or dispatcher loop. |
 | Runtime (`src/runtime`) | Trusted | Frames, calls, arguments, and property semantics. All guest operations on shared values route through the boundary. |
 | Sandbox boundary (`src/runtime/security.js`) | Trusted, the mediation point | Every crossing between guest code and host values: reads, writes, calls, construction, cloning, and capability dispatch. |
-| `capability()` | Trusted, host-authored | The only supported function crossing. Arguments and results are deep-copied; errors are sanitized; disposal revokes the guest wrapper. |
+| `capability()` | Trusted, host-authored | Explicit capability wrapping; raw host functions in `globals` are auto-wrapped with the same machinery. Arguments and results are deep-copied; errors are sanitized; disposal revokes the guest wrapper. |
 | Worker | Host resource layer | Timeouts, memory isolation, termination. Not part of the language boundary. |
 
 The boundary model: the guest may **read** shared intrinsics, but never **mutate** them, never **construct** dynamic code, and never receive an unmediated host function or ambient host object. The full regression corpus for these guarantees lives in `test/unit/security.test.js` (the adversarial battery, run at every optimization level).
@@ -26,8 +26,8 @@ The boundary model: the guest may **read** shared intrinsics, but never **mutate
 
 - **Protected intrinsics**: `Object`, `Array`, `Math`, prototypes, and everything reachable from the standard intrinsic roots. Readable, callable (mediated), never mutable by the guest. Mutation attempts throw a boundary `TypeError`.
 - **Guest-owned objects**: everything the guest creates (`{}`, `new Date`, arrays, proxies). Fully mutable; never reachable from host code except through capability copying.
-- **Injected data**: `globals` entries are recursively copied at `createInstance`. Functions, accessors, symbols, custom prototypes, class instances, and ambient objects (`globalThis`, `process`) are rejected; cycles and shared references are preserved inside the copy.
-- **Capability tokens**: frozen null-prototype objects produced by `capability(fn)`. Only these cross the boundary as callables.
+- **Injected data**: `globals` entries are recursively copied at `createInstance`. Raw host functions are auto-wrapped as capabilities; accessors, symbols, custom prototypes, class instances, and ambient objects (`globalThis`, `process`) are rejected; cycles and shared references are preserved inside the copy.
+- **Capability tokens**: frozen null-prototype objects produced by `capability(fn)`. Explicit tokens materialize as wrappers in sandbox mode and are unwrapped back to their raw callables in trusted mode.
 - **Wrappers**: mediated host functions delivered to the guest. They re-mediate every call; their raw targets are stored in a module-private WeakMap (trap-free — guest proxies never run a trap during resolution), and their own `toString` is redacted. `Function.prototype.toString` refuses wrapper receivers outright.
 
 ## Explicit policies
@@ -43,7 +43,8 @@ The boundary model: the guest may **read** shared intrinsics, but never **mutate
 - **`Intl`**: exposed as an optional host intrinsic only; no data is copied or cached by sablejs.
 - **`Map` / `Set` / typed arrays / Buffer**: constructible and mutable by the guest; capability copies clone them. Node `Buffer` clones into plain `Uint8Array` views so host-only prototype methods never cross.
 - **`arguments.callee` / `caller`**: resolved only across compiled guest frames; strict-mode accessors throw. Host frames never appear.
-- **Cross-instance smuggling**: guest functions passed as `globals` to another instance are rejected; each instance owns its guest-function registry.
+- **Cross-instance smuggling**: every callable the runtime manufactures — guest closures from either mode, capability wrappers, mediated intrinsic wrappers — is branded; passing one as `globals` to another instance is rejected.
+- **Auto-wrapped functions**: a raw host function anywhere in `globals` becomes a per-instance capability — name `fn.name` or the property path it was found at or `"capability"`, `thisValue` `undefined` unless set explicitly, one shared wrapper per clone when the same function appears at several paths, and only the function value crosses (its own properties do not). `capability()` remains the explicit form for custom names and receivers. In trusted mode the same literal is served by unwrapping tokens to raw callables, preserving reference identity.
 - **Intrinsic snapshot**: the protected-intrinsic graph is captured when the first sandbox instance is created and shared by every instance (the walk cost dominated short-program startup). The host must not extend intrinsic prototypes after that point: functions added later are still wrapped on read but are denied on call (fail-closed), while non-function objects added later are not in the protected set and could be written by the guest. Extend intrinsics before creating the first instance.
 - **Host-initiated guest entries**: a guest function returned from `run()` and called by the host copies its arguments and receiver like `globals`, so guest mutations cannot reach host objects through them. Nested host callbacks during execution (proxy traps, `Map`/`Set` iteration callbacks, `JSON.stringify`'s `toJSON`, regex replace callbacks) keep guest reference semantics. The distinction is per-instance execution state, not caller identity.
 

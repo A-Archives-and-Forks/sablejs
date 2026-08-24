@@ -139,7 +139,7 @@ describe("sablejs sandbox security boundary", function () {
     assert.equal(host.left.value, 1);
   });
 
-  it("rejects custom prototypes, accessors, symbols, and unwrapped functions in globals", function () {
+  it("rejects custom prototypes, accessors, and symbols in globals", function () {
     const inherited = Object.create({ inherited: globalThis });
     assert.throws(() => load("input;").program.createInstance({ globals: { input: inherited } }), /plain data/);
 
@@ -154,10 +154,6 @@ describe("sablejs sandbox security boundary", function () {
 
     const symbolic = { [Symbol("secret")]: 1 };
     assert.throws(() => load("input;").program.createInstance({ globals: { input: symbolic } }), /symbol/);
-    assert.throws(
-      () => load("fn;").program.createInstance({ globals: { fn() {} } }),
-      /capability/
-    );
   });
 
   it("exposes host functions only through explicit cloned capabilities", function () {
@@ -528,16 +524,7 @@ describe("sablejs sandbox adversarial battery (audit 2026-08-22)", function () {
     assert.equal(result, "resolved");
   });
 
-  it("rejects unwrapped functions and custom shapes in globals and capability results", function () {
-    assert.throws(
-      () => load("x;").program.createInstance({ globals: { x: { fn() {} } } }),
-      /function|capability/
-    );
-    assert.throws(
-      () => load("m;").program.createInstance({ globals: { m: new Map([["k", function () {}]]) } }),
-      /function|capability/
-    );
-
+  it("rejects custom shapes in capability results", function () {
     class HostSecret { constructor() { this.value = 1; } }
     const returnsInstance = sablejs.capability(() => new HostSecret());
     assert.equal(attempt("cap();", { cap: returnsInstance }).outcome, "throw");
@@ -555,14 +542,120 @@ describe("sablejs sandbox adversarial battery (audit 2026-08-22)", function () {
     }
   });
 
-  it("rejects guest functions smuggled between instances", function () {
-    const loaded = load("function secret(){ return 42; } secret;");
-    const guestFunction = loaded.program.createInstance({}).run();
+  it("rejects runtime-owned callables smuggled between instances", function () {
+    // A guest closure from a sandbox instance.
+    const sandboxLoaded = load("function secret(){ return 42; } secret;");
+    const guestFunction = sandboxLoaded.program.createInstance({}).run();
     assert.equal(typeof guestFunction, "function");
     assert.throws(
-      () => loaded.program.createInstance({ globals: { smuggled: guestFunction } }),
-      /function|capability/
+      () => sandboxLoaded.program.createInstance({ globals: { smuggled: guestFunction } }),
+      /owned by the sablejs runtime/
     );
+
+    // A wrapHostFunction wrapper reached through a shared intrinsic.
+    const wrapperLoaded = load("Array.prototype.map;");
+    const wrapper = wrapperLoaded.program.createInstance({}).run();
+    assert.equal(typeof wrapper, "function");
+    assert.throws(
+      () => wrapperLoaded.program.createInstance({ globals: { smuggled: wrapper } }),
+      /owned by the sablejs runtime/
+    );
+
+    // A guest closure from a trusted instance injected into a sandbox instance.
+    const trustedLoaded = load("function secret(){ return 42; } secret;", { security: "trusted" });
+    const trustedGuestFunction = trustedLoaded.program.createInstance({}).run();
+    assert.equal(typeof trustedGuestFunction, "function");
+    assert.throws(
+      () => sandboxLoaded.program.createInstance({ globals: { smuggled: trustedGuestFunction } }),
+      /owned by the sablejs runtime/
+    );
+
+    // A capability wrapper produced by instance A.
+    const capLoaded = load("cap;");
+    const capWrapper = capLoaded.program.createInstance({
+      globals: { cap: sablejs.capability(() => 1, { name: "cap" }) },
+    }).run();
+    assert.equal(typeof capWrapper, "function");
+    assert.throws(
+      () => capLoaded.program.createInstance({ globals: { smuggled: capWrapper } }),
+      /owned by the sablejs runtime/
+    );
+  });
+
+  it("auto-wraps raw host functions in globals as capabilities", function () {
+    let received;
+    const hostResult = { total: 0 };
+    const add = function (input) {
+      received = input;
+      input.value = 20;
+      hostResult.total = input.value + 2;
+      return hostResult;
+    };
+    const loaded = run(
+      "var local = { value: 3 }; var result = add(local); " +
+      "result.total = 99; [local.value, result.total];",
+      { add }
+    );
+    // Copy semantics both directions: guest mutations never reach host
+    // objects through the auto-wrapped capability.
+    assert.deepStrictEqual(loaded.value, [3, 99]);
+    assert.deepStrictEqual(received, { value: 20 });
+    assert.equal(hostResult.total, 22);
+  });
+
+  it("sanitizes auto-wrapped errors and revokes wrappers on dispose", function () {
+    const fail = function () {
+      const error = new RangeError("expected failure");
+      error.secret = globalThis;
+      throw error;
+    };
+    assert.deepStrictEqual(
+      run(
+        "try { fail(); } catch (error) { [error.name, error.message, typeof error.secret]; }",
+        { fail }
+      ).value,
+      ["RangeError", "expected failure", "undefined"]
+    );
+
+    const exported = run("cap;", { cap: function () { return 1; } });
+    assert.throws(() => new (exported.value)(), /not a constructor/);
+    exported.instance.dispose();
+    assert.throws(() => exported.value(), /revoked/);
+  });
+
+  it("auto-wraps nested functions in objects, arrays, Maps, and Sets with dedup identity", function () {
+    const fn = (x) => x * 10;
+    const value = run(
+      "input.a.fn(2); input.arr[0](3); input.m.get('k')(4); input.s.has(input.a.fn);" +
+      "[typeof input.a.fn, typeof input.arr[0], typeof input.m.get('k'), input.a.fn === input.other];",
+      { input: { a: { fn }, other: fn, arr: [fn], m: new Map([["k", fn]]), s: new Set([fn]) } }
+    ).value;
+    assert.deepStrictEqual(value, ["function", "function", "function", true]);
+  });
+
+  it("derives auto-capability names from function names and property paths", function () {
+    const named = function saveRecord() {};
+    const first = run("input.save;", { input: { save: named } });
+    first.instance.dispose();
+    assert.throws(() => first.value(), /capability saveRecord has been revoked/);
+
+    const anonymous = run("input.save;", { input: { save: function () {} } });
+    anonymous.instance.dispose();
+    assert.throws(() => anonymous.value(), /capability save has been revoked/);
+
+    const mapValue = run("input.m;", { input: { m: new Map([["k", function () {}]]) } });
+    mapValue.instance.dispose();
+    assert.throws(() => mapValue.value.get("k")(), /capability capability has been revoked/);
+  });
+
+  it("auto-wraps mixed trees alongside explicit capability tokens", function () {
+    const token = sablejs.capability((input) => input + 1, { name: "withBase" });
+    const plain = { a: 1 };
+    const value = run(
+      "[raw(1), token(2), plain === plain];",
+      { raw: (x) => x + 1, token, plain }
+    ).value;
+    assert.deepStrictEqual(value, [2, 3, true]);
   });
 
   it("clones cyclic globals with preserved identity", function () {
@@ -1573,5 +1666,61 @@ describe("sablejs literal-init fast path (prototype setter guard, audit 2026-08-
       { optimization: "O2", security: "trusted" }
     ).value;
     assert.deepStrictEqual(value, [true, 7, true]);
+  });
+});
+
+describe("sablejs capability tokens in trusted mode", function () {
+  it("unwraps capability tokens to their recorded callables", function () {
+    const rawFn = (x) => x * 10;
+    const tok = sablejs.capability(rawFn, { name: "tok" });
+    const value = run(
+      "[tok(2), input.a.tok(3), input.arr[0](4), input.m.get('k')(5), input.s.has(tok)];",
+      { tok, input: { a: { tok }, arr: [tok], m: new Map([["k", tok]]), s: new Set([tok]) } },
+      { security: "trusted" }
+    ).value;
+    assert.deepStrictEqual(value, [20, 30, 40, 50, true]);
+  });
+
+  it("preserves the trusted pass-through contract when no tokens are present", function () {
+    const input = { a: 1, nested: { b: 2 } };
+    const loaded = run("input;", { input }, { security: "trusted" });
+    assert.strictEqual(loaded.value, input);
+    assert.strictEqual(loaded.value.nested, input.nested);
+  });
+
+  it("never mutates the host globals object", function () {
+    const tok = sablejs.capability(() => 1, { name: "tok" });
+    const host = { obj: { fn: tok, data: { x: 1 } } };
+    assert.equal(run("input.obj.fn();", { input: host }, { security: "trusted" }).value, 1);
+    // The token stays frozen in the host tree, and the guest shares the
+    // token-free sibling by reference instead of rebuilding it.
+    assert.strictEqual(host.obj.fn, tok);
+    assert.strictEqual(
+      run("input.obj.data;", { input: host }, { security: "trusted" }).value,
+      host.obj.data
+    );
+  });
+
+  it("replaces the same token with the same callable at every occurrence", function () {
+    const rawFn = () => 7;
+    const tok = sablejs.capability(rawFn, { name: "tok" });
+    assert.equal(run("a === b.c;", { a: tok, b: { c: tok } }, { security: "trusted" }).value, true);
+
+    const obj = { base: 3 };
+    const bound = sablejs.capability(function () { return this.base; }, { name: "m", thisValue: obj });
+    const value = run("[m() === m2(), m()];", { m: bound, m2: bound }, { security: "trusted" }).value;
+    assert.deepStrictEqual(value, [true, 3]);
+  });
+
+  it("unwraps tokens inside cyclic trusted globals", function () {
+    const g = { fn: sablejs.capability(() => 7, { name: "fn" }) };
+    g.self = g;
+    assert.equal(run("input.self === input && input.fn();", { input: g }, { security: "trusted" }).value, 7);
+  });
+
+  it("honors thisValue in trusted mode", function () {
+    const counter = { base: 5 };
+    const bound = sablejs.capability(function (n) { return this.base + n; }, { name: "add", thisValue: counter });
+    assert.equal(run("add(3);", { add: bound }, { security: "trusted" }).value, 8);
   });
 });
