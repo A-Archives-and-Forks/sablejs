@@ -5,3 +5,4 @@ dist
 .cache
 .DS_Store
 benchmark/suite.aot*.cjs
+test-results
