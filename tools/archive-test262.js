@@ -68,6 +68,20 @@ function reportFromArgument() {
   return { filepath, report: JSON.parse(fs.readFileSync(filepath, "utf8")) };
 }
 
+function parseRunnerReport(output) {
+  const text = String(output || "").trim();
+  // Quiet mode emits progress lines before the final pretty-printed JSON.
+  // A top-level object begins either at byte zero or immediately after a
+  // newline; nested objects are indented and therefore cannot match.
+  const objectStart = text.lastIndexOf("\n{");
+  const json = objectStart === -1 ? text : text.slice(objectStart + 1);
+  const report = JSON.parse(json);
+  if (!report || typeof report !== "object" || typeof report.revision !== "string") {
+    throw new TypeError("Test262 runner report is missing its revision");
+  }
+  return report;
+}
+
 function runGate() {
   const result = spawnSync(
     process.execPath,
@@ -85,23 +99,28 @@ function runGate() {
   );
   if (result.error) throw result.error;
   if (result.stdout) {
-    const line = result.stdout.trim().split("\n").pop();
-    const parsed = JSON.parse(line);
-    if (parsed && parsed.revision) return { report: parsed, gateExitCode: result.status || 0, stderr: result.stderr };
+    const parsed = parseRunnerReport(result.stdout);
+    return { report: parsed, gateExitCode: result.status || 0, stderr: result.stderr };
   }
   throw new Error(`Test262 runner produced no report (exit=${result.status}): ${result.stderr}`);
 }
 
-const fromArgument = reportFromArgument();
-if (fromArgument) {
-  const filepath = archiveFile(fromArgument.report, environmentInfo());
-  console.log(`Archived existing report ${fromArgument.filepath} -> ${path.relative(repositoryRoot, filepath)}`);
-} else {
-  const { report, gateExitCode, stderr } = runGate();
-  const filepath = archiveFile(report, environmentInfo());
-  console.log(`Archived Test262 gate (revision ${report.revision.slice(0, 12)}, ` +
-    `passed=${report.passed + (report.negativePassed || 0)}, failed=${report.failed}, ` +
-    `policyExcluded=${report.policyExcluded}) -> ${path.relative(repositoryRoot, filepath)}`);
-  if (stderr && stderr.trim()) process.stderr.write(stderr);
-  if (gateExitCode !== 0) process.exitCode = gateExitCode;
+function main() {
+  const fromArgument = reportFromArgument();
+  if (fromArgument) {
+    const filepath = archiveFile(fromArgument.report, environmentInfo());
+    console.log(`Archived existing report ${fromArgument.filepath} -> ${path.relative(repositoryRoot, filepath)}`);
+  } else {
+    const { report, gateExitCode, stderr } = runGate();
+    const filepath = archiveFile(report, environmentInfo());
+    console.log(`Archived Test262 gate (revision ${report.revision.slice(0, 12)}, ` +
+      `passed=${report.passed + (report.negativePassed || 0)}, failed=${report.failed}, ` +
+      `policyExcluded=${report.policyExcluded}) -> ${path.relative(repositoryRoot, filepath)}`);
+    if (stderr && stderr.trim()) process.stderr.write(stderr);
+    if (gateExitCode !== 0) process.exitCode = gateExitCode;
+  }
 }
+
+if (require.main === module) main();
+
+module.exports = { parseRunnerReport };

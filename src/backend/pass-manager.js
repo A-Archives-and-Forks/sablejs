@@ -1,6 +1,7 @@
 "use strict";
 
 const { verifyProgram } = require("../ir/verify");
+const { monotonicNow } = require("../platform");
 
 function liveInstructionCount(program) {
   return program.scopes.reduce((total, scope) => total + scope.instructions.reduce(
@@ -18,13 +19,13 @@ class PassManager {
 
   run(name, transform) {
     const before = liveInstructionCount(this.program);
-    const startedAt = process.hrtime.bigint();
+    const startedAt = monotonicNow();
     transform(this.program, this.stats);
     verifyProgram(this.program);
     const after = liveInstructionCount(this.program);
     const pass = {
       name,
-      durationMs: Number(process.hrtime.bigint() - startedAt) / 1e6,
+      durationMs: monotonicNow() - startedAt,
       nodesBefore: before,
       nodesAfter: after,
       nodesChanged: after - before,

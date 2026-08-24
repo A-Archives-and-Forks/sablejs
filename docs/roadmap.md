@@ -10,7 +10,7 @@ Last updated 2026-08-24.
 The 2026-08-22 top-10 priorities are all done:
 
 1. ✅ `docs/security.md` + threat model established (component trust boundaries, object taxonomy, Proxy/Symbol/SAB/Atomics/Intl policies)
-2. ✅ Audit findings 1/2/3 fixed; 6 skipped tests activated (110 tests, 0 skipped)
+2. ✅ Audit findings 1–4 fixed; skipped security tests activated and permanent regressions added
 3. ✅ Two compiler bugs fixed: the `$v1_30` cross-block inline-guard reference (region-stack visibility checks) and the giant-literal scalability bug (four sub-issues: SCCP O(V²), frontend table dedup O(n²), O2 const-scope chunking, constant array-literal folding) — Kraken imaging restored, 14/14
 4. ✅ Differential fuzzing: `test/differential/fuzz.js` (generator + three-engine comparison + failure saving + ddmin), 16,000 cases with zero mismatches
 5. ✅ NavierStokes / Crypto sandbox-tax profile: `createInstance({ profileBoundary: true })` counters + `--profile-boundary` driver; five-suite table in [Performance](performance.md)
@@ -22,15 +22,15 @@ The 2026-08-22 top-10 priorities are all done:
 
 ## Current snapshot (2026-08-24)
 
-- **Security**: a full boundary audit ([Security](security.md), Historical audit record) found no usable escape; the adversarial regression battery lives in `test/unit/security.test.js` (78 tests, 0 skipped, 158/158 across the unit suite), now including the boundary-internals sweep, the clone-shape sweep (P0-S1–S4), the provenance-v2 write fast-path pins, the arity-specialized dispatch pins, and the object-literal folding pins.
+- **Security**: a full boundary audit ([Security](security.md), Historical audit record) found no usable escape; the zero-skipped adversarial regression battery lives in `test/unit/security.test.js`, now including the boundary-internals sweep, the clone-shape sweep (P0-S1–S4), the provenance-v2 write fast-path pins, the arity-specialized dispatch pins, and the object-literal folding pins. Vulnerability disclosure is defined in the repository `SECURITY.md`.
 - **Performance**: V8 Benchmark Suite 7 sandbox 2,202, trusted 2,783 (three-run medians, [Performance](performance.md)); the sandbox beats QuickJS-WASM on 7 of the 8 real-world workloads (mini-parser at parity). The 2026-08-23/24 optimization batch (items 1–19, fully recorded in the [Optimization history](optimization.md)) shipped guest-provenance v2, arity-specialized call/NEW dispatch, literal folding, local promotion, slot-provenance write stamps, the inline guest-stamp write path, the literal-init fast path and its inlined/deep-folded successors, the sandbox-only host-intrinsic call inlines, frame-stack sync simplification, and branch-test round-trip elimination; item 16 measured flat and was rolled back. Cumulative Octane A/B vs the pre-items HEAD: **+37% geomean** across 8 suites (Splay 2.25×, EarleyBoyer 2.14×, RayTrace 1.67×, NavierStokes 1.48×; Richards −12% unattributable). The loop exited at item 19 — a refreshed real-speed decomposition found the remaining costs intrinsic (interp dispatch + guest-function/property sandbox mediation). **Measurement protocol: all in-session A/Bs are pinned to one core (`taskset -c 11`) — the machine runs other projects' benchmark jobs, so unpinned numbers are unreliable.**
-- **Semantics**: the pinned Test262 gate passes; the 33 pre-existing failures were confirmed unrelated to this work by A/B comparison.
+- **Semantics**: the pinned Test262 gate passes 14,293/14,293 variants with zero host failures. Native A/B failures are no longer automatic waivers: an exact, reviewed host-failure policy is required and is currently empty.
 
 ## Next priorities
 
 1. ✅ **Local-safe IR distinction** (v1 shipped 2026-08-22) — the guest-object provenance pass proves which GETLOCAL outputs are guest-created (literals, closures, phi joins) and sandbox property writes to them skip `writeTarget` via the slim `$setGuest` helper, keeping `secureValue` + strict/sloppy dispatch. Security tests pin that unmarked writes (intrinsics, capability tokens, globals, parameters) stay on the guarded path byte-for-byte.
-2. ◐ **Backend optimization batch** (2026-08-23) — complete design for the next backend batch in [Optimization history](optimization.md): guest-provenance v2 (`new` results + `this`-targeted writes, **shipped**), strict-mode parameter propagation (**shipped**), guest direct-call fast path (**shipped** as arity-specialized dispatch), object-literal folding (**shipped**), intrinsic-read LICM, local promotion, and the smaller items. Implementation order and per-item evidence gates are defined there; each item ships with security regressions at all four levels plus differential smokes.
-3. **Facet fuzzing** — extend the differential fuzzer to parser / optimizer / sandbox boundary / capability serializer facets, add generated-code syntax validation, and a nightly campaign.
+2. ✅ **Backend optimization batch** (2026-08-23/24) — guest-provenance v2, strict-parameter propagation, arity-specialized call/construct dispatch, literal folding, local promotion, intrinsic call inlines, and the measured follow-ups shipped with security and differential gates. Full evidence is in [Optimization history](optimization.md).
+3. ◐ **Facet fuzzing** — semantics and sandbox-boundary facets plus generated-code syntax validation are in CI; parser/capability-serializer expansion and a nightly campaign remain.
 4. **Benchmark reporting automation** — automatically generate the performance markdown and archive benchmark JSON with environment info.
 
 ## Open work by priority
@@ -56,7 +56,7 @@ The 2026-08-22 top-10 priorities are all done:
 
 - ✅ Pinned Test262 runs continuously (gate passes).
 - ✅ Differential testing established (return value + exception name, 16,000 cases zero mismatches); finer observation surfaces (observable mutations, descriptors, enumeration order) belong to facet fuzzing.
-- ✅ Archive Test262 pass/fail counts and failure lists per release (`npm run test262:archive` → `archives/test262/`, full failure list + environment stamp + `latest.json` pointer; a red gate still archives and still exits non-zero).
+- ✅ Archive Test262 pass/fail counts and failure lists per release (`npm run test262:archive` → `archives/test262/`); the release workflow archives the completed gate and attaches the full report plus `latest.json` to the GitHub release.
 - ✅ The ES5.1-contract exclusion list is documented ([Compatibility](compatibility.md)): corpus selection (`es5id`), the token-based dynamic-code policy exclusion, the pinned ES5.1 expectation adjustments, the Babel downlevel path, and the native A/B failure attribution.
 
 ### P1 — Fuzzing
@@ -96,7 +96,7 @@ The 2026-08-22 top-10 priorities are all done:
 
 - ✅ `benchmark/size.js` measures raw CJS + minified IIFE for every level × security and gates CI on recorded budgets (`npm run benchmark:size -- --check`, +5% tolerance); reproducible Pareto data: O2 per-scope factories cost +55% raw CJS over shared at sandbox (1,225.7 vs 789.5 KB) for the deliberate speed-for-size trade, Os picks shared (617.1 KB sandbox); sandbox O2 min IIFE 593.4 KB (81.5 KB gzip) — full tables in [Performance](performance.md).
 - ⬜ Factory safe-sharing (emit shared factories only when frame layouts provably match — could recover most of the O2 per-scope premium), helper dedup, descriptor table sharing, literal pooling, common guard factoring.
-- ⬜ Size regression CI on every optimization level (currently the O2/Os min-IIFE budgets are gated; extend the gate to per-suite generated code).
+- ✅ Size regression CI covers O0/O1/O2/Os in both security modes. Per-suite generated-code budgets remain a possible extension.
 
 ### P2 — Compiler architecture
 
@@ -116,7 +116,7 @@ The 2026-08-22 top-10 priorities are all done:
 
 - ✅ `docs/architecture.md`, `docs/performance.md`, `docs/security.md` (with threat model), `docs/worker-isolation.md`.
 - ◐ O0/O1/O2/Os design goals (brief version in [Architecture](architecture.md); expand).
-- ⬜ Dedicated compatibility, capabilities, migration, and limitations documents — only if the content outgrows the current ones.
+- ✅ Dedicated compatibility contract. Separate capabilities, migration, and limitations documents remain optional if the current README/security/Worker material outgrows its sections.
 
 ### P3 — ES version strategy
 
@@ -124,8 +124,8 @@ The 2026-08-22 top-10 priorities are all done:
 
 ### P3 — Release quality
 
-- ✅ Release pipeline automated (2026-08-22): a `v*` tag push triggers `release.yml` — tag/version verification, unit tests, `npm run build`, npm publish via Trusted Publishing (OIDC), and a GitHub release carrying the `dist/` artifacts; hyphenated versions land on the `beta` dist-tag, stable versions on `latest`. npm allows one trusted publisher per package, so `release.yml` is the only publishing workflow (the earlier master-green auto-publish workflow was removed to match that constraint).
-- ⬜ Release checklist: Test262, E2E browser matrix, security regression, benchmark regression, bundle-size regression, fuzz smoke; archive benchmark JSON + environment info; auto-generate the performance markdown; flag security-sensitive changes in release notes.
+- ✅ Release pipeline: tags must match `package.json` and point into `master`; a read-only job runs unit/adversarial, Test262, differential, benchmark, size, Node/Deno/Bun, browser/compiler/Worker, build, and third-party-license gates. Only its uploaded artifact reaches the separate OIDC publish job. All Actions are pinned to full commit SHAs; Test262 evidence ships with the release.
+- ◐ Remaining release reporting automation: archive benchmark JSON + environment info, auto-generate the performance markdown, and flag security-sensitive changes in generated release notes.
 
 ## Recent fixes (2026-08-22)
 
@@ -133,7 +133,7 @@ The 2026-08-22 top-10 priorities are all done:
 - **Boundary facet fuzzer: Proxy-wrapped branded containers leaked raw receiver TypeErrors** — a guest passing `new Proxy(new Set(...))` to a capability reached the clone internals' branded methods, which threw unlabeled receiver TypeErrors instead of the documented boundary rejection. Every branded clone path (Date/RegExp/ArrayBuffer/typed arrays/Map/Set/Error) now converts receiver-identity failures into `sablejs sandbox boundary: <path> is a Proxy-wrapped <tag>; only plain data or explicit capabilities cross`; proxies over plain data still clone as the data they present. Regressions cover all branded shapes.
 - **Bundled guests keep ES5 sloppy `arguments` semantics** — esbuild hoists `"use strict"` from any strict module to the top of the bundle, which turns the runtime's sloppy `arguments`-capture helper strict: its Arguments object then carries PoisonPill `callee`/`caller` accessors (non-configurable), and the runtime's mapped-parameter defines threw `Cannot redefine property: callee`. The runtime now detects a strict capture and, for sloppy guest frames, routes the exposed Arguments object through a Proxy with `callee`/`caller` in closure cells, so `arguments.callee === f` and legacy `caller` reads keep working in bundled artifacts. This also fixed the shipped `dist/runtime.js` (same bundle shape). E2E regression: the bundled build test now probes `arguments.length` / mapped parameters / `callee` identity (`test/e2e/build.js`).
 - **Guest-invisible wrapper mapping (audit finding 4)** — the `HOST_TARGET` symbol tag on wrappers could be observed by guest proxy get traps during write-target resolution and by `Reflect.ownKeys` enumeration, and a trap returning a wrapper could steer resolution toward that wrapper's host target. Replaced with a module-private `wrapperTargets` WeakMap: `WeakMap.get` is trap-free, unforgeable, and unobservable, so write-target resolution is single-pass and guest traps cannot influence it. The boundary-internals sweep (P0-S1/S2) pins the fix with trap-observation, trap-steering, and enumeration regressions.
-- **Iterative value clone + per-node checks** — `cloneValue` was rewritten with an explicit work stack (depth bounded by memory instead of the host call stack: 100k-deep graphs clone without stack overflow), and the entry-level checks (ambient objects, capability records, functions, primitives) now run per node so nested values keep their specific boundary messages. The P0 clone sweep (P0-S3/S4) covers sparse arrays, huge graphs, deep cycles, null-prototype data, Map/Set identity, typed-array subclass stripping, and DataView bytes (127 tests, 0 skipped).
+- **Iterative value clone + per-node checks** — `cloneValue` was rewritten with an explicit work stack (depth bounded by memory instead of the host call stack: 100k-deep graphs clone without stack overflow), and the entry-level checks (ambient objects, capability records, functions, primitives) now run per node so nested values keep their specific boundary messages. The zero-skipped P0 clone sweep (P0-S3/S4) covers sparse arrays, huge graphs, deep cycles, null-prototype data, Map/Set identity, typed-array subclass stripping, and DataView bytes.
 - **`$v1_30` cross-block inline-guard bug** — trusted sunspider `string-unpack-code` failed with `$v1_30 is not defined`: an inlined identity guard referenced a closure temporary emitted in a sibling region block. Fix: `temporaryRegions` records each temporary's emission region stack; inline guards fall back to the runtime call when the temporary is invisible, and the reuse optimization gets the same check. Sunspider trusted restored, 23/23.
 - **Giant-literal superlinearity** — Kraken's ~1.8 MB imaging literals hit four scaling bugs: SCCP post-pass O(V²) linear lookup → `Map` index (25.2s→1.0s at 8,000 objects), frontend number/string table `indexOf` dedup → parallel `Map` (400k elements 58.0s→0.76s), O2 scope overflow → 200-`const` block chunking (visibility checks aware of block boundaries), and codegen constant array-literal chains now fold into native literals (47.6 MB→1.8 MB generated code per test). Kraken imaging restored, 14/14.
 - **Audit findings 1/2/3** — fixed with permanent regressions; see [Security](security.md), Historical audit record.

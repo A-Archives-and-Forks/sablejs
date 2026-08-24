@@ -827,6 +827,67 @@ describe("sablejs sandbox known issues (audit 2026-08-22)", function () {
     await assert.rejects(fastClient.run({}), /timed out/);
   });
 
+  it("worker client rejects invalid per-call timeouts without poisoning the worker", async function () {
+    const { createSandboxClient } = sablejs.worker;
+    let terminated = 0;
+    const posted = [];
+    const fakeWorker = {
+      listeners: {},
+      addEventListener(name, handler) { this.listeners[name] = handler; },
+      postMessage(message) { posted.push(message); },
+      terminate() { terminated += 1; },
+    };
+    const client = createSandboxClient(fakeWorker, { timeoutMs: 5000 });
+    await assert.rejects(client.run({}, { timeoutMs: NaN }), /positive number/);
+    await assert.rejects(client.run({}, { timeoutMs: -1 }), /positive number/);
+    assert.equal(posted.length, 0);
+    assert.equal(terminated, 0);
+
+    const valid = client.run({ ok: true });
+    fakeWorker.listeners.message({ data: { id: posted[0].id, ok: true, value: true } });
+    assert.equal(await valid, true);
+    client.terminate();
+  });
+
+  it("worker client cleans up when postMessage rejects an uncloneable input", async function () {
+    const { createSandboxClient } = sablejs.worker;
+    let terminated = 0;
+    const fakeWorker = {
+      addEventListener() {},
+      postMessage() {
+        const error = new Error("could not be cloned");
+        error.name = "DataCloneError";
+        throw error;
+      },
+      terminate() { terminated += 1; },
+    };
+    const client = createSandboxClient(fakeWorker, { timeoutMs: 10 });
+    await assert.rejects(client.run({ fn() {} }), { name: "DataCloneError" });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(terminated, 0);
+    client.terminate();
+    assert.equal(terminated, 1);
+  });
+
+  it("worker client rejects pending work and terminates after a Worker error", async function () {
+    const { createSandboxClient } = sablejs.worker;
+    let terminated = 0;
+    const posted = [];
+    const fakeWorker = {
+      listeners: {},
+      addEventListener(name, handler) { this.listeners[name] = handler; },
+      postMessage(message) { posted.push(message); },
+      terminate() { terminated += 1; },
+    };
+    const client = createSandboxClient(fakeWorker, { timeoutMs: 5000 });
+    const pending = client.run({});
+    fakeWorker.listeners.error({ message: "worker crashed" });
+    await assert.rejects(pending, /worker crashed/);
+    await assert.rejects(client.run({}), /has been terminated/);
+    assert.equal(posted.length, 1);
+    assert.equal(terminated, 1);
+  });
+
   it("worker client evaluate ships compiled artifacts and validates the program argument", async function () {
     const { createSandboxClient } = sablejs.worker;
     const posted = [];
@@ -852,7 +913,7 @@ describe("sablejs sandbox known issues (audit 2026-08-22)", function () {
     await assert.rejects(plain, /terminated/);
   });
 
-  it("worker handler loads and runs compiled artifacts on evaluate messages", function () {
+  it("worker handler loads and runs compiled artifacts on evaluate messages", async function () {
     const { handleSandboxMessages } = sablejs.worker;
     const artifact = sablejs.compile("var total = input.price * 2; total;", { runtimeModule }).code;
     let loads = 0;
@@ -873,15 +934,55 @@ describe("sablejs sandbox known issues (audit 2026-08-22)", function () {
     );
     scope.onmessage({ data: { id: 1, input: { price: 21 }, program: artifact } });
     scope.onmessage({ data: { id: 2, input: { price: 22 }, program: artifact } });
+    scope.onmessage({ data: { id: 3, input: {}, program: 7 } });
+    scope.onmessage({ data: { id: 4, input: { price: 1 } } });
+    await new Promise((resolve) => setImmediate(resolve));
     assert.deepStrictEqual(posted[0], { id: 1, ok: true, value: 42 });
     assert.deepStrictEqual(posted[1], { id: 2, ok: true, value: 44 });
     assert.equal(loads, 1); // the last artifact is cached across messages
-    scope.onmessage({ data: { id: 3, input: {}, program: 7 } });
     assert.equal(posted[2].ok, false);
     assert.match(posted[2].error, /compiled artifact/);
-    scope.onmessage({ data: { id: 4, input: { price: 1 } } });
     assert.equal(posted[3].ok, false);
     assert.match(posted[3].error, /bound program/);
+  });
+
+  it("worker handler awaits async results, disposes afterwards, and serializes runs", async function () {
+    const { handleSandboxMessages } = sablejs.worker;
+    const posted = [];
+    const events = [];
+    const scope = {};
+    let releaseFirst;
+    const firstResult = new Promise((resolve) => { releaseFirst = resolve; });
+    handleSandboxMessages({
+      createInstance({ globals }) {
+        const id = globals.input.id;
+        events.push(`create:${id}`);
+        return {
+          run() {
+            events.push(`run:${id}`);
+            return id === 1 ? firstResult : id * 10;
+          },
+          dispose() { events.push(`dispose:${id}`); },
+        };
+      },
+    }, { scope, postMessage: (message) => posted.push(message) });
+
+    scope.onmessage({ data: { id: 1, input: { id: 1 } } });
+    scope.onmessage({ data: { id: 2, input: { id: 2 } } });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepStrictEqual(events, ["create:1", "run:1"]);
+    assert.deepStrictEqual(posted, []);
+
+    releaseFirst(10);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepStrictEqual(posted, [
+      { id: 1, ok: true, value: 10 },
+      { id: 2, ok: true, value: 20 },
+    ]);
+    assert.deepStrictEqual(events, [
+      "create:1", "run:1", "dispose:1",
+      "create:2", "run:2", "dispose:2",
+    ]);
   });
 
   it("default artifact loader resolves the sablejs runtime (Node)", function () {

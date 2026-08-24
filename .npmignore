@@ -1,8 +1,11 @@
 # Development and test files — not shipped in the npm package
 .cache/
+.playwright/
 .github/
+archives/
 benchmark/
+playwright-report/
 test/
+test-results/
 tools/
-.babelrc
 .gitignore

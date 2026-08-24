@@ -1,34 +1,32 @@
 name: Release
 
-# Tag push releases: verify the tag against package.json, run tests, then
-# publish to npm via Trusted Publishing (OIDC) and create the GitHub
-# release. npm allows exactly one trusted publisher per package — register
-# this workflow (release.yml) as the publisher for the package on
-# registry.npmjs.org. Publish is skipped when the version is already on
-# the registry; the release is created either way.
+# A tag is releasable only when it points into master and this workflow's
+# complete verification job succeeds. Publishing happens in a separate job
+# so dependency installation and test code never receive an OIDC token.
 on:
   push:
     tags: ["v*"]
 
-permissions:
-  contents: write
-  id-token: write
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  publish:
-    name: Build and publish release
+  verify:
+    name: Verify and package release
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-node@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: 24.x
-          registry-url: https://registry.npmjs.org
           cache: npm
-      - name: Install locked dependencies
-        run: npm ci
-      - name: Verify tag matches package version
+      - name: Verify tag, version, and master ancestry
         run: |
           tag=${GITHUB_REF#refs/tags/v}
           pkg=$(node -p "require('./package.json').version")
@@ -36,31 +34,109 @@ jobs:
             echo "Tag v$tag does not match package.json version $pkg"
             exit 1
           fi
-      - name: Run unit tests
+          git fetch origin master
+          release_commit=$(git rev-list -n 1 "$GITHUB_REF")
+          if ! git merge-base --is-ancestor "$release_commit" origin/master; then
+            echo "Release commit $release_commit is not contained in origin/master"
+            exit 1
+          fi
+      - uses: denoland/setup-deno@22d081ff2d3a40755e97629de92e3bcbfa7cf2ed # v2.0.5
+        with:
+          deno-version: v2.x
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: latest
+      - name: Install locked dependencies
+        run: npm ci
+      - name: Run unit and adversarial tests
         run: npm test
+      - name: Run and archive the pinned Test262 gate
+        run: |
+          npm run upstream:fetch -- test262
+          node --expose-gc test/conformance/test262.js > .cache/test262-report.json
+          node tools/archive-test262.js --report=.cache/test262-report.json
+      - name: Run differential gates
+        run: |
+          npm run test:differential
+          npm run test:differential:boundary
+      - name: Run performance and size gates
+        run: |
+          npm run benchmark:smoke
+          npm run benchmark:size -- --check
+      - name: Build and verify publishable artifacts
+        run: |
+          npm run build
+          npm run check:compliance
+      - name: Build portable E2E artifacts
+        run: npm run test:e2e:build
+      - name: Run Node, Deno, and Bun E2E
+        run: |
+          npm run test:e2e:node
+          npm run test:e2e:deno
+          npm run test:e2e:bun
+      - name: Install browser engines
+        run: npx playwright install --with-deps chromium firefox webkit
+      - name: Run browser and Worker E2E
+        run: npm run test:e2e:browsers
+      - name: Assemble release bundle
+        run: |
+          mkdir -p release-bundle/dist release-bundle/test262
+          cp dist/* release-bundle/dist/
+          cp archives/test262/* release-bundle/test262/
+          cp LICENSE SECURITY.md THIRD_PARTY_NOTICES release-bundle/
+          npm pack --pack-destination release-bundle
+      - name: Upload verified release bundle
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: release-bundle
+          path: release-bundle
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish verified release
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 24.x
+          registry-url: https://registry.npmjs.org
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: release-bundle
+          path: release-bundle
       - name: Check whether this version is already published
         id: check
         run: |
-          pkg=$(node -p "require('./package.json').version")
+          pkg=${GITHUB_REF#refs/tags/v}
           if npm view sablejs@$pkg version >/dev/null 2>&1; then
             echo "sablejs@$pkg is already on the registry; skipping publish"
             echo "should_publish=false" >> "$GITHUB_OUTPUT"
           else
             echo "should_publish=true" >> "$GITHUB_OUTPUT"
           fi
-      - name: Build artifacts
-        if: steps.check.outputs.should_publish == 'true'
-        run: npm run build
-      - name: Publish to npm
+      - name: Publish to npm with Trusted Publishing
         if: steps.check.outputs.should_publish == 'true'
         run: |
-          pkg=$(node -p "require('./package.json').version")
+          pkg=${GITHUB_REF#refs/tags/v}
+          tarball=release-bundle/sablejs-${pkg}.tgz
           case "$pkg" in
-            *-*) npm publish --access public --tag beta ;;
-            *)   npm publish --access public ;;
+            *-*) npm publish "$tarball" --access public --tag beta ;;
+            *)   npm publish "$tarball" --access public ;;
           esac
       - name: Create GitHub release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
-          files: dist/*
+          files: |
+            release-bundle/sablejs-*.tgz
+            release-bundle/LICENSE
+            release-bundle/SECURITY.md
+            release-bundle/THIRD_PARTY_NOTICES
+            release-bundle/dist/*
+            release-bundle/test262/*
           generate_release_notes: true

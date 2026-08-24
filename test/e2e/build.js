@@ -10,6 +10,8 @@ const outputDirectory = path.join(repositoryRoot, ".cache/e2e");
 const generatedPath = path.join(outputDirectory, "generated.cjs");
 const entryPath = path.join(outputDirectory, "entry.cjs");
 const outputPath = path.join(outputDirectory, "program.js");
+const compilerEntryPath = path.join(outputDirectory, "compiler-entry.cjs");
+const compilerOutputPath = path.join(outputDirectory, "compiler-browser.js");
 const runtimeModule = path.join(repositoryRoot, "src/runtime");
 
 const source = `
@@ -97,7 +99,39 @@ esbuild.buildSync({
   logLevel: "warning",
 });
 
+fs.writeFileSync(compilerEntryPath, `
+"use strict";
+
+const { compile } = require(${JSON.stringify(path.join(repositoryRoot, "src"))});
+const result = compile("var value = input * 2; value;", {
+  optimization: "Os",
+  runtimeModule: "sablejs/runtime",
+});
+globalThis.__sablejs_compiler_e2e_result__ = {
+  format: result.format,
+  inputLanguage: result.metadata.inputLanguage,
+  security: result.metadata.security,
+  hasCreateProgram: result.code.includes("createProgram"),
+  outputBytes: result.stats.codegen.sizeOptimization.outputBytes,
+};
+`);
+
+esbuild.buildSync({
+  entryPoints: [compilerEntryPath],
+  outfile: compilerOutputPath,
+  bundle: true,
+  format: "iife",
+  platform: "browser",
+  target: ["es2020"],
+  logLevel: "warning",
+  external: ["fs", "path"],
+});
+
 console.log(
   `Built ${path.relative(repositoryRoot, outputPath)} ` +
   `(${(fs.statSync(outputPath).size / 1000).toFixed(1)} KB)`
+);
+console.log(
+  `Built ${path.relative(repositoryRoot, compilerOutputPath)} ` +
+  `(${(fs.statSync(compilerOutputPath).size / 1000).toFixed(1)} KB)`
 );

@@ -10,7 +10,9 @@ sablejs is a **small AOT-compiled execution layer** for running **user-authored 
 
 sablejs AOT-compiles untrusted JavaScript into direct host JavaScript while limiting guest access to **standard ECMAScript objects, copied data, and explicit capabilities**.
 
-- No runtime `eval`/`new Function`. 
+- The normal precompiled `run()` path does not evaluate guest source at
+  runtime. The optional trusted-artifact `worker.evaluate()` loader uses
+  `new Function` at Worker privilege and is documented separately.
 - No ambient browser APIs. 
 - No embedded JavaScript VM.
 
@@ -27,7 +29,7 @@ modern JS -> ES5.1 -> sablejs AOT -> Worker -> application
 
 ## Install and build
 
-Install the published v2 beta from npm (currently `2.0.0-beta.3`; the v2
+Install the published v2 beta from npm (currently `2.0.0-beta.4`; the v2
 series is in beta, and `latest` still points at the v1 line until 2.0.0
 goes stable):
 
@@ -157,9 +159,14 @@ const save = capability(
 
 Explicit tokens work in both modes. In trusted mode, `globals` are passed through by reference and capability tokens are unwrapped back to the raw host functions, so one literal serves sandbox (copied data, mediated calls) and trusted (reference identity, lowest overhead) unchanged.
 
-## Isolating CPU and memory: the Worker
+## Isolating execution: the Worker
 
-The language boundary does not stop infinite loops or memory exhaustion. Run each program in a dedicated Worker and terminate it when it exceeds its budget. `sablejs/worker` packages the two pieces:
+The language boundary does not stop infinite loops or memory exhaustion. Run
+each program in a dedicated Worker so the host can enforce a wall-clock
+timeout and terminate the execution agent. Browser Workers do not expose a
+portable hard memory limit; enforce input/output/source limits and use
+host-specific memory controls where available. `sablejs/worker` packages the
+two pieces:
 
 ```js
 // sandbox.worker.js — worker side
@@ -230,7 +237,7 @@ Sandbox retains 79.1% of trusted throughput on V8 Benchmark Suite 7 under this h
 
 ## Security
 
-An internal boundary audit completed on 2026-08-22 found no known usable escape within the tested threat model — no host-code execution and no host-object-graph access through the reviewed paths. The adversarial battery of 100+ probes runs across the O0/O1/O2/Os optimization levels (127 tests, 0 skipped), including the boundary-internals sweep (wrapper and intrinsic enumeration, proxy-trap observation and steering) and the clone-shape sweep (sparse, huge, deep, exotic, Map/Set/typed-array identities), and a differential fuzzer compares sablejs against native V8 and QuickJS on generated programs. Security depends on the combination: `sandbox` mode + a dedicated Worker + narrow capabilities + correct host integration. Threat model, trust boundaries, and policies: [Security](docs/security.md).
+An internal boundary audit completed on 2026-08-22 found no known usable escape within the tested threat model — no host-code execution and no host-object-graph access through the reviewed paths. The adversarial battery of 100+ probes runs across the O0/O1/O2/Os optimization levels with zero skipped tests, including the boundary-internals sweep (wrapper and intrinsic enumeration, proxy-trap observation and steering) and the clone-shape sweep (sparse, huge, deep, exotic, Map/Set/typed-array identities), and a differential fuzzer compares sablejs against native V8 and QuickJS on generated programs. Security depends on the combination: `sandbox` mode + a dedicated Worker + narrow capabilities + correct host integration. Threat model, trust boundaries, disclosure process, and policies: [Security](docs/security.md) and [Security policy](SECURITY.md).
 
 ## Documentation
 
@@ -250,6 +257,7 @@ npm test # unit + adversarial battery
 npm run test:e2e:build && npm run test:e2e:node
 npm run benchmark:smoke
 npm run benchmark:size # artifact sizes; --check enforces the CI budgets
+npm run build && npm run check:compliance # bundles + third-party notices
 ```
 
 Semantic changes must also pass the pinned Test262 gate, and performance changes use three measured runs — both command lists are in [Architecture](docs/architecture.md) (Verification) and [Performance](docs/performance.md) (Reproduction). Keep dependencies directed through `frontend -> ir -> backend -> compiler -> runtime`, add focused regression tests, and update the concise English documentation. The repository uses `package-lock.json` as its only lockfile.
@@ -259,11 +267,18 @@ Semantic changes must also pass the pinned Test262 gate, and performance changes
 Bump the version in `package.json` (sync `package-lock.json` too), push to master, and wait for Ubuntu CI to go green. Then tag the release and push the tag:
 
 ```sh
-git tag v2.0.0-beta.3 && git push origin v2.0.0-beta.3
+git tag v2.0.0-beta.4 && git push origin v2.0.0-beta.4
 ```
 
-The `release.yml` workflow verifies the tag against `package.json`, runs the unit tests, builds `dist/`, publishes to npm via Trusted Publishing (OIDC), and creates the GitHub release with the bundled artifacts. Versions containing a hyphen (e.g. `2.0.0-beta.1`) publish under the `beta` dist-tag; stable versions publish as `latest`. npm allows exactly one trusted publisher per package — `release.yml` is that registered workflow, so it is the only path that publishes to npm.
+The `release.yml` workflow requires the tag commit to be contained in
+`master`, runs unit/adversarial, Test262, differential, size, performance,
+Node/Deno/Bun, and browser gates under read-only permissions, verifies
+third-party notices, and archives the Test262 report. Only the resulting
+artifact is passed to a separate OIDC-enabled publish job, which publishes to
+npm and creates the GitHub release. Versions containing a hyphen publish
+under `beta`; stable versions publish as `latest`.
 
 ## License
 
-[Apache-2.0](LICENSE)
+[Apache-2.0](LICENSE). Licenses and copyright notices for dependencies bundled
+into the single-file distribution are in [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES).

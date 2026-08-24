@@ -8,6 +8,7 @@ const { optimizeProgram, normalizeLevel } = require("../backend/optimizer");
 const { generate, normalizeIdentifierProtection } = require("../codegen");
 const { printProgram, printMIR } = require("../ir/print");
 const { ABI_VERSION } = require("../runtime");
+const { utf8ByteLength } = require("../platform");
 
 // Inspection-mode file adapter. compile() writes the HIR/MIR/code dumps
 // through this three-method surface, so the browser bundle never executes
@@ -96,7 +97,7 @@ class AOTCompiler {
         code,
         codegenStats,
         perScopeFactories,
-        bytes: Buffer.byteLength(code),
+        bytes: utf8ByteLength(code),
       };
     });
     candidates.sort((left, right) => left.bytes - right.bytes ||
@@ -115,7 +116,7 @@ class AOTCompiler {
       helperImportPruning: true,
     };
     stats.codegen = codegenStats;
-    stats.codegen.sizeOptimization.outputBytes = Buffer.byteLength(code);
+    stats.codegen.sizeOptimization.outputBytes = utf8ByteLength(code);
     if (options.dumpDir) {
       // Inspection mode: write the optimized HIR, the MIR the backend passes
       // reason about, and the generated code as text files. Independent of

@@ -29,6 +29,29 @@ const startIndex = Number(process.env.sablejs_test_start_index || 0);
 const quiet = process.env.sablejs_test_quiet === "1";
 const allowFailures = process.env.sablejs_test262_allow_failures === "1";
 const maxFailureDetails = Number(process.env.sablejs_test262_failure_details || 30);
+const hostFailurePolicyPath = path.join(__dirname, "host-failures.json");
+const hostFailurePolicy = JSON.parse(fs.readFileSync(hostFailurePolicyPath, "utf8"));
+if (!Array.isArray(hostFailurePolicy)) {
+  throw new TypeError("Test262 host-failure policy must be an array");
+}
+const hostFailurePolicyByVariant = new Map();
+for (const entry of hostFailurePolicy) {
+  if (!entry || typeof entry.path !== "string" || !entry.path.endsWith(".js") ||
+      !["strict", "sloppy"].includes(entry.mode) ||
+      typeof entry.sableReason !== "string" ||
+      typeof entry.nativeReason !== "string") {
+    throw new TypeError(
+      "Each Test262 host-failure policy entry needs path, strict/sloppy mode, " +
+      "sableReason, and nativeReason strings"
+    );
+  }
+  const key = `${entry.path}#${entry.mode}`;
+  if (hostFailurePolicyByVariant.has(key)) {
+    throw new Error(`Duplicate Test262 host-failure policy entry ${key}`);
+  }
+  hostFailurePolicyByVariant.set(key, entry);
+}
+const observedHostFailureVariants = new Set();
 
 const summaries = {
   files: 0,
@@ -38,6 +61,8 @@ const summaries = {
   es5Adjusted: 0,
   policyExcluded: 0,
   hostFailures: 0,
+  allowedHostFailures: 0,
+  hostFailurePolicyDrift: 0,
   failed: 0,
 };
 const failures = [];
@@ -293,17 +318,27 @@ function evaluate(execute, source, data, filepath) {
   }
 }
 
-function recordFailure(relativePath, strict, sableResult, nativeResult) {
+function recordFailure(relativePath, strict, sableResult, nativeResult, allowedHostFailure = false) {
   const entry = {
     path: relativePath,
     mode: strict ? "strict" : "sloppy",
     reason: sableResult.reason,
     native: nativeResult.pass ? "pass" : nativeResult.reason,
+    allowedHostFailure,
   };
   failures.push(entry);
   if (!quiet && failures.length <= maxFailureDetails) {
     console.error(`[FAIL ${entry.mode}] ${entry.path}: ${entry.reason}; native=${entry.native}`);
   }
+}
+
+function isAllowedHostFailure(relativePath, strict, sableResult, nativeResult) {
+  const mode = strict ? "strict" : "sloppy";
+  const key = `${relativePath}#${mode}`;
+  observedHostFailureVariants.add(key);
+  const expected = hostFailurePolicyByVariant.get(key);
+  return !!expected && expected.sableReason === sableResult.reason &&
+    expected.nativeReason === nativeResult.reason;
 }
 
 if (!fs.existsSync(testRoot) || !fs.existsSync(harnessRoot)) {
@@ -362,9 +397,21 @@ for (const filepath of candidates) {
     }
 
     const nativeResult = evaluate(executeNative, runnableSource, variantData, relativePath);
-    if (!nativeResult.pass) summaries.hostFailures += 1;
-    else summaries.failed += 1;
-    recordFailure(relativePath, strict, sableResult, nativeResult);
+    let allowedHostFailure = false;
+    if (!nativeResult.pass) {
+      summaries.hostFailures += 1;
+      allowedHostFailure = isAllowedHostFailure(
+        relativePath, strict, sableResult, nativeResult
+      );
+      if (allowedHostFailure) summaries.allowedHostFailures += 1;
+      else {
+        summaries.hostFailurePolicyDrift += 1;
+        summaries.failed += 1;
+      }
+    } else {
+      summaries.failed += 1;
+    }
+    recordFailure(relativePath, strict, sableResult, nativeResult, allowedHostFailure);
   }
 
   if (quiet && summaries.files % 100 === 0) {
@@ -375,6 +422,25 @@ for (const filepath of candidates) {
     );
   }
   if (summaries.files % 50 === 0 && typeof global.gc === "function") global.gc();
+}
+
+// A full run also fails when an allowlisted host failure disappears. That
+// forces the policy file to remain an exact, reviewed baseline rather than a
+// growing wildcard suppression list. Partial developer runs skip this stale
+// entry check because they intentionally do not visit the whole corpus.
+if (!matchPath && !limit && startIndex === 0) {
+  for (const [key, entry] of hostFailurePolicyByVariant) {
+    if (observedHostFailureVariants.has(key)) continue;
+    summaries.hostFailurePolicyDrift += 1;
+    summaries.failed += 1;
+    failures.push({
+      path: entry.path,
+      mode: entry.mode,
+      reason: "allowlisted host failure was not observed; remove or refresh the policy entry",
+      native: entry.nativeReason,
+      allowedHostFailure: false,
+    });
+  }
 }
 
 const report = {

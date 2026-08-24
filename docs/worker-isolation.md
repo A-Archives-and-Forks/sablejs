@@ -1,12 +1,12 @@
 # Worker isolation
 
-The language boundary controls what guest code can reach. It deliberately does not control how long guest code runs or how much memory it uses. A dedicated Worker supplies those budgets, and forceful termination is the enforcement mechanism: terminate the Worker when a run exceeds its budget, and never reuse a terminated Worker.
+The language boundary controls what guest code can reach. It deliberately does not control how long guest code runs or how much memory it uses. A dedicated Worker gives the host a separately terminable execution agent; `sablejs/worker` enforces a wall-clock timeout. Browser Workers do not expose a portable hard memory quota, so combine termination with source/input/output limits and host-specific memory controls where available. Never reuse a terminated Worker.
 
 `sablejs/worker` provides the two small pieces that make this workflow reliable: a host-side client with per-run timeouts and response validation, and a worker-side message handler that creates and disposes an instance per request.
 
 ## Compiling at build time
 
-Install sablejs (v2 beta, currently `2.0.0-beta.3`), Babel, and esbuild:
+Install sablejs (v2 beta, currently `2.0.0-beta.4`), Babel, and esbuild:
 
 ```sh
 npm install sablejs@beta
@@ -102,11 +102,11 @@ sandbox.run({ price: 100 }).then(
 sandbox.terminate();
 ```
 
-- **The worker survives many runs**: `run()` can be called repeatedly on the same client. Each message creates a fresh instance in the worker and disposes it afterwards (program instances are single-run by design), so state never leaks between executions. Only a timeout or an explicit `terminate()` destroys the worker.
+- **The worker survives many runs**: `run()` can be called repeatedly on the same client. Each message creates a fresh instance in the worker and disposes it afterwards (program instances are single-run by design), so state never leaks between executions. A timeout, Worker error, or explicit `terminate()` makes the client unusable.
 - **Results cross the message channel as plain data**: whatever the program returns must be structured-cloneable. Functions cannot cross the channel (the worker reports a sanitized error instead), so the "return a function from `run()`" pattern in the README works in-process only — through the worker, call one function invocation per message and pass its arguments in `input` (see Calling functions through the worker below).
 - **Timeout**: `timeoutMs` (per run, overridable per call). On expiry the worker is terminated and the promise rejects; recreate the worker for further runs.
 - **Response validation**: successes must carry `value`, failures must carry a sanitized `error` string. Malformed responses reject.
-- **One run at a time is not enforced** — the worker processes messages serially in practice, but the host should await each `run` before issuing the next unless concurrent execution is intended.
+- **One run at a time is enforced** — the handler serializes messages, including Promise-returning capability calls, and does not create the next instance until the previous one is disposed. Callers may queue requests, though awaiting each call keeps backpressure explicit.
 
 ## Calling functions through the worker
 
@@ -146,13 +146,13 @@ await call("price", { base: 100 });            // { total: 120 }
 await call("discount", { base: 100, off: 30 }); // { base: 100, off: 30 }
 ```
 
-Results come back as plain data (functions cannot cross the message channel; the in-process "return a function from `run()`" pattern in the README does not apply here). Each message runs a fresh instance, so calls are stateless by design — persist state on the host between calls. Await each call before issuing the next unless concurrent execution is intended.
+Results come back as plain data (functions cannot cross the message channel; the in-process "return a function from `run()`" pattern in the README does not apply here). Each message runs a fresh instance, so calls are stateless by design — persist state on the host between calls. Calls may be queued, but one Worker executes them serially; use separate Workers for actual parallel execution.
 
 ## Capabilities and the Worker
 
 The message channel carries structured-cloneable data only — functions, raw or wrapped, cannot cross it — so the stock handler injects just `input` (see Worker script above). Capabilities are an in-process feature of `createInstance`: the unified `globals` DX — raw host functions auto-wrap in sandbox mode, capability tokens unwrap in trusted mode — applies wherever you construct an instance yourself.
 
-When a program needs host operations and resource budgets together, write a custom worker script that builds the instance with its own globals, and let the Worker enforce the budgets (terminate on timeout):
+When a program needs host operations and a termination boundary together, write a custom worker script that builds the instance with its own globals, and let the host client enforce the timeout:
 
 ```js
 // budget.worker.js — custom handler, capabilities built worker-side
@@ -167,8 +167,7 @@ const save = capability(async function (record) {
   return { saved: response.ok };
 }, { name: "save" });
 
-self.onmessage = (event) => {
-  const message = event.data;
+async function runMessage(message) {
   if (!message || typeof message.id !== "number") return;
   let instance;
   try {
@@ -180,10 +179,12 @@ self.onmessage = (event) => {
         input: message.input 
       },
     });
-    self.postMessage({ 
+    const result = instance.run();
+    const value = result instanceof Promise ? await result : result;
+    self.postMessage({
       id: message.id, 
       ok: true, 
-      value: instance.run() 
+      value,
     });
   } catch (error) {
     // Errors crossing the message channel must be sanitized strings.
@@ -195,10 +196,19 @@ self.onmessage = (event) => {
   } finally {
     if (instance) instance.dispose();
   }
+}
+
+let queue = Promise.resolve();
+self.onmessage = (event) => {
+  const message = event.data;
+  queue = queue.then(
+    () => runMessage(message),
+    () => runMessage(message)
+  );
 };
 ```
 
-`globals` are fixed when the worker script is written — keep per-call data in `input`. Drive this handler with the same host client (`createSandboxClient(new Worker("/budget.worker.js"), ...)`), and it inherits per-run timeouts, response validation, and terminate-on-expiry.
+`globals` are fixed when the worker script is written — keep per-call data in `input`. Drive this handler with the same host client (`createSandboxClient(new Worker("/budget.worker.js"), ...)`), and it inherits per-run timeouts, response validation, and terminate-on-expiry. The `await` is required when a program can finish with a Promise-returning capability; the stock `handleSandboxMessages` performs the same wait and serialization.
 
 Two caveats. First, in sandbox mode the guest never holds the raw host function: the auto-wrapped capability is a per-instance guest wrapper, so calls stay mediated inside the worker exactly as in-process. Second, `timeoutMs` budgets the whole run — keep it above the longest capability call so legitimate work is not killed (see Timeout-wrapping below for the per-call version).
 
@@ -215,6 +225,11 @@ sandbox.evaluate(artifact, { price: 100 }).then(console.log, console.error);
 
 - `evaluate(program, input)` ships the artifact code with the message; the worker loads it (caching the last artifact), runs a fresh instance, and disposes it — same protocol, validation, and timeout semantics as `run`. Results cross the message channel as plain data, so programs evaluated through the worker must return structured-cloneable values; for callable results use the in-process function pattern in the README.
 - **Only send AOT-compiled artifacts, never user source.** The worker loads artifact code at worker privilege, exactly like the build pipeline does; the language boundary applies to the guest program, not to code the trusted host chooses to load. `compile()` belongs on the trusted host side.
+- The default Node artifact loader uses `new Function` at Worker privilege. It
+  therefore requires a CSP that permits dynamic code and must never receive
+  attacker-controlled source. Deployments with a strict CSP should use
+  build-time artifacts and `run()`, or provide a separately reviewed
+  `options.loadProgram` implementation.
 - The default artifact loader (`loadCompiledArtifact`) resolves the `sablejs/runtime` import through Node's package exports. In browser builds the runtime is bundled into the worker script; pass `options.loadProgram` to `handleSandboxMessages` to supply the bundled runtime when you load artifacts at runtime.
 
 ## Budgets beyond time
@@ -295,4 +310,8 @@ the same machinery, but with no receiver and a derived name:
 
 ## What the Worker does not provide
 
-The Worker isolates CPU time and memory, not the semantics of the language boundary. The sandbox mode and the Worker are complementary layers: the boundary restricts reach, the Worker restricts resources. Neither protects secrets placed in client-side bundles.
+The Worker provides a termination boundary and host-enforced wall-clock
+timeout, not a portable hard memory quota or the semantics of the language
+boundary. Sandbox mode and Worker isolation are complementary: the boundary
+restricts reach; the Worker lets the host stop execution. Neither protects
+secrets placed in client-side bundles.

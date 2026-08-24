@@ -1,6 +1,6 @@
 {
   "name": "sablejs",
-  "version": "2.0.0-beta.3",
+  "version": "2.0.0-beta.4",
   "description": "ES5.1 native-object ahead-of-time compiler and runtime",
   "main": "src/index.js",
   "exports": {
@@ -8,6 +8,16 @@
     "./runtime": "./src/runtime/index.js",
     "./worker": "./src/worker.js"
   },
+  "files": [
+    "src/",
+    "dist/",
+    "docs/",
+    "README.md",
+    "LICENSE",
+    "SECURITY.md",
+    "THIRD_PARTY_NOTICES",
+    "logo.jpg"
+  ],
   "directories": {
     "test": "test"
   },
@@ -33,7 +43,8 @@
     "benchmark:smoke": "node --expose-gc benchmark/run.js --suite=Richards",
     "upstream:fetch": "node tools/fetch-upstreams.js",
     "build": "node tools/build.js",
-    "prepublishOnly": "npm run build",
+    "prepublishOnly": "npm run build && npm run check:compliance",
+    "check:compliance": "node tools/check-compliance.js",
     "test:differential:boundary": "node test/differential/fuzz-boundary.js --seed=1 --cases=300 --quiet",
     "test262:archive": "node tools/archive-test262.js"
   },

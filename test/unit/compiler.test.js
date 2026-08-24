@@ -7,6 +7,7 @@ const { compile: compileProgram, lowerToHIR, lowerToMIR } = require("../../src/c
 const OpSpec = require("../../src/ir/op-spec");
 const { buildCFG, verifyCFG } = require("../../src/ir/cfg");
 const { ABI_VERSION, createProgram } = require("../../src/runtime");
+const { monotonicNow, utf8ByteLength } = require("../../src/platform");
 const {
   LOWERING_COVERAGE,
   STATIC_CONTROL_OPS,
@@ -37,6 +38,31 @@ function run(source, globals, options = {}) {
   });
   return { ...loaded, instance, value: instance.run() };
 }
+
+describe("sablejs platform adapters", function () {
+  it("counts UTF-8 bytes with browser and dependency-free fallbacks", function () {
+    const samples = ["ascii", "中文", "😀", "x\ud800y", "\udc00"];
+    const expected = samples.map((value) => Buffer.byteLength(value));
+    const savedBuffer = globalThis.Buffer;
+    const savedTextEncoder = globalThis.TextEncoder;
+    try {
+      globalThis.Buffer = undefined;
+      assert.deepStrictEqual(samples.map(utf8ByteLength), expected);
+      globalThis.TextEncoder = undefined;
+      assert.deepStrictEqual(samples.map(utf8ByteLength), expected);
+    } finally {
+      globalThis.Buffer = savedBuffer;
+      globalThis.TextEncoder = savedTextEncoder;
+    }
+  });
+
+  it("provides a finite monotonic timestamp without fixing a host API", function () {
+    const first = monotonicNow();
+    const second = monotonicNow();
+    assert(Number.isFinite(first));
+    assert(second >= first);
+  });
+});
 
 describe("sablejs OpSpec and AOT backend", function() {
   it("describes every frontend opcode", function() {

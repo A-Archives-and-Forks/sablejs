@@ -7,7 +7,12 @@ sablejs compiles ES5.1 source ahead of time into direct JavaScript. The security
 - **Attacker**: the author of the compiled program. They may write any ES5.1 program, including malicious reflection (`constructor` chains), prototype pollution, exotic objects (proxies, accessors), oversized inputs, and infinite loops.
 - **Trusted**: the compiler and its output-generation, the runtime module, the host application that loads the compiled module, and every host function injected as a capability (explicitly or auto-wrapped).
 - **Untrusted**: everything the guest program constructs at runtime, plus all values it imports from `globals` (copied, so mutations cannot reach host data).
-- **Out of scope**: CPU and memory exhaustion. A Worker supplies time and memory budgets and forceful termination; the language boundary alone does not. Secrets must never be embedded in client-side bundles, because generated code ships to the client.
+- **Out of scope**: CPU and memory exhaustion. A dedicated Worker supplies a
+  separately terminable execution agent and the host helper enforces a
+  wall-clock timeout; browser Workers do not expose a portable hard memory
+  quota. Apply source/input/output limits and host-specific memory controls.
+  Secrets must never be embedded in client-side bundles, because generated
+  code ships to the client.
 
 ## Components and their trust boundaries
 
@@ -18,7 +23,7 @@ sablejs compiles ES5.1 source ahead of time into direct JavaScript. The security
 | Runtime (`src/runtime`) | Trusted | Frames, calls, arguments, and property semantics. All guest operations on shared values route through the boundary. |
 | Sandbox boundary (`src/runtime/security.js`) | Trusted, the mediation point | Every crossing between guest code and host values: reads, writes, calls, construction, cloning, and capability dispatch. |
 | `capability()` | Trusted, host-authored | Explicit capability wrapping; raw host functions in `globals` are auto-wrapped with the same machinery. Arguments and results are deep-copied; errors are sanitized; disposal revokes the guest wrapper. |
-| Worker | Host resource layer | Timeouts, memory isolation, termination. Not part of the language boundary. |
+| Worker | Host resource layer | Serialized runs, wall-clock timeouts, execution-agent isolation, and termination. Not part of the language boundary; hard memory quotas are host-specific. |
 
 The boundary model: the guest may **read** shared intrinsics, but never **mutate** them, never **construct** dynamic code, and never receive an unmediated host function or ambient host object. The full regression corpus for these guarantees lives in `test/unit/security.test.js` (the adversarial battery, run at every optimization level).
 
@@ -50,20 +55,21 @@ The boundary model: the guest may **read** shared intrinsics, but never **mutate
 
 ## What the boundary does not provide
 
-- CPU or memory budgets — use a dedicated Worker and terminate it on budget exhaustion.
+- In-process CPU preemption or portable hard memory quotas — use a dedicated
+  Worker for termination, validate data sizes, and apply host-specific limits.
 - Protection of secrets placed in the client bundle.
 - Identifier encryption — identifier protection is deterministic aliasing for obfuscation, not secrecy.
 
 ## Verification
 
-- Adversarial battery: `npm test` (127 tests, 0 skipped, every optimization level).
+- Adversarial battery: `npm test` (zero skipped; escape probes cover every optimization level).
 - Pinned Test262 gate: `npm run upstream:fetch -- test262 && npm run test262`.
 - Differential fuzzing: `npm run test:differential` (CI smoke) and `npm run fuzz:differential` (campaign).
 - New escape fixes must add a permanent regression test to the adversarial battery.
 
 ### Historical audit record (2026-08-22)
 
-An internal boundary audit completed on 2026-08-22 found no known usable escape within the tested threat model — no host-code execution and no host-object-graph access through the reviewed paths. It produced three findings, all fixed with permanent regressions:
+An internal boundary audit completed on 2026-08-22 found no known usable escape within the tested threat model — no host-code execution and no host-object-graph access through the reviewed paths. It produced four findings, all fixed with permanent regressions:
 
 - **Finding 1 (high) — O2/Os codegen/mediation contract mismatch.** Direct property reads assumed bare host values, but dynamic scopes (`eval`/`with`/`try-catch`) delivered wrappers through `getVar`; legal programs crashed under default O2, and observable behavior drifted across optimization levels. Fixed by mediating all property reads in non-direct scopes and propagating the mediated source through chained reads; behavior is now consistent across O0/O1/O2/Os.
 - **Finding 2 (low) — host stack-frame disclosure.** Host file paths leaked through `Error.captureStackTrace.call(guestObj)`, boundary errors thrown unwashed into guest catches, and `Function.prototype.toString.call(wrapper)`. Fixed by stripping boundary-error stacks, rejecting `Error.captureStackTrace` outright (not ES5.1), and a redacted shared wrapper `toString` with refusal of bare `Function.prototype.toString` on wrapper receivers.

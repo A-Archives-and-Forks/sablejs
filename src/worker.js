@@ -1,8 +1,9 @@
 "use strict";
 
-// Official Worker isolation helpers. A Worker supplies the CPU and memory
-// budgets the language boundary cannot: timeout handling, message
-// validation, and forceful termination. See docs/worker-isolation.md.
+// Official Worker isolation helpers. A Worker supplies a separately
+// terminable execution agent; these helpers add serialized requests,
+// wall-clock timeouts, response validation, and forceful termination.
+// Portable hard memory quotas are host-specific. See docs/worker-isolation.md.
 //
 // Protocol between the two sides:
 //   host -> worker: { id: number, input: <plain data>, program?: <artifact code> }
@@ -10,7 +11,7 @@
 // Without `program` the message runs the bound program (run); with `program`
 // it loads and runs the given compiled artifact (evaluate). Every execution
 // creates a fresh instance and disposes it, so one worker serves many
-// requests until a timeout terminates it.
+// serialized requests until a timeout, Worker error, or explicit termination.
 
 const WORKER_MODULE = "sablejs/worker";
 
@@ -44,15 +45,20 @@ function validateResponse(message) {
   return null;
 }
 
+function normalizeTimeout(value, label = "timeoutMs") {
+  const timeout = Number(value);
+  if (!Number.isFinite(timeout) || timeout <= 0) {
+    throw new TypeError(`sandbox client ${label} must be a positive number`);
+  }
+  return timeout;
+}
+
 // Host-side client. `worker` is any object with addEventListener,
 // postMessage, and terminate (a browser Worker or a compatible wrapper).
 // The timeout terminates the worker, so a timed-out worker cannot be
 // reused; recreate it for further runs.
 function createSandboxClient(worker, options = {}) {
-  const timeoutMs = options.timeoutMs == null ? 1000 : Number(options.timeoutMs);
-  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
-    throw new TypeError("sandbox client timeoutMs must be a positive number");
-  }
+  const timeoutMs = normalizeTimeout(options.timeoutMs == null ? 1000 : options.timeoutMs);
   let nextId = 0;
   const pending = new Map();
   let terminated = false;
@@ -82,12 +88,22 @@ function createSandboxClient(worker, options = {}) {
   });
 
   worker.addEventListener("error", (event) => {
+    terminated = true;
     rejectAll(new Error(`sandbox worker failed: ${event && event.message ? event.message : "unknown error"}`));
+    worker.terminate();
   });
 
   function dispatch(payload, perCallOptions) {
     if (terminated) return Promise.reject(new Error("sandbox worker has been terminated"));
-    const timeout = perCallOptions.timeoutMs == null ? timeoutMs : Number(perCallOptions.timeoutMs);
+    let timeout;
+    try {
+      timeout = normalizeTimeout(
+        perCallOptions.timeoutMs == null ? timeoutMs : perCallOptions.timeoutMs,
+        "per-call timeoutMs"
+      );
+    } catch (error) {
+      return Promise.reject(error);
+    }
     const id = nextId++;
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -97,7 +113,16 @@ function createSandboxClient(worker, options = {}) {
         reject(new Error(`sandbox execution timed out after ${timeout} ms; the worker was terminated`));
       }, timeout);
       pending.set(id, { resolve, reject, timer });
-      worker.postMessage(Object.assign({ id, input: payload.input }, payload.program !== undefined ? { program: payload.program } : {}));
+      try {
+        worker.postMessage(Object.assign(
+          { id, input: payload.input },
+          payload.program !== undefined ? { program: payload.program } : {}
+        ));
+      } catch (error) {
+        clearTimeout(timer);
+        pending.delete(id);
+        reject(error);
+      }
     });
   }
 
@@ -130,7 +155,8 @@ function createSandboxClient(worker, options = {}) {
 //   const program = require("./.sable/program.cjs");
 //   require("sablejs/worker").handleSandboxMessages(program);
 //
-// It answers one message per execution and disposes the instance afterwards.
+// It serializes messages, awaits real Promise results, answers once per
+// execution, and disposes the instance afterwards.
 // Messages carrying `program` load that artifact first (evaluate); the last
 // loaded artifact is cached so repeated evaluation skips the module load.
 function handleSandboxMessages(program, options = {}) {
@@ -139,9 +165,9 @@ function handleSandboxMessages(program, options = {}) {
   const loadProgram = options.loadProgram || loadCompiledArtifact;
   let cachedCode = null;
   let cachedProgram = null;
-  scope.onmessage = (event) => {
-    const message = event.data;
-    if (!message || typeof message.id !== "number") return;
+  let queue = Promise.resolve();
+
+  async function executeMessage(message) {
     let instance;
     try {
       let target = program;
@@ -156,7 +182,13 @@ function handleSandboxMessages(program, options = {}) {
         target = cachedProgram;
       }
       instance = target.createInstance({ globals: { input: message.input } });
-      const value = instance.run();
+      const result = instance.run();
+      // ES5 guest programs are synchronous by default, but a program ending
+      // in an async capability call returns the host Promise manufactured by
+      // the boundary. Await only real Promises, not arbitrary guest thenables.
+      const value = typeof Promise !== "undefined" && result instanceof Promise
+        ? await result
+        : result;
       post({ id: message.id, ok: true, value });
     } catch (error) {
       // Errors crossing the message channel must be sanitized strings;
@@ -165,7 +197,25 @@ function handleSandboxMessages(program, options = {}) {
     } finally {
       if (instance) instance.dispose();
     }
+  }
+
+  scope.onmessage = (event) => {
+    const message = event.data;
+    if (!message || typeof message.id !== "number") return;
+    // Serialize both CPU-bound runs and async capabilities. This makes the
+    // documented one-request-at-a-time lifecycle an enforced invariant and
+    // prevents instances from overlapping inside one Worker.
+    queue = queue.then(
+      () => executeMessage(message),
+      () => executeMessage(message)
+    );
   };
 }
 
-module.exports = { WORKER_MODULE, createSandboxClient, handleSandboxMessages, loadCompiledArtifact, validateResponse };
+module.exports = {
+  WORKER_MODULE,
+  createSandboxClient,
+  handleSandboxMessages,
+  loadCompiledArtifact,
+  validateResponse,
+};

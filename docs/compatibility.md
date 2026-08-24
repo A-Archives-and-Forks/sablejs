@@ -11,7 +11,7 @@ Runner: `test/conformance/test262.js`. Invocation and archiving:
 ```
 npm run upstream:fetch -- test262   # pinned revision checkout
 npm run test262                     # gate; exits non-zero on sablejs failures
-npm run test262:archive             # full-failure-list report -> archives/test262/
+npm run test262:archive             # full report -> archives/test262/
 ```
 
 ## Corpus selection
@@ -79,13 +79,14 @@ are never transpiled: the early error is exactly what is being tested.
 ## Host-failure attribution (A/B comparison)
 
 Every sablejs failure is re-run on native V8 inside the same harness with the
-same source. When native also fails, the case is counted as `hostFailures`,
-not as a sablejs failure: it is an upstream/environment problem, and the
-runner policy is to attribute it rather than silently pass or silently fail.
-The pre-existing failure population was confirmed unrelated to the sablejs
-work precisely through this A/B output. The report's `failures` array carries
-the first N entries with the native verdict attached (`native: "pass"` when
-native succeeded).
+same source. A native failure is diagnostic evidence, not an automatic
+waiver: the gate still fails unless the exact path, strict/sloppy mode,
+sablejs reason, and native reason match a reviewed entry in
+`test/conformance/host-failures.json`. A full run also fails when an entry in
+that file is no longer observed, so the list cannot silently become stale.
+The current policy is empty. The report distinguishes total `hostFailures`,
+`allowedHostFailures`, and `hostFailurePolicyDrift`; its `failures` array
+carries both reasons and whether the entry was allowlisted.
 
 ## Report and archive
 
@@ -93,14 +94,14 @@ The runner prints one JSON report on stdout:
 
 ```
 { revision, optimization, elapsedMs, files, variants, passed, negativePassed,
-  es5Adjusted, policyExcluded, hostFailures, failed, codegen, failures }
+  es5Adjusted, policyExcluded, hostFailures, allowedHostFailures,
+  hostFailurePolicyDrift, failed, codegen, failures }
 ```
 
 The gate defaults to a 30-entry failure detail cap; `npm run test262:archive`
 reruns with the cap raised to the full list, stamps the report with the
 environment (node version, platform, arch, OS release, CPU count, time), and
 writes `archives/test262/<revision>-<timestamp>.json` plus a `latest.json`
-pointer. A red gate still archives the report (the failure list is the point
-of an archive) and still exits non-zero so the release checklist cannot pass
-on it. Archives are git-tracked: each release records its pass/fail counts
-and its full failure list.
+pointer. A red gate still archives the report and exits non-zero. The release
+workflow archives its already-completed gate (without rerunning it) and
+attaches the full report plus `latest.json` to the GitHub release.
