@@ -129,10 +129,20 @@ jobs:
         run: |
           pkg=${GITHUB_REF#refs/tags/v}
           tarball=release-bundle/sablejs-${pkg}.tgz
+          set +e
           case "$pkg" in
-            *-*) npm publish "$tarball" --access public --tag beta ;;
-            *)   npm publish "$tarball" --access public ;;
+            *-*) NO_COLOR=1 npm publish "$tarball" --access public --tag beta 2>&1 | tee release-bundle/npm-publish.log ;;
+            *)   NO_COLOR=1 npm publish "$tarball" --access public 2>&1 | tee release-bundle/npm-publish.log ;;
           esac
+          publish_status=${PIPESTATUS[0]}
+          set -e
+          {
+            echo '### npm publish output'
+            echo '```text'
+            cat release-bundle/npm-publish.log
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$publish_status"
       - name: Create GitHub release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
