@@ -9,15 +9,29 @@
 // The mark seeds at the allocate ops (NEWARRAY/NEWOBJECT/NEWREGEXP/CLOSURE),
 // flows only through SETLOCAL slots and phi joins (AND meet), and is written
 // back onto the HIR as `instruction.guestObjectOutput = true` on
-// GETLOCAL/GETLOCAL2, which codegen replays as a "guest-object" temporary
-// origin. Nothing unmarked ever takes the fast path: a marked value is
-// guest-created by construction, hence never a wrapper, a capability token,
-// or a protected intrinsic, so writeTarget would be a no-op for it.
+// GETLOCAL/GETLOCAL2 and NEW, which codegen replays as a "guest-object"
+// temporary origin. Nothing unmarked ever takes the fast path: a marked value
+// is guest-created by construction, hence never a wrapper, a capability
+// token, or a protected intrinsic, so writeTarget would be a no-op for it.
+//
+// NEW marking (v2): a NEW's output is marked iff its constructor is a marked
+// value whose provenance pins the constructor to a single CLOSURE scope, and
+// that scope is return-safe — every live RETURN returns this/undefined/null/a
+// primitive, so `new` always yields the fresh object rather than a value the
+// constructor returned. Return-safety is deliberately static and coarse:
+// constructor code with a single risky RETURN (a GETVAR result, a jump
+// target as producer, any optimized producer) forfeits the mark entirely.
 //
 // Marked-value stability: allocate ops are never folded, never DCE'd, and
-// never copy-propagated, so the mark cannot go stale. The pass runs after
-// the last SSA pass (ssa-dead-code-elimination) and before the literal-only
-// peepholes.
+// never copy-propagated, and NEW results are never rewritten either, so the
+// mark cannot go stale. The pass runs after the last SSA pass
+// (ssa-dead-code-elimination) and before the literal-only peepholes.
+//
+// Deliberately NOT marked: `new Array(...)` and friends. Standard intrinsic
+// names are imported as globals through OBJECT_DEFINE_PROPERTY at instance
+// creation, so a host can inject a hostile constructor under the same name;
+// a static mark would let a protected/mediated result take the unguarded
+// write path.
 
 const { lowerToMIR, verifyMIR } = require("../ir/mir");
 
@@ -36,8 +50,30 @@ const ALLOCATE_OPS = new Set(["NEWARRAY", "NEWOBJECT", "NEWREGEXP", "CLOSURE"]);
 const SET_OPS = new Set(["SETLOCAL", "SETLOCAL2"]);
 const GET_OPS = new Set(["GETLOCAL", "GETLOCAL2"]);
 const DEL_OPS = new Set(["DELLOCAL", "DELLOCAL2"]);
+const NEW_OPS = new Set(["NEW"]);
 
-function analyzeScope(mirScope) {
+// A value state is { marked, scopeId }: marked means "provably guest-created
+// object or closure", scopeId pins the value to closures of exactly one
+// scope (null when the value is an object literal or the pin is lost).
+const UNMARKED = { marked: false, scopeId: null };
+const OBJECT_MARK = { marked: true, scopeId: null };
+
+function allocationState(operation) {
+  return operation.op === "CLOSURE"
+    ? { marked: true, scopeId: operation.args[0].id }
+    : OBJECT_MARK;
+}
+
+function sameState(left, right) {
+  if (!left || !right) return false;
+  if (left.size !== right.size) return false;
+  return Array.from(left.entries()).every(([index, state]) => {
+    const other = right.get(index);
+    return other != null && other.marked === state.marked && other.scopeId === state.scopeId;
+  });
+}
+
+function analyzeScope(mirScope, returnSafeByScopeId) {
   const values = new Map(mirScope.values.map((value) => [value.id, value]));
   const opsByOffset = new Map();
   const blockByOffset = new Map();
@@ -47,46 +83,56 @@ function analyzeScope(mirScope) {
   }));
   const cap = Math.max(100, mirScope.blocks.length * mirScope.blocks.length * 4);
 
-  // Phi marks persist across outer iterations and only grow (monotone):
-  // a phi is marked iff every input is marked.
-  const phiMarked = new Set();
-  // Complete per-block slot states (localIndex -> marked). Entry states are
+  // Phi states persist across outer iterations and only grow (monotone):
+  // a phi is marked iff every input is marked, and its scopeId pin survives
+  // only while every input pins the same scope.
+  const phiState = new Map();
+  // Complete per-block slot states (localIndex -> state). Entry states are
   // the AND meet of predecessor exit states; absent slots are unmarked.
   const entryState = new Map();
   const exitState = new Map();
+  const getLocalStateByBlock = new Map();
 
-  // Markedness of a value in the current outer iteration. Same-block
-  // GETLOCAL outputs are recorded by the walk itself (SSA dominance
-  // guarantees they precede their uses); cross-block values are phis, which
-  // consult phiMarked.
-  function inputMarked(valueId, slots, valueMarked) {
-    if (valueMarked.has(valueId)) return valueMarked.get(valueId);
+  // State of a value in the current outer iteration. Same-block outputs are
+  // recorded by the walk itself (SSA dominance guarantees they precede their
+  // uses); cross-block values are phis, which consult phiState.
+  function inputState(valueId, slots, valueState) {
+    if (valueState.has(valueId)) return valueState.get(valueId);
     const definition = values.get(valueId).definition;
-    if (definition.kind === "Phi") return phiMarked.has(valueId);
+    if (definition.kind === "Phi") return phiState.get(valueId) || UNMARKED;
     if (definition.kind === "Operation") {
       const operation = opsByOffset.get(definition.offset);
-      if (ALLOCATE_OPS.has(operation.op)) return true;
-      if (GET_OPS.has(operation.op)) return valueMarked.get(valueId) === true;
+      if (ALLOCATE_OPS.has(operation.op)) return allocationState(operation);
+      if (GET_OPS.has(operation.op)) return valueState.get(valueId) || UNMARKED;
     }
-    return false;
+    return UNMARKED;
   }
 
   function walk(block, entry) {
     const slots = new Map(entry);
-    const valueMarked = new Map();
-    const getLocalMarked = new Map();
+    const valueState = new Map();
+    const getLocalState = new Map();
+    const newMarked = new Set();
     block.operations.forEach((operation) => {
       if (SET_OPS.has(operation.op)) {
-        slots.set(operation.args[0], inputMarked(operation.inputs[0], slots, valueMarked));
+        slots.set(operation.args[0], inputState(operation.inputs[0], slots, valueState));
       } else if (DEL_OPS.has(operation.op)) {
-        slots.set(operation.args[0], false);
+        slots.set(operation.args[0], UNMARKED);
       } else if (GET_OPS.has(operation.op)) {
-        const marked = slots.get(operation.args[0]) === true;
-        valueMarked.set(operation.outputs[0], marked);
-        getLocalMarked.set(operation.offset, marked);
+        const state = slots.get(operation.args[0]) || UNMARKED;
+        valueState.set(operation.outputs[0], state);
+        getLocalState.set(operation.offset, state);
+      } else if (NEW_OPS.has(operation.op)) {
+        // inputs[0] is the constructor (stack order: constructor, args...).
+        const constructor = inputState(operation.inputs[0], slots, valueState);
+        const returnSafe = constructor.scopeId != null &&
+          returnSafeByScopeId.get(constructor.scopeId) === true;
+        const state = returnSafe ? OBJECT_MARK : UNMARKED;
+        valueState.set(operation.outputs[0], state);
+        if (returnSafe) newMarked.add(operation.offset);
       }
     });
-    return { slots, getLocalMarked };
+    return { slots, getLocalState, newMarked };
   }
 
   function mergeEntry(block) {
@@ -94,19 +140,25 @@ function analyzeScope(mirScope) {
     block.predecessors.forEach((predecessor) => {
       const exit = exitState.get(predecessor);
       if (!exit) return;
-      exit.forEach((marked, index) => {
-        merged.set(index, merged.has(index) ? merged.get(index) && marked : marked);
+      exit.forEach((state, index) => {
+        const previous = merged.get(index);
+        const scopeId = previous != null && previous.scopeId === state.scopeId
+          ? state.scopeId
+          : null;
+        merged.set(index, {
+          marked: previous ? previous.marked && state.marked : state.marked,
+          scopeId: previous != null ? scopeId : state.scopeId,
+        });
       });
     });
     return merged;
   }
 
-  // Outer loop: grow phi marks (monotone), then re-solve the slot flow with
+  // Outer loop: grow phi states (monotone), then re-solve the slot flow with
   // them. Terminates because each outer iteration adds at least one phi mark
-  // or converges.
+  // or refines a phi's scopeId pin, and both are bounded.
   let outerChanged = true;
   let outerIterations = 0;
-  const getLocalMarkedByBlock = new Map();
   while (outerChanged) {
     outerChanged = false;
     outerIterations += 1;
@@ -125,7 +177,7 @@ function analyzeScope(mirScope) {
       mirScope.blocks.forEach((block) => {
         const entry = mergeEntry(block);
         const result = walk(block, entry);
-        getLocalMarkedByBlock.set(block.start, result.getLocalMarked);
+        getLocalStateByBlock.set(block.start, result.getLocalState);
         const entryChanged = !sameState(entryState.get(block.start), entry);
         const exitChanged = !sameState(exitState.get(block.start), result.slots);
         if (!entryChanged && !exitChanged) return;
@@ -140,65 +192,125 @@ function analyzeScope(mirScope) {
       phiChanged = false;
       mirScope.blocks.forEach((block) => {
         block.phis.forEach((phi) => {
-          if (phiMarked.has(phi.id)) return;
-          if (phi.inputs.every((input) => {
-            const definition = values.get(input.value).definition;
-            if (definition.kind === "Phi") return phiMarked.has(input.value);
-            if (definition.kind === "Operation") {
-              const operation = opsByOffset.get(definition.offset);
-              if (ALLOCATE_OPS.has(operation.op)) return true;
-              if (GET_OPS.has(operation.op)) {
-                const perBlock = getLocalMarkedByBlock.get(blockByOffset.get(operation.offset));
-                return perBlock != null && perBlock.get(operation.offset) === true;
+          const joined = { marked: true, scopeId: null };
+          let first = true;
+          phi.inputs.forEach((input) => {
+            const state = (() => {
+              const definition = values.get(input.value).definition;
+              if (definition.kind === "Phi") return phiState.get(input.value) || UNMARKED;
+              if (definition.kind === "Operation") {
+                const operation = opsByOffset.get(definition.offset);
+                if (ALLOCATE_OPS.has(operation.op)) return allocationState(operation);
+                if (GET_OPS.has(operation.op)) {
+                  const perBlock = getLocalStateByBlock.get(blockByOffset.get(operation.offset));
+                  return (perBlock && perBlock.get(operation.offset)) || UNMARKED;
+                }
               }
+              return UNMARKED;
+            })();
+            if (!state.marked) joined.marked = false;
+            if (first) {
+              joined.scopeId = state.scopeId;
+              first = false;
+            } else if (state.scopeId !== joined.scopeId) {
+              joined.scopeId = null;
             }
-            return false;
-          })) {
-            phiMarked.add(phi.id);
-            phiChanged = true;
-            outerChanged = true;
-          }
+          });
+          const current = phiState.get(phi.id);
+          if (current && current.marked === joined.marked && current.scopeId === joined.scopeId) return;
+          phiState.set(phi.id, joined.marked ? joined : UNMARKED);
+          phiChanged = true;
+          outerChanged = true;
         });
       });
     }
   }
 
   // Final deterministic walk with the converged entry states; collect the
-  // marked GETLOCAL offsets for the HIR writeback.
+  // marked GETLOCAL and NEW offsets for the HIR writeback.
   const markedOffsets = new Set();
+  const markedNews = new Set();
   mirScope.blocks.forEach((block) => {
     const result = walk(block, entryState.get(block.start) || new Map());
-    result.getLocalMarked.forEach((marked, offset) => {
-      if (marked) markedOffsets.add(offset);
+    result.getLocalState.forEach((state, offset) => {
+      if (state.marked) markedOffsets.add(offset);
     });
+    result.newMarked.forEach((offset) => markedNews.add(offset));
   });
-  return markedOffsets;
+  return { markedOffsets, markedNews };
 }
 
-function sameState(left, right) {
-  if (!left || !right) return false;
-  if (left.size !== right.size) return false;
-  return Array.from(left.entries()).every(([index, marked]) => right.get(index) === marked);
+// Producers of RETURN that provably return a non-object value. `new` yields
+// the fresh object for those (this/undefined/null/primitives are replaced by
+// the constructed instance); any other producer forfeits the constructor's
+// mark.
+const RETURN_SAFE_OPS = new Set([
+  "THIS", "UNDEF", "NULL", "TRUE", "FALSE", "INTEGER", "NUMBER", "STRING",
+]);
+
+// A constructor is return-safe when every live RETURN's value producer is a
+// non-object literal that no jump can enter with a different stack. Jump
+// targets are every branch argument plus every structured-region boundary
+// offset: both are places control can land without executing the producer.
+function returnSafeAnalysis(hirScope) {
+  if (!hirScope.lightweight || hirScope.script) return false;
+  const jumpTargets = new Set();
+  hirScope.instructions.forEach((instruction) => {
+    if (["JUMP", "JTRUE", "JFALSE", "JCASE"].includes(instruction.op)) {
+      jumpTargets.add(instruction.args[0]);
+    }
+  });
+  (hirScope.controlRegions || []).forEach((region) => {
+    Object.values(region).forEach((value) => {
+      if (typeof value === "number" && Number.isInteger(value)) jumpTargets.add(value);
+    });
+  });
+  const live = hirScope.instructions.filter((instruction) =>
+    !instruction.elided && !instruction.unreachable
+  );
+  for (let index = 0; index < live.length; index += 1) {
+    const instruction = live[index];
+    if (instruction.op !== "RETURN") continue;
+    const producer = live[index - 1];
+    if (!producer || !RETURN_SAFE_OPS.has(producer.op) ||
+        producer.optimized || jumpTargets.has(producer.offset)) {
+      return false;
+    }
+  }
+  return true;
 }
 
 function runGuestProvenance(hirProgram, stats, existingMIR) {
   const mir = analysisMIR(hirProgram, stats, existingMIR);
+  const returnSafeByScopeId = new Map();
+  hirProgram.scopes.forEach((scope) => {
+    returnSafeByScopeId.set(scope.id, returnSafeAnalysis(scope));
+  });
   let markedLoads = 0;
+  let markedNews = 0;
   mir.scopes.forEach((mirScope) => {
     const hirScope = hirProgram.scopes.find((scope) => scope.id === mirScope.id);
     if (!hirScope) return;
     const instructions = new Map(
       hirScope.instructions.map((instruction) => [instruction.offset, instruction])
     );
-    analyzeScope(mirScope).forEach((offset) => {
+    const { markedOffsets, markedNews: newsOffsets } = analyzeScope(mirScope, returnSafeByScopeId);
+    markedOffsets.forEach((offset) => {
       const instruction = instructions.get(offset);
       if (instruction) {
         instruction.guestObjectOutput = true;
         markedLoads += 1;
       }
     });
+    newsOffsets.forEach((offset) => {
+      const instruction = instructions.get(offset);
+      if (instruction) {
+        instruction.guestObjectOutput = true;
+        markedNews += 1;
+      }
+    });
   });
-  stats.guestProvenance = { markedLoads };
+  stats.guestProvenance = { markedLoads, markedNews };
   return mir;
 }
 

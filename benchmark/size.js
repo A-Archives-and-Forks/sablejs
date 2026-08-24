@@ -24,20 +24,23 @@ const SECURITIES = ["sandbox", "trusted"];
 const runtimeModule = path.resolve(__dirname, "../src/runtime");
 const source = fs.readFileSync(path.resolve(__dirname, "v8-suite.js"), "utf8");
 
-// Recorded 2026-08-22 (Node 24.x, esbuild 0.28.2). Regenerate with
+// Recorded 2026-08-23 (Node 24.x, esbuild 0.28.2) — re-pasted after the
+// NEW-dispatch arity specialization (item 8) and the slot-provenance write
+// stamps (item 9, sandbox O2 only: +16.8 KB min-IIFE for the $q flags and
+// write-site ternaries; Os/trusted/O0/O1 untouched). Regenerate with
 // `node benchmark/size.js` and paste when a deliberate size change lands.
 const BASELINES = {
   sandbox: {
-    O0: { minifiedIIFE: 603880 },
-    O1: { minifiedIIFE: 596882 },
-    O2: { minifiedIIFE: 607653 },
-    Os: { minifiedIIFE: 369530 },
+    O0: { minifiedIIFE: 621346 },
+    O1: { minifiedIIFE: 614414 },
+    O2: { minifiedIIFE: 657107 },
+    Os: { minifiedIIFE: 385661 },
   },
   trusted: {
-    O0: { minifiedIIFE: 603880 },
-    O1: { minifiedIIFE: 596882 },
-    O2: { minifiedIIFE: 513222 },
-    Os: { minifiedIIFE: 345456 },
+    O0: { minifiedIIFE: 621346 },
+    O1: { minifiedIIFE: 614414 },
+    O2: { minifiedIIFE: 521261 },
+    Os: { minifiedIIFE: 353169 },
   },
 };
 const TOLERANCE = 1.05;

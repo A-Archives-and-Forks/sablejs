@@ -5,6 +5,7 @@ const { PassManager, liveInstructionCount } = require("./pass-manager");
 const {
   runCopyPropagation,
   runDeadCodeElimination,
+  runDeadStoreElimination,
   runGlobalValueNumbering,
   runLocalCSE,
   runLoopInvariantCodeMotion,
@@ -255,8 +256,9 @@ function optimizeProgram(program, requestedLevel, options = {}) {
       // Hoists private non-parameter local reads out of loops (O2 only). Such
       // reads cannot invoke guest code, and lightweight scopes prove no
       // with/eval/closures can mutate the slot; a loop-local write is a hard
-      // kill.
-      runLoopInvariantCodeMotion(currentProgram, stats, analysisMIR);
+      // kill. Trusted-mode slots that codegen will promote (Item 6) are
+      // skipped: their hoist would be a pure alias of a register read.
+      runLoopInvariantCodeMotion(currentProgram, stats, analysisMIR, options);
     });
 
     passes.run("global-value-numbering", (currentProgram) => {
@@ -272,6 +274,21 @@ function optimizeProgram(program, requestedLevel, options = {}) {
       // Same-block CSE (O2/Os).
       runLocalCSE(currentProgram, stats, analysisMIR);
     });
+
+    passes.run("dead-store-elimination", (currentProgram) => {
+      // Elides SETLOCALs whose value is never read on any path before the
+      // next store/delete (must-use liveness over the MIR CFG). Private
+      // propagable slots only — same eligibility as copy propagation,
+      // widened by item 4 to strict parameters. Reads rewritten by earlier
+      // passes (literal/duplicate/reuse/licm marks) no longer consume the
+      // slot, so stores orphaned by copy-prop and the unused name-binding
+      // prologue are caught too. SETLOCAL is a stack PEEK, so the elision
+      // leaves the stack untouched (no drop-inputs needed, unlike DCE's POP
+      // chains). Runs after every value-moving pass and before the final
+      // DCE, so the provenance mark written later cannot go stale.
+      if (options.deadStoreElimination === false) return;
+      runDeadStoreElimination(currentProgram, stats, analysisMIR);
+    });
   }
 
   passes.run("ssa-dead-code-elimination", (currentProgram) => {
@@ -283,13 +300,15 @@ function optimizeProgram(program, requestedLevel, options = {}) {
 
   if (level === "O2" || level === "Os") {
     passes.run("guest-object-provenance", (currentProgram) => {
-      // SECURITY-SENSITIVE. Proves GETLOCAL outputs are guest-created and
-      // marks them `guestObjectOutput` — the fast-path ticket for sandbox
-      // property writes. The mark seeds exclusively at allocate ops
-      // (NEWARRAY/NEWOBJECT/NEWREGEXP/CLOSURE), flows only through slots and
-      // phi joins (AND meet), and is written after the last pass that can
-      // move or eliminate values, so the mark cannot go stale. Nothing
-      // unmarked ever takes the fast path; see guest-provenance.js.
+      // SECURITY-SENSITIVE. Proves GETLOCAL outputs and NEW results are
+      // guest-created and marks them `guestObjectOutput` — the fast-path
+      // ticket for sandbox property writes. The mark seeds exclusively at
+      // allocate ops (NEWARRAY/NEWOBJECT/NEWREGEXP/CLOSURE), flows only
+      // through slots and phi joins (AND meet), and is written after the
+      // last pass that can move or eliminate values, so the mark cannot go
+      // stale. NEW outputs additionally require a constructor pinned to one
+      // return-safe closure scope. Nothing unmarked ever takes the fast
+      // path; see guest-provenance.js.
       runGuestProvenance(currentProgram, stats, analysisMIR);
     });
   }

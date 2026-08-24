@@ -29,9 +29,12 @@ function load(source, options = {}) {
   return { result, program: generatedModule.exports };
 }
 
-function run(source, globals, options) {
+function run(source, globals, options = {}) {
   const loaded = load(source, options);
-  const instance = loaded.program.createInstance({ globals });
+  const instance = loaded.program.createInstance({
+    globals,
+    profileBoundary: options.profileBoundary,
+  });
   return { ...loaded, instance, value: instance.run() };
 }
 
@@ -337,6 +340,129 @@ describe("sablejs OpSpec and AOT backend", function() {
     }
   });
 
+  it("emits dense constant-case switches as a native switch over the discriminant", function() {
+    // Every case test is a single compile-time constant: the host switch
+    // compares the discriminant directly, no $r.caseJump, no selector
+    // variable, no guard chain. ES5 switch is strict equality on the
+    // once-evaluated discriminant, which is exactly native switch semantics;
+    // the "1" host exercises the no-coercion behavior.
+    const source = "var result = ''; switch (host) { " +
+      "case 1: result += 'a'; break; case 2: result += 'b'; break; " +
+      "case 3: result += 'c'; break; default: result = 'd'; } result;";
+    for (const security of ["trusted", "sandbox"]) {
+      for (const [host, expected] of [[1, "a"], [2, "b"], [3, "c"], [7, "d"], ["1", "d"]]) {
+        const loaded = run(source, { host }, { optimization: "O2", security });
+        assert.equal(loaded.value, expected);
+        assert(loaded.result.code.includes("switch ($d"));
+        assert(!loaded.result.code.includes("$r.caseJump($f)"));
+        assert.equal(loaded.result.stats.codegen.stackToLocal.denseSwitches, 1);
+        assert.equal(loaded.result.stats.codegen.stackToLocal.denseSwitchCases, 3);
+      }
+    }
+  });
+
+  it("preserves switch fallthrough, break, and out-of-order default in dense switches", function() {
+    // Default sits between the case bodies: a match must skip it, a non-match
+    // must enter it and then fall through, exactly like the guarded chain.
+    const source = "var result = ''; switch (host) { " +
+      "default: result += 'd'; case 1: result += 'a'; case 2: result += 'b'; break; " +
+      "case 3: result += 'c'; break; } result;";
+    for (const [host, expected] of [[1, "ab"], [2, "b"], [3, "c"], [9, "dab"]]) {
+      assert.equal(run(source, { host }, { optimization: "O2" }).value, expected);
+      assert.equal(run(source, { host }, { optimization: "O0" }).value, expected);
+    }
+  });
+
+  it("falls back to the guarded chain for non-constant or colliding case tests", function() {
+    const nonConstant = "var result = ''; switch (host) { " +
+      "case probe(1): result = 'a'; break; default: result = 'd'; } result;";
+    const o2 = run(nonConstant, { host: 1, probe(value) { return value; } }, { optimization: "O2" });
+    assert.equal(o2.value, "a");
+    assert(o2.result.code.includes("$r.caseJump($f)"));
+    assert.equal(o2.result.stats.codegen.stackToLocal.denseSwitches, 0);
+
+    // Duplicate labels (valid guest code, first match wins) collide under
+    // SameValueZero and would be a host SyntaxError — must stay guarded.
+    const duplicate = "var result = ''; switch (host) { " +
+      "case 1: result = 'a'; break; case 1: result = 'b'; break; default: result = 'd'; } result;";
+    const dup = run(duplicate, { host: 1 }, { optimization: "O2" });
+    assert.equal(dup.value, "a");
+    assert(dup.result.code.includes("$r.caseJump($f)"));
+    assert.equal(dup.result.stats.codegen.stackToLocal.denseSwitches, 0);
+
+    // -0 and 0 are the same label under SameValueZero — a host switch would
+    // be a SyntaxError, so the guarded chain must be kept. Guest semantics
+    // stay first-match-wins on === (0 === -0), identical across O2/O0.
+    const zero = "var result = ''; switch (host) { " +
+      "case -0: result = 'n'; break; case 0: result = 'p'; break; default: result = 'd'; } result;";
+    for (const host of [0, -0]) {
+      assert.equal(run(zero, { host }, { optimization: "O2" }).value, "n");
+      assert.equal(run(zero, { host }, { optimization: "O0" }).value, "n");
+    }
+    const zeroO2 = run(zero, { host: 0 }, { optimization: "O2" });
+    assert(zeroO2.result.code.includes("$r.caseJump($f)"));
+  });
+
+  it("handles NaN, strings, booleans, null, undefined, and floats as dense case constants", function() {
+    // NaN is a global read, not a constant op, so this switch stays guarded;
+    // a NaN label never matches under === in either path.
+    const nan = "var result = ''; switch (host) { case NaN: result = 'n'; break; default: result = 'd'; } result;";
+    const nanO2 = run(nan, { host: NaN }, { optimization: "O2" });
+    assert.equal(nanO2.value, "d");
+    assert(nanO2.result.code.includes("$r.caseJump($f)"));
+    assert.equal(run(nan, { host: 1 }, { optimization: "O2" }).value, "d");
+    assert.equal(run(nan, { host: 1 }, { optimization: "O0" }).value, "d");
+
+    const mixed = "var result = ''; switch (host) { case 's': result = 's'; break; " +
+      "case true: result = 't'; break; case null: result = 'u'; break; " +
+      "case undefined: result = 'v'; break; case 1.5: result = 'w'; break; " +
+      "case -2: result = 'x'; break; default: result = 'd'; } result;";
+    for (const [host, expected] of [["s", "s"], [true, "t"], [null, "u"], [undefined, "v"], [1.5, "w"], [-2, "x"], [0, "d"]]) {
+      assert.equal(run(mixed, { host }, { optimization: "O2" }).value, expected);
+    }
+  });
+
+  it("keeps loop break/continue and nested regions working inside dense switches", function() {
+    // continue targets the outer loop across the switch; the inner switch is
+    // dense and sits inside the loop region.
+    const loop = "var result = 0; for (var i = 0; i < 4; i += 1) { " +
+      "switch (i) { case 0: continue; case 1: result += 10; break; case 2: result += 100; break; " +
+      "default: result += 1000; } } result;";
+    assert.equal(run(loop, {}, { optimization: "O2" }).value, 1110);
+    assert.equal(run(loop, {}, { optimization: "O0" }).value, 1110);
+
+    // A nested short-circuit region inside a dense case body emits correctly.
+    const nested = "var result = ''; switch (host) { case 1: " +
+      "result += (flag ? 'a' : 'b'); break; case 2: result = 'c'; break; default: result = 'd'; } result;";
+    for (const [host, expected] of [[1, "b"], [2, "c"], [3, "d"]]) {
+      assert.equal(run(nested, { host, flag: false }, { optimization: "O2" }).value, expected);
+    }
+    assert.equal(run(nested, { host: 1, flag: true }, { optimization: "O2" }).value, "a");
+    assert(run(nested, { host: 1, flag: false }, { optimization: "O2" }).result.code.includes("switch ($d"));
+  });
+
+  it("evaluates the discriminant once and breaks out of dense switches", function() {
+    let calls = 0;
+    const source = "var result = ''; switch (probe()) { case 1: result = 'a'; break; " +
+      "case 2: result = 'b'; break; default: result = 'd'; } result + ':' + calls;";
+    const loaded = run(source, {
+      get calls() { return calls; },
+      probe() { calls += 1; return 2; },
+    }, { optimization: "O2" });
+    assert.equal(loaded.value, "b:1");
+    assert(loaded.result.code.includes("switch ($d"));
+  });
+
+  it("keeps the guarded chain at O0 where there is no stack alias", function() {
+    const source = "var result = ''; switch (host) { case 1: result = 'a'; break; " +
+      "case 2: result = 'b'; break; default: result = 'd'; } result;";
+    const o0 = run(source, { host: 2 }, { optimization: "O0" });
+    assert.equal(o0.value, "b");
+    assert(o0.result.code.includes("$r.caseJump($f)"));
+    assert(!o0.result.code.includes("switch ($d"));
+    assert.equal(o0.result.stats.codegen.stackToLocal.denseSwitches, 0);
+  });
+
   it("emits reducible try/catch regions directly without block continuations", function() {
     const marker = {};
     const source = "var result = 0; try { if (host) throw marker; result = 1; } " +
@@ -573,21 +699,365 @@ describe("sablejs OpSpec and AOT backend", function() {
   it("hoists only invariant private-local reads out of natural loops", function() {
     const source = "function sum(n) { var invariant = 3, i = 0, total = 0; " +
       "while (i < n) { total = total + invariant; i++; } return total; } sum(4);";
-    const o0 = run(source, undefined, { optimization: "O0" });
-    const o2 = run(source, undefined, { optimization: "O2" });
-    assert.equal(o0.value, 12);
-    assert.equal(o2.value, o0.value);
-    assert(o2.result.stats.loopInvariantCodeMotion.loadsHoisted > 0);
-    assert(/const \$h\d+_\d+ = \$l\[\d+\];/.test(o2.result.code));
+    // Both securities (promotion is security-independent since Phase 3):
+    // every non-parameter slot is promoted to a `$p` variable, so the
+    // invariant read is a register access and LICM skips the redundant
+    // alias. (Under Phase 3 the `$h`/`$l` hoist render is unreachable for
+    // private locals — every LICM-eligible scope is promotion-eligible; see
+    // the strict-parameter test below.)
+    const sandbox = run(source, undefined, { optimization: "O2", security: "sandbox" });
+    assert.equal(sandbox.value, 12);
+    assert.equal(sandbox.result.stats.loopInvariantCodeMotion.loadsHoisted, 0);
+    assert(!sandbox.result.code.includes("const $h"));
+    const trusted = run(source, undefined, { optimization: "O2" });
+    assert.equal(trusted.value, sandbox.value);
+    assert.equal(trusted.result.stats.loopInvariantCodeMotion.loadsHoisted, 0);
+    assert(!trusted.result.code.includes("const $h"));
 
     const changing = run(
       "function sum(n) { var value = 0, i = 0, total = 0; " +
       "while (i < n) { value = value + 1; total = total + value; i++; } return total; } sum(4);",
       undefined,
-      { optimization: "O2" }
+      { optimization: "O2", security: "sandbox" }
     );
     assert.equal(changing.value, 10);
     assert.equal(changing.result.stats.loopInvariantCodeMotion.loadsHoisted, 0);
+  });
+
+  it("hoists strict-parameter reads in scopes with a frame layout", function() {
+    const source = "function loop(a) { \"use strict\"; var total = 0, i = 0; " +
+      "while (i < a) { total = total + a; i = i + 1; } return total; } loop(4);";
+    // Both securities: the scope is fully promotion-eligible (Item 6
+    // phases 2/3), so the LICM mirror skips these loads — the promoted
+    // parameter is a register, not a frame-array read.
+    for (const security of ["trusted", "sandbox"]) {
+      const o2 = run(source, undefined, { optimization: "O2", security });
+      assert.equal(o2.value, 16);
+      assert.equal(o2.result.stats.loopInvariantCodeMotion.loadsHoisted, 0);
+      assert(!o2.result.code.includes("const $h"));
+    }
+    // A closure-containing scope is not promotion-eligible, and it never
+    // hoists either: the frontend marks the scope non-lightweight at the
+    // CLOSURE emission site (emitter.emitFunction), and LICM's lightweight
+    // guard excludes it before the mirror runs. That is not a coincidence:
+    // no lightweight scope can be promotion-ineligible, because every other
+    // exclusion term is also impossible there — dynamicFunctions comes only
+    // from the Function constructor, which likewise marks the scope
+    // non-lightweight, and GETLOCAL2/SETLOCAL2 are never emitted into HIR.
+    // So the mirror skip covers the entire LICM space and the `$h = $l[...]`
+    // render is unreachable for private locals under Phase 3; the exclusion
+    // terms stay in both plans as defense-in-depth for future frontend
+    // changes.
+    const closure = run("function outer(a) { \"use strict\"; var total = 0, i = 0; " +
+      "function inner() { return 1; } while (i < a) { total = total + a; i = i + 1; } " +
+      "return total + inner(); } outer(4);", undefined, { optimization: "O2" });
+    assert.equal(closure.value, 17);
+    assert.equal(closure.result.stats.loopInvariantCodeMotion.loadsHoisted, 0);
+    assert(!closure.result.code.includes("const $h"));
+    // Only inner's own scope (its self-name slot) is promoted; outer keeps
+    // every slot on the frame array.
+    assert.equal(closure.result.stats.codegen.localPromotion.eligibleScopes, 1);
+    assert.equal(closure.result.stats.codegen.localPromotion.promotedSlots, 1);
+  });
+
+  it("does not hoist loads in scopes without a frame layout", function() {
+    // The function is nested under a with block, so it has a dynamic chain
+    // and codegen gives it no `$l`. Its strict parameter is still propagable
+    // under Item 4 semantics, so a naive hoist would emit `$l[...]` into a
+    // scope that never declares it.
+    const source = "var loop, x = 1; with ({ x: 2 }) { loop = function(a) { " +
+      "\"use strict\"; var total = 0, i = 0; while (i < a) { total = total + a; " +
+      "i = i + 1; } return total; }; } loop(4);";
+    const o2 = run(source, undefined, { optimization: "O2" });
+    assert.equal(o2.value, 16);
+    assert.equal(o2.result.stats.loopInvariantCodeMotion.loadsHoisted, 0);
+    assert(!o2.result.code.includes("const $h"));
+  });
+
+  describe("local promotion (trusted frame-shape specialization)", function() {
+    const sumSource = "function sum(n) { var invariant = 3, i = 0, total = 0; " +
+      "while (i < n) { total = total + invariant; i++; } return total; } sum(4);";
+
+    it("promotes non-parameter locals into $exec prologue variables", function() {
+      const o0 = run(sumSource, undefined, { optimization: "O0" });
+      const o2 = run(sumSource, undefined, { optimization: "O2" });
+      assert.equal(o2.value, o0.value);
+      const promotion = o2.result.stats.codegen.localPromotion;
+      assert.equal(promotion.eligibleScopes, 1);
+      assert.equal(promotion.promotedSlots, 4);
+      assert(o2.result.stats.codegen.stackToLocal.promotedLoads > 0);
+      assert(o2.result.stats.codegen.stackToLocal.promotedStores > 0);
+      // The prologue declares one variable per promoted slot; the loop body
+      // reads and writes them directly, with no frame-array access to them.
+      assert(/let \$p1_2, \$p1_3, \$p1_4, \$p1_5;/.test(o2.result.code));
+      assert(!/\$l\[[2-5]\]/.test(o2.result.code));
+      // Parameters keep their frame slot, and the frame literal keeps the
+      // dead `void 0` placeholders — constructors, arguments mapping, and
+      // metadata are untouched.
+      assert(/\$l\[1\]/.test(o2.result.code));
+      assert(/locals: \[void 0, \$args\[0\], void 0, void 0, void 0, void 0\]/.test(o2.result.code));
+    });
+
+    it("promotes the same shapes under the sandbox (Phase 3)", function() {
+      const sandbox = run(sumSource, undefined, { optimization: "O2", security: "sandbox" });
+      assert.equal(sandbox.value, 12);
+      const promotion = sandbox.result.stats.codegen.localPromotion;
+      assert.equal(promotion.eligibleScopes, 1);
+      assert.equal(promotion.promotedSlots, 4);
+      assert(sandbox.result.stats.codegen.stackToLocal.promotedLoads > 0);
+      assert(sandbox.result.stats.codegen.stackToLocal.promotedStores > 0);
+      assert(/let \$p1_2, \$p1_3, \$p1_4, \$p1_5;/.test(sandbox.result.code));
+      assert(!/\$l\[[2-5]\]/.test(sandbox.result.code));
+    });
+
+    it("never promotes scopes that create closures", function() {
+      const source = "function counter() { var count = 0; " +
+        "return function() { return ++count; }; } counter()();";
+      const o2 = run(source, undefined, { optimization: "O2" });
+      assert.equal(o2.value, 1);
+      assert.equal(o2.result.stats.codegen.localPromotion.eligibleScopes, 0);
+      assert(!/\$p\d+_\d+/.test(o2.result.code));
+    });
+
+    it("never promotes scopes under with, eval, or catch environments", function() {
+      const sources = [
+        ["function e() { var x = 1; return eval(\"x\"); } e();", 1],
+        ["var loop, x = 1; with ({ x: 2 }) { loop = function(a) { var total = 0; " +
+          "for (var i = 0; i < a; i++) total = total + x; return total; }; } loop(4);", 8],
+        ["function f() { var y = 0; try { throw 3; } catch (e) { y = e; } return y + 1; } f();", 4],
+      ];
+      sources.forEach(([source, expected]) => {
+        const o2 = run(source, undefined, { optimization: "O2" });
+        assert.equal(o2.value, expected);
+        assert.equal(o2.result.stats.codegen.localPromotion.eligibleScopes, 0);
+        assert(!/\$p\d+_\d+/.test(o2.result.code));
+      });
+    });
+
+    it("promotes strict parameter slots alongside locals (Phase 2)", function() {
+      const source = "function scale(a, b) { 'use strict'; var c = 2; " +
+        "a = a * c; b = b + a; return a + b; } scale(3, 4);";
+      const o0 = run(source, undefined, { optimization: "O0" });
+      const o2 = run(source, undefined, { optimization: "O2" });
+      assert.equal(o2.value, o0.value);
+      assert.equal(o2.value, 16);
+      const promotion = o2.result.stats.codegen.localPromotion;
+      assert.equal(promotion.eligibleScopes, 1);
+      // Parameters (slots 1 and 2), the local (slot 3), and the function's
+      // own name binding (slot 4) all live in prologue variables.
+      assert.equal(promotion.promotedSlots, 4);
+      assert(o2.result.stats.codegen.stackToLocal.promotedLoads > 0);
+      assert(o2.result.stats.codegen.stackToLocal.promotedStores > 0);
+      // Promoted parameters are initialized from the call arguments in the
+      // declaration; non-parameter slots start uninitialized.
+      assert(/let \$p1_1 = \$f\.callArgs\[0\], \$p1_2 = \$f\.callArgs\[1\], \$p1_3, \$p1_4;/
+        .test(o2.result.code));
+      assert(!/\$l\[[1-3]\] = /.test(o2.result.code));
+      assert(!/getLocal\(\$f, [1-3]\)/.test(o2.result.code));
+    });
+
+    it("keeps strict arguments unmapped under promoted parameters", function() {
+      // arguments[0] = 99 must not reach the promoted parameter...
+      const forward = "function f(a) { 'use strict'; arguments[0] = 99; return a; } f(7);";
+      const o2f = run(forward, undefined, { optimization: "O2" });
+      assert.equal(o2f.value, 7);
+      // ...and a promoted parameter write must not reach arguments[0].
+      const backward = "function f(a) { 'use strict'; a = 42; return arguments[0]; } f(7);";
+      const o2b = run(backward, undefined, { optimization: "O2" });
+      assert.equal(o2b.value, 7);
+      [o2f, o2b].forEach((result) => {
+        const promotion = result.result.stats.codegen.localPromotion;
+        assert.equal(promotion.eligibleScopes, 1);
+        // The parameter (slot 1) and the function's own name (slot 2).
+        assert.equal(promotion.promotedSlots, 2);
+      });
+    });
+
+    it("never promotes sloppy parameter slots (mapped arguments)", function() {
+      // Slot 2 (the `b` local) and slot 3 (the function's own name binding)
+      // are promoted; the parameter slot 1 stays on the live array because
+      // the sloppy mapped-arguments proxy reads it through frame.locals.
+      const plain = run("function f(a) { var b = a; return b; } f(9);",
+        undefined, { optimization: "O2" });
+      assert.equal(plain.value, 9);
+      assert.equal(plain.result.stats.codegen.localPromotion.promotedSlots, 2);
+      assert(/let \$p1_2, \$p1_3;/.test(plain.result.code));
+      assert(!/\$p1_1\b/.test(plain.result.code));
+      // A function that touches arguments keeps slot 1 live too; only its
+      // self-name binding (slot 2) is promoted.
+      const mapped = run("function f(a) { return arguments[0]; } f(5);",
+        undefined, { optimization: "O2" });
+      assert.equal(mapped.value, 5);
+      assert.equal(mapped.result.stats.codegen.localPromotion.promotedSlots, 1);
+      assert(!/\$p1_1\b/.test(mapped.result.code));
+    });
+  });
+
+  describe("dead-store elimination (must-use liveness)", function() {
+    const eliminated = (source, options) =>
+      run(source, undefined, { optimization: "O2", ...options })
+        .result.stats.deadStoreElimination.storesEliminated;
+    // Every named function declaration carries a self-binding prologue store
+    // (CURRENT SETLOCAL[nameSlot] POP); it is dead when the body never reads
+    // its own name, so the counts below include it unless noted.
+
+    it("elides a store killed by a later store and keeps the live one", function() {
+      const source = "function f(y) { var x = 1; x = y; return x; } f(5);";
+      const o0 = run(source, undefined, { optimization: "O0" });
+      const o2 = run(source, undefined, { optimization: "O2" });
+      assert.equal(o2.value, o0.value);
+      assert.equal(o2.value, 5);
+      assert.equal(o2.result.stats.deadStoreElimination.storesEliminated, 2);
+    });
+
+    it("keeps a store that an optimized read sits between and a live read follows", function() {
+      // `first = stable` reads `stable` in the entry block; copy-prop folds
+      // that read to a literal, but the fall-through path's `first + stable`
+      // read is real. The folded read is a no-op for liveness — it must not
+      // kill the entry store of `stable`.
+      const source = "function f(flag) { var stable = 7, first = stable; " +
+        "if (flag) { stable = 9; } return first + stable; } f(true) + f(false);";
+      const o0 = run(source, undefined, { optimization: "O0" });
+      const o2 = run(source, undefined, { optimization: "O2" });
+      assert.equal(o2.value, o0.value);
+      assert.equal(o2.value, 30);
+      assert.equal(o2.result.stats.deadStoreElimination.storesEliminated, 1);
+    });
+
+    it("keeps a store read after a no-op local delete", function() {
+      // deleteLocal pushes false for lightweight frames without touching the
+      // slot, so `return x` still observes the stored 1: the delete neither
+      // kills nor reads, and the store stays live.
+      const source = "function f() { var x = 1; delete x; return x; } f();";
+      const o0 = run(source, undefined, { optimization: "O0" });
+      const o2 = run(source, undefined, { optimization: "O2" });
+      assert.equal(o2.value, o0.value);
+      assert.equal(o2.value, 1);
+      assert.equal(o2.result.stats.deadStoreElimination.storesEliminated, 1);
+    });
+
+    it("never eliminates sloppy parameter stores (mapped arguments alias them)", function() {
+      const source = "function f(a) { a = 1; a = 2; return a; } f(0);";
+      const o2 = run(source, undefined, { optimization: "O2" });
+      assert.equal(o2.value, 2);
+      // Only the self-binding prologue store is dead.
+      assert.equal(o2.result.stats.deadStoreElimination.storesEliminated, 1);
+    });
+
+    it("eliminates strict parameter stores", function() {
+      const source = "function f(a) { \"use strict\"; a = 1; a = 2; return a; } f(0);";
+      const o0 = run(source, undefined, { optimization: "O0" });
+      const o2 = run(source, undefined, { optimization: "O2" });
+      assert.equal(o2.value, o0.value);
+      assert.equal(o2.value, 2);
+      // a=1 is killed by a=2; the a=2 store is orphaned by copy-prop (the
+      // return read folds to the literal 2); plus the prologue.
+      assert.equal(o2.result.stats.deadStoreElimination.storesEliminated, 3);
+    });
+
+    it("keeps cross-block live stores and elides cross-block dead ones", function() {
+      const live = run(
+        "function f(flag) { var x = 7; if (flag) { x = 9; } return x; } f(true) + f(false);",
+        undefined, { optimization: "O2" });
+      assert.equal(live.value, 16);
+      assert.equal(live.result.stats.deadStoreElimination.storesEliminated, 1);
+      const dead = run(
+        "function f(flag) { var x = 7; if (flag) { x = 9; x = 11; } return x; } f(true) + f(false);",
+        undefined, { optimization: "O2" });
+      assert.equal(dead.value, 18);
+      assert.equal(dead.result.stats.deadStoreElimination.storesEliminated, 2);
+    });
+
+    it("elides stores orphaned by copy-prop and loop-local dead stores", function() {
+      const orphaned = run("function f() { var x = 2; return x + x; } f();",
+        undefined, { optimization: "O2" });
+      assert.equal(orphaned.value, 4);
+      assert.equal(orphaned.result.stats.deadStoreElimination.storesEliminated, 2);
+      const loop = run("function f(n) { var x = 0; while (n > 0) { x = 1; n--; } return n; } f(3);",
+        undefined, { optimization: "O2" });
+      assert.equal(loop.value, 0);
+      assert.equal(loop.result.stats.deadStoreElimination.storesEliminated, 3);
+    });
+
+    it("keeps loop-carried stores and self-name stores that are read", function() {
+      const carried = run("function f(n) { var x = 0; while (n > 0) { x = x + n; n--; } return x; } f(3);",
+        undefined, { optimization: "O2" });
+      assert.equal(carried.value, 6);
+      assert.equal(carried.result.stats.deadStoreElimination.storesEliminated, 1);
+      const self = run("function f() { return f === f; } f();",
+        undefined, { optimization: "O2" });
+      assert.equal(self.value, true);
+      assert.equal(self.result.stats.deadStoreElimination.storesEliminated, 0);
+    });
+
+    it("ignores immediates that numerically collide with slot indices", function() {
+      // NUMBER[2] (from `var y = 2`) shares the slot index of `x`; without
+      // op gating it would kill the entry store of `x` and the flag-false
+      // path would read undefined.
+      const source = "function f(flag) { var x = 7; var y = 2; " +
+        "if (flag) { x = 9; } return x; } f(true) + f(false);";
+      const o0 = run(source, undefined, { optimization: "O0" });
+      const o2 = run(source, undefined, { optimization: "O2" });
+      assert.equal(o2.value, o0.value);
+      assert.equal(o2.value, 16);
+      assert.equal(o2.result.stats.deadStoreElimination.storesEliminated, 2);
+    });
+
+    it("keeps stores feeding a reuse whose source later elides", function() {
+      // GVN marks the loop read of x as `reuse` of the earlier `!x` load; the
+      // copy-folding peephole then elides that source load, so codegen falls
+      // back to a real slot read. DSE must not have elided the stores that
+      // read needs — the reuse mark is a hint whose honor is conditional.
+      const source = "function f() { var x = \"ab\"; var y = !x; " +
+        "while (3) { x = x[1]; break; } return y; } f();";
+      const o0 = run(source, undefined, { optimization: "O0" });
+      const o2 = run(source, undefined, { optimization: "O2" });
+      assert.equal(o2.value, o0.value);
+      assert.equal(o2.value, false);
+      // Entry store of x stays live (the reuse read consumes); only the
+      // self-binding prologue and the loop's own dead x store are elided.
+      assert.equal(o2.result.stats.deadStoreElimination.storesEliminated, 2);
+    });
+
+    it("skips env-observer scopes (with/eval/catch) entirely", function() {
+      const source = "var loop; with ({ x: 2 }) { loop = function(a) { " +
+        "var total = 0; for (var i = 0; i < a; i++) total = total + x; " +
+        "return total; }; } loop(4);";
+      const o2 = run(source, undefined, { optimization: "O2" });
+      assert.equal(o2.value, 8);
+      assert.equal(o2.result.stats.deadStoreElimination.storesEliminated, 0);
+    });
+
+    it("never eliminates stores in try/finally scopes (exception path)", function() {
+      // test262 S12.14_A15 regression: the desugared empty catch emits a
+      // CATCH op, so every try/catch/finally scope has a dynamic chain and is
+      // skipped wholesale. `result += 2` sits in the try body; the throw's
+      // exception path (empty catch -> finally { break } -> return result)
+      // reads `result`, but the THROW block has no CFG successors, so the
+      // store looks dead to the backward fixpoint — eliding it returns 0
+      // instead of 2 on that path.
+      const source = "function SwitchTest3(value) { var result = 0; " +
+        "switch (value) { case 0: try { result += 2; throw \"ex\"; } " +
+        "finally { break; } default: result += 32; break; } return result; } " +
+        "SwitchTest3(2); SwitchTest3(0);";
+      const o0 = run(source, undefined, { optimization: "O0" });
+      const o2 = run(source, undefined, { optimization: "O2" });
+      assert.equal(o2.value, o0.value);
+      // The exception path is the last statement: try body -> throw -> empty
+      // catch -> finally { break } -> return result. The finally's break
+      // reads result, so the try body's += 2 store must survive.
+      assert.equal(o2.value, 2);
+      assert.equal(o2.result.stats.deadStoreElimination.storesEliminated, 0);
+    });
+
+    it("honors the dead-store-elimination kill switch", function() {
+      const source = "function f(y) { var x = 1; x = y; return x; } f(5);";
+      const off = run(source, undefined, { optimization: "O2", deadStoreElimination: false });
+      assert.equal(off.value, 5);
+      assert.equal(off.result.stats.deadStoreElimination, undefined);
+      const on = eliminated(source);
+      assert.equal(on, 2);
+    });
   });
 
   it("inlines budgeted small calls behind identity and primitive guards", function() {
@@ -741,6 +1211,52 @@ describe("sablejs OpSpec and AOT backend", function() {
     assert(result.code.length < 200000);
   });
 
+  it("folds constant object literals into native literals", function() {
+    const source =
+      "var o = { a: 1, b: \"x\", c: true, d: null, e: undefined, f: -0, g: 1.5, " +
+      "dup: 1, dup: 2, num: 0, neg: -5, h: NaN, i: Infinity, nested: { k: 3 } }; " +
+      "[o.a, o.b, o.c, o.d, o.e, 1 / o.f, o.g, o.dup, o.num, o.neg, isNaN(o.h), o.i, o.nested.k]";
+    for (const optimization of ["O0", "O1", "O2", "Os"]) {
+      assert.deepEqual(run(source, undefined, { optimization }).value, [1, "x", true, null, undefined, -Infinity, 1.5, 2, 0, -5, true, Infinity, 3], optimization);
+    }
+    // The constant-property helper round-trips are folded into one literal.
+    // NaN/Infinity are global-property reads (not literals) and `nested` is a
+    // dynamic value, so both keep the runtime path on the same fresh object.
+    const { result } = run(source, undefined, { optimization: "O2" });
+    assert(result.code.includes('"a": 1'));
+    assert(result.code.includes('"dup": 2'));
+    assert(result.code.includes('"f": -0'));
+    assert(result.code.includes('"k": 3'));
+    // 3 runtime INITPROPs for h/i/nested; the trailing 13-element result
+    // array has non-literal elements and stays on the runtime path.
+    assert.equal((result.code.match(/initProperty/g) || []).length, 16);
+  });
+
+  it("keeps the __proto__ key on the runtime path (ES5.1 plain property)", function() {
+    // Native literal syntax would give `__proto__` Annex-B prototype-setting
+    // meaning; folding must stop so the runtime preserves ES5.1 semantics.
+    const source =
+      "var p = { q: 1 }; var o = { __proto__: p, z: 2 }; " +
+      "[o.q, o.z, o.__proto__ === p, Object.getPrototypeOf(o) !== p]";
+    for (const optimization of ["O0", "O1", "O2", "Os"]) {
+      assert.deepEqual(run(source, undefined, { optimization }).value, [undefined, 2, true, true], optimization);
+    }
+    const { result } = run(source, undefined, { optimization: "O2" });
+    // The proto key is emitted through the runtime, never in a literal.
+    assert(result.code.includes('"__proto__"'));
+    assert(!result.code.includes('"__proto__":'));
+  });
+
+  it("folds giant constant object literals into compact code", function() {
+    const count = 3000;
+    let entries = "";
+    for (let index = 0; index < count; index += 1) entries += (index ? ", " : "") + `k${index}: ${index % 251}`;
+    const source = `var data = { ${entries} }; data.k2999;`;
+    const { result, value } = run(source, undefined, { optimization: "O2" });
+    assert.equal(value, 2999 % 251);
+    assert(result.code.length < 200000);
+  });
+
   it("keeps cross-block inline guards from referencing out-of-scope temporaries", function() {
     // The helper closure is emitted inside the if-block; the call site in
     // the loop must fall back to the runtime call instead of referencing
@@ -761,7 +1277,9 @@ describe("sablejs OpSpec and AOT backend", function() {
     assert.equal(os.value, 5);
     assert(o2.result.stats.codegen.leafFrameScopes > 0);
     assert(o2.result.stats.codegen.inlineLeafFrameScopes > 0);
-    assert(o2.result.code.includes("const $f = { metadata: $metadata, locals:"));
+    assert(o2.result.stats.codegen.framePooledScopes > 0);
+    assert(o2.result.code.includes("$f = { metadata: $metadata, locals:"));
+    assert(o2.result.code.includes("$poolHead"));
     assert(!o2.result.code.includes("argumentsInitialized: false"));
     const genericLeaf = run(source, undefined, {
       optimization: "O2",
@@ -788,6 +1306,123 @@ describe("sablejs OpSpec and AOT backend", function() {
     assert.equal(os.result.stats.codegen.sizeOptimization.costModel.objective, "raw-bytes");
     assert.equal(os.result.stats.codegen.sizeOptimization.costModel.candidates.length, 2);
     assert.equal(os.result.stats.codegen.sizeOptimization.costModel.selected, "shared-factory");
+  });
+
+  it("pools leaf frames and resets per-call state", function() {
+    const source = "function calc(v) { var t = v + 1; var u = t * 2; return u; } " +
+      "var acc = 0; for (var i = 1; i <= 6; i++) { acc += calc(i); } acc;";
+    for (const security of ["trusted", "sandbox"]) {
+      const loaded = run(source, undefined, { optimization: "O2", security });
+      assert.equal(loaded.value, 54, security);
+      assert(loaded.result.stats.codegen.leafFrameScopes > 0, security);
+      assert.equal(loaded.result.stats.codegen.framePooledScopes, loaded.result.stats.codegen.leafFrameScopes, security);
+      assert(loaded.result.code.includes("$poolHead"), security);
+      // The pooled acquire resets exactly the slots the body reads — the
+      // parameter slot, rewritten from $args — and never stores `void 0`
+      // into the reused array (a `void 0` store would transition it off
+      // the packed-elements fast path and box double-valued locals). The
+      // reserved slot 0 and the promoted `var` slots are unreachable from
+      // the body, so their stale values are never observed.
+      assert(loaded.result.code.includes("$f.locals[1] = $args[0];"), security);
+      assert(!loaded.result.code.includes("$f.locals[0] = void 0;"), security);
+      assert(!loaded.result.code.includes("$f.locals[2] = void 0;"), security);
+    }
+  });
+
+  it("keeps receivers isolated across pooled frame reuse", function() {
+    const source = "function put(v) { this.x = v; return this.x; } " +
+      "var o1 = { put: put }; var o2 = { put: put }; " +
+      "var a = o1.put(1); var b = o2.put(2); a + \"|\" + b + \"|\" + o1.x + \"|\" + o2.x;";
+    for (const security of ["trusted", "sandbox"]) {
+      const loaded = run(source, undefined, { optimization: "O2", security });
+      assert.equal(loaded.value, "1|2|1|2", security);
+      assert(loaded.result.stats.codegen.framePooledScopes > 0, security);
+    }
+  });
+
+  it("reenters the same pool through a host callback without aliasing", function() {
+    // leaf -> hostGo -> leaf: the inner call must not reuse the outer frame,
+    // which is still active on the host stack (release happens only in the
+    // finally after $execute returns).
+    const source = "var depth = 0; function leaf() { depth += 1; return hostGo(leaf); } leaf(); depth;";
+    let reentries = 0;
+    const { value } = run(source, {
+      hostGo(fn) {
+        reentries += 1;
+        return reentries < 3 ? fn() : reentries;
+      },
+    }, { optimization: "O2" });
+    assert.equal(reentries, 3);
+    assert.equal(value, 3);
+    const loaded = load(source, { optimization: "O2" });
+    assert(loaded.result.stats.codegen.framePooledScopes > 0);
+    assert.equal(loaded.result.stats.codegen.framePooledScopes, loaded.result.stats.codegen.leafFrameScopes);
+    let hops = 0;
+    assert.equal(loaded.program.createInstance({ globals: {
+      hostGo(fn) { hops += 1; return hops < 3 ? fn() : hops; },
+    } }).run(), 3);
+    assert.equal(hops, 3);
+  });
+
+  it("reenters a pooled leaf scope recursively without cross-call aliasing", function() {
+    // nz (ternary, non-leaf) and dec (straight-line, leaf) alternate, so each
+    // recursion depth acquires its own pooled dec frame.
+    const source = "function nz(n) { return n === 0 ? 0 : 1 + dec(n); } " +
+      "function dec(n) { return nz(n - 1); } var out = 0; " +
+      "for (var i = 0; i < 4; i++) { out += dec(10); } out;";
+    const loaded = run(source, undefined, { optimization: "O2" });
+    assert.equal(loaded.value, 36);
+    assert(loaded.result.stats.codegen.framePooledScopes > 0);
+  });
+
+  it("retires frames that materialize an arguments object", function() {
+    // reader() reads leaf.arguments while leaf is active; the runtime then
+    // caches an arguments proxy on leaf's frame. That frame must never be
+    // reused, or a later call's parameters would alias the stale object.
+    const source = "function leaf(a) { return reader(); } " +
+      "function reader() { return leaf.arguments; } " +
+      "var r1 = leaf(10); var r2 = leaf(20); r1[0] + \"|\" + r2[0] + \"|\" + (r1 !== r2);";
+    for (const security of ["trusted", "sandbox"]) {
+      const loaded = run(source, undefined, { optimization: "O2", security });
+      assert.equal(loaded.value, "10|20|true", security);
+      assert(loaded.result.stats.codegen.framePooledScopes > 0, security);
+    }
+  });
+
+  it("walks caller chains through pooled frames", function() {
+    const source = "function inner() { return outer.caller; } " +
+      "function outer() { return inner(); } " +
+      "function main2() { return outer(); } var got = main2(); got === main2;";
+    for (const security of ["trusted", "sandbox"]) {
+      const loaded = run(source, undefined, { optimization: "O2", security });
+      assert.equal(loaded.value, true, security);
+      assert(loaded.result.stats.codegen.framePooledScopes > 0, security);
+    }
+  });
+
+  it("releases pooled frames when an exception unwinds through them", function() {
+    // Guest try/catch disqualifies every scope it can reach (runtime-visible
+    // locals), so a pooled frame can only be unwound by an exception that
+    // reaches the host. The finally still releases the frame, and a fresh
+    // instance from the same module runs correctly afterwards.
+    const source = "function thrower() { if (armed) { throw 9; } return 1; } " +
+      "function leafl() { return thrower(); } leafl(); 42;";
+    const loaded = load(source, { optimization: "O2" });
+    assert(loaded.result.stats.codegen.framePooledScopes > 0);
+    assert.throws(() => loaded.program.createInstance({ globals: { armed: 1 } }).run(), (error) => error === 9);
+    assert.equal(loaded.program.createInstance({ globals: { armed: 0 } }).run(), 42);
+  });
+
+  it("disables pooling with framePooling: false", function() {
+    const source = "function add2(a, b) { var c = a + b; return c; } add2(2, 3);";
+    for (const security of ["trusted", "sandbox"]) {
+      const loaded = run(source, undefined, { optimization: "O2", security, framePooling: false });
+      assert.equal(loaded.value, 5, security);
+      assert(loaded.result.stats.codegen.leafFrameScopes > 0, security);
+      assert.equal(loaded.result.stats.codegen.framePooledScopes, 0, security);
+      assert(!loaded.result.code.includes("$poolHead"), security);
+      assert(loaded.result.code.includes("const $f = { metadata: $metadata, locals:"), security);
+    }
   });
 
   it("preserves names across dynamic environment chains", function() {
@@ -1030,6 +1665,641 @@ describe("sablejs guest-object provenance (local-safe write distinction)", funct
       assert.match(result.code, /setPropertyStatic/, optimization);
       assert.doesNotMatch(result.code, /setGuestPropertyValue/, optimization);
     }
+  });
+});
+
+describe("sablejs slot-provenance stamps (Item 9, per-store write classification)", function () {
+  function sandboxCompile(source, options = {}) {
+    return compileProgram(source, { security: "sandbox", runtimeModule, ...options });
+  }
+
+  // Derives the set of $q-tracked slot indexes per generated $exec body.
+  function trackedSlotsByScope(code) {
+    const byScope = new Map();
+    for (const exec of code.matchAll(/function \$exec(\d+)\([\s\S]*?\n\}/g)) {
+      const scopeId = Number(exec[1]);
+      const slots = new Set();
+      for (const flag of exec[0].matchAll(/\$q\d+_(\d+)/g)) slots.add(flag[1]);
+      byScope.set(scopeId, slots);
+    }
+    return byScope;
+  }
+
+  it("classifies frame-local write receivers once per store via $q flags", function () {
+    const result = sandboxCompile(
+      "function f(u) { var i; for (i = 0; i < 4; i++) { u[i] = i * 0.5; } return u[3]; } f(new Array(4));",
+      { optimization: "O2" }
+    );
+    const stats = result.stats.codegen.slotProvenance;
+    assert(stats.trackedScopes >= 1);
+    assert(stats.trackedSlots >= 1);
+    // The parameter slot's flag is declared and initialized lazily at the
+    // write site (no per-call prologue classification — measured overhead).
+    assert.match(result.code, /let \$q\d+_\d+/);
+    assert.doesNotMatch(result.code, /let \$q\d+_\d+[\s\S]*?\$r\.boundary\.isUnmediatedWriteTarget\(\$f\.(?:locals\[\d+\]|callArgs\[\d+\])\)/);
+    // The write site is the guarded ternary (the sandbox helper survives as
+    // the ternary's fallback arm, never as the direct call).
+    assert.match(result.code, /\(\$q\d+_\d+ === undefined \? \$q\d+_\d+ = \$r\.boundary\.isUnmediatedWriteTarget/);
+    assert.doesNotMatch(result.code, /^\s*\$setSandbox\(/m);
+    // Behavior parity with the unoptimized path.
+    const generatedModule = { exports: {} };
+    new Function("require", "module", "exports", result.code)(require, generatedModule, generatedModule.exports);
+    assert.equal(generatedModule.exports.createInstance().run(), 1.5);
+  });
+
+  it("guards sloppy parameter slots with the mapped-arguments stamp", function () {
+    const sloppy = sandboxCompile("function f(a) { a[0] = 1; return a[0]; } f([0]);", { optimization: "O2" });
+    assert.match(sloppy.code, /!\$f\.argumentsInitialized && \(\$q\d+_\d+ === undefined/);
+    // Strict functions have PoisonPill caller/arguments accessors and an
+    // unmapped arguments object: no proxy can write a parameter slot, so the
+    // guard must be absent.
+    const strict = sandboxCompile(
+      "function f(a) { 'use strict'; a[0] = 1; return a[0]; } f([0]);",
+      { optimization: "O2" }
+    );
+    assert.doesNotMatch(strict.code, /argumentsInitialized && \(\$q/);
+    assert.match(strict.code, /\(\$q\d+_\d+ === undefined/);
+  });
+
+  it("keeps flags off Os, O0/O1, trusted, and kill-switched builds", function () {
+    const source = "function f(a) { a[0] = 1; return a[0]; } f([0]);";
+    for (const optimization of ["Os", "O0", "O1"]) {
+      const result = sandboxCompile(source, { optimization });
+      assert.doesNotMatch(result.code, /\$q\d+_\d+/, optimization);
+      assert.equal(result.stats.codegen.slotProvenance.trackedSlots, 0, optimization);
+    }
+    const trusted = compileProgram(source, { security: "trusted", runtimeModule, optimization: "O2" });
+    assert.doesNotMatch(trusted.code, /\$q\d+_\d+/);
+    const killed = sandboxCompile(source, { optimization: "O2", slotProvenance: false });
+    assert.equal(killed.stats.codegen.slotProvenance.trackedSlots, 0);
+    assert.doesNotMatch(killed.code, /\$q\d+_\d+/);
+  });
+
+  it("routes writes after a mapped-arguments rebind through the full path", function () {
+    // The proxy rebinds the parameter slot to a host value; once arguments
+    // are materialized the $q stamp may be stale, so the write must behave
+    // exactly like the kill-switched build (both take the full path).
+    const source = "var out = []; function f(a) { " +
+      "var g = function() { return g.caller.arguments; }; var args = g(); " +
+      "args[0] = host; a.x = 1; return [typeof a, a.x]; } " +
+      "out.push(f(new Object())); print(JSON.stringify(out));";
+    const { capability } = require("../../src/runtime");
+    const runBoth = (options) => {
+      const result = sandboxCompile(source, options);
+      const generatedModule = { exports: {} };
+      new Function("require", "module", "exports", result.code)(require, generatedModule, generatedModule.exports);
+      let printed;
+      const instance = generatedModule.exports.createInstance({
+        globals: {
+          print: capability((value) => { printed = value; }, { name: "print" }),
+          host: capability(function host() {}, { name: "host" }),
+        },
+      });
+      instance.run();
+      return printed;
+    };
+    assert.equal(
+      runBoth({ optimization: "O2" }),
+      runBoth({ optimization: "O2", slotProvenance: false })
+    );
+  });
+
+  it("never mixes $q-tracked slots with the runtime setLocal path", function () {
+    // A stack-height mismatch (constant-folded ternary merge) sends one
+    // SETLOCAL through $r.setLocal; any tracked slot written that way would
+    // bypass its store classification, so the per-scope tracked sets and the
+    // runtime writes must be disjoint — per scope.
+    const source = "function f(a) { var t = g ? 1 : 2; a[0] = t; a[0] = 1; return a[0]; } f(new Array(1));";
+    const result = sandboxCompile(source, { optimization: "O2" });
+    const byScope = trackedSlotsByScope(result.code);
+    assert(byScope.size >= 1);
+    for (const [scopeId, slots] of byScope) {
+      if (!slots.size) continue;
+      const scopeExec = result.code.match(new RegExp(`function \\$exec${scopeId}\\([\\s\\S]*?\\n\\}`))[0];
+      for (const match of scopeExec.matchAll(/\$r\.setLocal\(\$f, (\d+)\)/g)) {
+        assert(!slots.has(match[1]), `tracked slot ${match[1]} written through runtime setLocal`);
+      }
+    }
+    const generatedModule = { exports: {} };
+    new Function("require", "module", "exports", result.code)(require, generatedModule, generatedModule.exports);
+    assert.equal(generatedModule.exports.createInstance({ globals: { g: true } }).run(), 1);
+  });
+});
+
+describe("sablejs inline guest-stamp write path (Item 10)", function () {
+  function sandboxCompile(source, options = {}) {
+    return compileProgram(source, { security: "sandbox", runtimeModule, ...options });
+  }
+
+  it("inlines provably-pure guest writes to a native strict set", function () {
+    // Strict scope + provably-primitive MUL value: the guest branch is a
+    // native `$o[$k] = $v` with no securing probe and no helper call.
+    const result = sandboxCompile(
+      "function f(v) { 'use strict'; var u = new Array(v.length); " +
+      "for (var i = 0; i < v.length; i++) { u[i] = v[i] * 1.5; } return u[v.length - 1]; } " +
+      "f([1, 2]);",
+      { optimization: "O2" }
+    );
+    assert.match(result.code, /\(\$q\d+_\d+ === undefined \?[^)]*isUnmediatedWriteTarget\([^)]*\)[^)]*\)\) \? \$[a-z0-9_]+\[\$[a-z0-9_]+\] = \$[a-z0-9_]+ : \$setSandbox/);
+    // The guest branch must not re-enter a helper: no $setGuest call at the
+    // site (the stamp ternary's guest arm is the native set).
+    assert.doesNotMatch(result.code, /\? \$setGuest\(\$r, \$f,/);
+    const generatedModule = { exports: {} };
+    new Function("require", "module", "exports", result.code)(require, generatedModule, generatedModule.exports);
+    assert.equal(generatedModule.exports.createInstance().run(), 3);
+  });
+
+  it("keeps impure write values (call results) on $setGuest", function () {
+    // A call result cannot be re-evaluated at the write site (side effects):
+    // its guest branch must stay the $setGuest helper call.
+    const result = sandboxCompile(
+      "function f(o) { o.x = g(); return o.x; } var n = 0; " +
+      "function g() { n++; return n; } var o = {}; f(o);",
+      { optimization: "O2" }
+    );
+    assert.match(result.code, /\? \$setGuest\(\$r, \$f, \$\w+, "x", \$[a-z0-9_]+\) : \$setSandbox/);
+  });
+
+  it("uses the slim sloppy writer for sloppy scopes with silent-failure semantics", function () {
+    const result = sandboxCompile(
+      "function f(o) { o.x = 1; return o.x; } f({});",
+      { optimization: "O2" }
+    );
+    assert.match(result.code, /\? \$writeSloppy\(\$[a-z0-9_]+, "x", \$[a-z0-9_]+\) : \$setSandbox/);
+    const generatedModule = { exports: {} };
+    new Function("require", "module", "exports", result.code)(require, generatedModule, generatedModule.exports);
+    assert.equal(generatedModule.exports.createInstance().run(), 1);
+  });
+
+  it("never inlines a write whose receiver is not provably guest", function () {
+    // `Math` is a protected intrinsic read from the global: writeTarget
+    // resolution is exactly what blocks the write, so the site must keep the
+    // full $setSandbox path — no native set, no $writeSloppy, no $setGuest.
+    const result = sandboxCompile(
+      "function f() { Math.polluted = 1; } f();",
+      { optimization: "O2" }
+    );
+    assert.doesNotMatch(result.code, /Math\.polluted = /);
+    assert.doesNotMatch(result.code, /\? \$writeSloppy\(/);
+    assert.doesNotMatch(result.code, /\? \$setGuest\(/);
+    // The write stays a full-path line: $setSandbox with the receiver read
+    // through $readGlobal — no ternary, no slim writer, no native set.
+    assert.match(result.code, /\$setSandbox\(\$r, \$writeSloppy, \$[a-z0-9_]+, "polluted", \$[a-z0-9_]+\);/);
+    assert.doesNotMatch(result.code, /\(\$q\d+_\d+ === undefined \?[^)]*isUnmediatedWriteTarget/);
+  });
+
+  it("keeps the inline forms off kill-switched and non-O2 builds", function () {
+    const source = "function f(o) { 'use strict'; o.x = 1; return o.x; } f({});";
+    const killed = sandboxCompile(source, { optimization: "O2", inlineGuestWrites: false });
+    assert.match(killed.code, /\? \$setGuest\(\$r, \$f,/);
+    assert.doesNotMatch(killed.code, /\? \$writeSloppy\(/);
+    for (const optimization of ["O0", "O1", "Os"]) {
+      const result = sandboxCompile(source, { optimization });
+      // O0 legitimately uses $writeSloppy for plain global writes; the inline
+      // form is specifically the ternary arm (`? $writeSloppy(`) of a
+      // $q-classified guest write, which requires O2 provenance.
+      assert.doesNotMatch(result.code, /\? \$writeSloppy\(/);
+      assert.doesNotMatch(result.code, /\(\$q\d+_\d+ === undefined \?/);
+    }
+    const trusted = compileProgram(source, { security: "trusted", runtimeModule, optimization: "O2" });
+    assert.doesNotMatch(trusted.code, /\? \$writeSloppy\(/);
+    assert.doesNotMatch(trusted.code, /\$q\d+_\d+/);
+  });
+});
+
+describe("sablejs inline literal init (Item 13)", function () {
+  function sandboxCompile(source, options = {}) {
+    return compileProgram(source, { security: "sandbox", runtimeModule, ...options });
+  }
+
+  it("inlines fresh-literal inits with the live flag guard and function-value probe", function () {
+    // {a: f()} at O2 sandbox: guard reads the live runtime flag; the fast arm
+    // is a native set with the typeof-function probe; the slow arm re-pushes
+    // the full operand stack and calls initProperty.
+    const result = sandboxCompile(
+      "function f() { return function inner() { return 1; }; } var o = {a: f()}; o.a();",
+      { optimization: "O2" }
+    );
+    assert.match(result.code, /if \(\$prototypesHaveSetters\(\)\) \{/);
+    assert.match(result.code, /\$s\.push\(\$[a-z0-9_]+, \$[a-z0-9_]+, \$[a-z0-9_]+\);\s*\n\s*\$r\.initProperty\(\$f\);/);
+    assert.match(result.code, /\$[a-z0-9_]+\[\$[a-z0-9_]+\] = \(typeof \$[a-z0-9_]+ === "function" \? \$r\.boundary\.secureValue\(\$[a-z0-9_]+\) : \$[a-z0-9_]+\);/);
+    const generatedModule = { exports: {} };
+    new Function("require", "module", "exports", result.code)(require, generatedModule, generatedModule.exports);
+    assert.equal(generatedModule.exports.createInstance().run(), 1);
+  });
+
+  it("skips the probe for provably-primitive values and the probe entirely in trusted mode", function () {
+    // {a: x + y} — ADD is a primitive-result op: no typeof probe.
+    const sandbox = sandboxCompile(
+      "var x = 1, y = 2; var o = {a: x + y}; o.a;",
+      { optimization: "O2" }
+    );
+    assert.match(sandbox.code, /if \(\$prototypesHaveSetters\(\)\) \{/);
+    assert.doesNotMatch(sandbox.code, /typeof .* === "function" \? \$r\.boundary\.secureValue/);
+    // Trusted mode has no boundary: the fast arm is a bare native set.
+    const trusted = compileProgram(
+      "var x = 1, y = 2; var o = {a: x + y}; o.a;",
+      { security: "trusted", runtimeModule, optimization: "O2" }
+    );
+    assert.match(trusted.code, /if \(\$prototypesHaveSetters\(\)\) \{/);
+    assert.doesNotMatch(trusted.code, /\$r\.boundary\.secureValue/);
+    const generatedModule = { exports: {} };
+    new Function("require", "module", "exports", trusted.code)(require, generatedModule, generatedModule.exports);
+    assert.equal(generatedModule.exports.createInstance().run(), 3);
+  });
+
+  it("keeps __proto__ keys and flushed-stack operands on the runtime path", function () {
+    // __proto__ must define an own data property (ES5.1), never a chain swap,
+    // so its init never inlines. A hole in an array literal flushes the model
+    // stack, so the inits after the hole keep the runtime path too.
+    const result = sandboxCompile(
+      "var p = {x: 1}; var o = {'__proto__': p}; var a = [f(), , f()]; function f() { return 1; } o['__proto__'].x + a.length;",
+      { optimization: "O2" }
+    );
+    // The literal __proto__ init has no guard: it is the plain helper line.
+    assert.match(result.code, /\$r\.initProperty\(\$f\);\s*\n(?!\s*\}\s*\n\s*\$r\.initProperty)/);
+    assert.doesNotMatch(result.code, /\$[a-z0-9_]+\["__proto__"\] = /);
+    const generatedModule = { exports: {} };
+    new Function("require", "module", "exports", result.code)(require, generatedModule, generatedModule.exports);
+    assert.equal(generatedModule.exports.createInstance().run(), 4);
+  });
+
+  it("falls back correctly after the flag flips mid-program", function () {
+    // Trusted guest installs a getter-only accessor, then initializes a
+    // literal: the guard must observe the flip and route the init through
+    // defineData (own data property) instead of a throwing plain assignment.
+    const result = compileProgram(
+      "Object.defineProperty(Object.prototype, 'k', { get: function () { return 9; }, configurable: true }); " +
+      "var v = 7; var o = {k: v}; " +
+      "[o.k, Object.getOwnPropertyDescriptor(o, 'k').writable];",
+      { security: "trusted", runtimeModule, optimization: "O2" }
+    );
+    assert.match(result.code, /if \(\$prototypesHaveSetters\(\)\) \{/);
+    const generatedModule = { exports: {} };
+    new Function("require", "module", "exports", result.code)(require, generatedModule, generatedModule.exports);
+    const instance = generatedModule.exports.createInstance({});
+    try {
+      assert.deepStrictEqual(instance.run(), [7, true]);
+    } finally {
+      instance.dispose();
+      delete Object.prototype.k;
+    }
+  });
+
+  it("keeps the inline forms off kill-switched and non-O2 builds", function () {
+    const source = "function f() { return 1; } var o = {a: f()}; o.a;";
+    const killed = sandboxCompile(source, { optimization: "O2", inlineGuestInit: false });
+    assert.doesNotMatch(killed.code, /\$prototypesHaveSetters\(\)/);
+    for (const optimization of ["O0", "O1", "Os"]) {
+      const result = sandboxCompile(source, { optimization });
+      assert.doesNotMatch(result.code, /\$prototypesHaveSetters\(\)/);
+    }
+    const trusted = compileProgram(source, { security: "trusted", runtimeModule, optimization: "Os" });
+    assert.doesNotMatch(trusted.code, /\$prototypesHaveSetters\(\)/);
+  });
+
+  it("demotes and compiles when a flushed SETVAR writes through $r.setVar", function () {
+    // Octane EarleyBoyer regression: a hole in an array literal routes the
+    // EMPTY init through the runtime path and flushes the model stack, so
+    // the following `g = [v, , v]` SETVAR falls back to the name-based
+    // $r.setVar helper. Promotion/provenance scopes must demote every slot
+    // that helper touches (here none — g is a global) and still compile,
+    // instead of the pre-fix hard error.
+    const result = compileProgram(
+      "var g = 0; " +
+      "function f(v) { var x = 1; g = [v, , v]; return g[2] + x; } " +
+      "f(6);",
+      { security: "trusted", runtimeModule, optimization: "O2" }
+    );
+    assert.match(result.code, /\$r\.setVar\(\$f, "[^"]+"\)/);
+    const generatedModule = { exports: {} };
+    new Function("require", "module", "exports", result.code)(require, generatedModule, generatedModule.exports);
+    assert.equal(generatedModule.exports.createInstance().run(), 7);
+  });
+});
+
+describe("sablejs inline host intrinsics (Item 14)", function () {
+  function sandboxCompile(source, options = {}) {
+    return compileProgram(source, { security: "sandbox", runtimeModule, ...options });
+  }
+
+  it("emits direct calls for intrinsic identifiers, with the sandbox ambient probe", function () {
+    const source = "isNaN(1); parseFloat(\"1.5px\");";
+    const sandbox = sandboxCompile(source, { optimization: "O2" });
+    // Direct arm is a bare variable call (a variable callee passes
+    // undefined this — the (0, ...) sequence expression would only be
+    // needed for member-expression callees, and it is the classic V8
+    // anti-inline idiom; keep the call feedback-friendly).
+    assert.match(sandbox.code, /typeof \$[a-z0-9_]+ === "object" && \$[a-z0-9_]+ !== null && \$r\.boundary\.ambientValues\.has\(\$[a-z0-9_]+\) \? \$applySandbox1/);
+    // The direct arm goes through the sanitizing $hostCallN helper so a
+    // throwing ToPrimitive (String/Number on a throwing toString) surfaces
+    // the same sanitized error the boundary throws.
+    assert.match(sandbox.code, /: \$hostCall1\(\$[a-z0-9_]+, \$[a-z0-9_]+, /);
+    // Trusted keeps the $apply chain: measured −6..−7% on Typescript when
+    // inlined (V8 already fully optimizes the chain, and the shape change
+    // perturbs the enclosing functions), so trusted must not inline.
+    const trusted = compileProgram(source, { security: "trusted", runtimeModule, optimization: "O2" });
+    assert.match(trusted.code, /\$apply\(\$r, \$f, /);
+    assert.doesNotMatch(trusted.code, /\$[a-z0-9_]+\(\$[a-z0-9_]+\)/);
+    assert.equal(sandbox.stats.codegen.inlining.hostIntrinsicCallSites, 2);
+    assert.equal(trusted.stats.codegen.inlining.hostIntrinsicCallSites, 0);
+  });
+
+  it("computes the five intrinsics identically to the mediated path", function () {
+    for (const security of ["sandbox", "trusted"]) {
+      const result = run(
+        "[isNaN(1), parseFloat(\"1.5px\"), parseInt(\"42\", 10), Number(\"3\"), String(42), isNaN()]",
+        {},
+        { security, optimization: "O2" }
+      );
+      assert.deepStrictEqual(result.value, [false, 1.5, 42, 3, "42", true], security);
+      // Trusted is gated off (measured −6..−7% on Typescript), so only
+      // sandbox counts inline sites; trusted still computes identically
+      // through $apply.
+      assert.equal(result.result.stats.codegen.inlining.hostIntrinsicCallSites, security === "sandbox" ? 6 : 0, security);
+    }
+  });
+
+  it("honors guest redefinitions through every global write vector", function () {
+    const shadow = "function shadow(x) { return \"shadow:\" + x; } isNaN = shadow; isNaN(1);";
+    for (const security of ["sandbox", "trusted"]) {
+      assert.equal(run(shadow, {}, { security, optimization: "O2" }).value, "shadow:1", security);
+    }
+    // The guest global object is reachable as top-level this (no globalThis
+    // binding in the ES5.1 guest), so member writes to it are SETPROPs.
+    const setprop = "function shadow() { return \"via-setprop\"; } this.isNaN = shadow; isNaN(1);";
+    for (const security of ["sandbox", "trusted"]) {
+      assert.equal(run(setprop, {}, { security, optimization: "O2" }).value, "via-setprop", security);
+    }
+    const define = "function shadow() { return \"via-define\"; } Object.defineProperty(this, \"isNaN\", { value: shadow }); isNaN(1);";
+    for (const security of ["sandbox", "trusted"]) {
+      assert.equal(run(define, {}, { security, optimization: "O2" }).value, "via-define", security);
+    }
+    // A declared global holding a non-function shadows the intrinsic: the
+    // call must throw exactly like the mediated path.
+    for (const security of ["sandbox", "trusted"]) {
+      assert.throws(() => run("var isNaN = 5; isNaN(1);", {}, { security, optimization: "O2" }).value, TypeError, security);
+    }
+  });
+
+  it("excludes locals, parameters, and member calls from the inline", function () {
+    const local = "function f(isNaN) { return isNaN(1); } f(function (x) { return \"param:\" + x; });";
+    for (const security of ["sandbox", "trusted"]) {
+      const result = run(local, {}, { security, optimization: "O2" });
+      assert.equal(result.value, "param:1", security);
+      assert.equal(result.result.stats.codegen.inlining.hostIntrinsicCallSites, 0, security);
+    }
+    const member = "var o = { isNaN: function (x) { return \"member:\" + x; } }; o.isNaN(1);";
+    for (const security of ["sandbox", "trusted"]) {
+      const result = run(member, {}, { security, optimization: "O2" });
+      assert.equal(result.value, "member:1", security);
+      assert.equal(result.result.stats.codegen.inlining.hostIntrinsicCallSites, 0, security);
+    }
+    // A with-environment read resolves dynamically and must keep its result.
+    const withScope = "with ({ isNaN: function (x) { return \"with:\" + x; } }) { isNaN(1); }";
+    for (const security of ["sandbox", "trusted"]) {
+      assert.equal(run(withScope, {}, { security, optimization: "O2" }).value, "with:1", security);
+    }
+  });
+
+  it("calls through guest argument objects and arities like the mediated path", function () {
+    for (const security of ["sandbox", "trusted"]) {
+      const objects = run(
+        "[String({ toString: function () { return \"T\"; } }), Number({ valueOf: function () { return 7; } }), isNaN(Math), parseFloat(\"1.5\", 2, 3, 4, 5, 6)]",
+        {},
+        { security, optimization: "O2" }
+      );
+      assert.deepStrictEqual(objects.value, ["T", 7, true, 1.5], security);
+      // 6-arg calls keep the generic array fallback shape in sandbox mode.
+      if (security === "sandbox") {
+        assert.match(objects.result.code, /\$applySandbox\(/);
+      }
+    }
+  });
+
+  it("keeps the inline forms off kill-switched and non-O2 builds", function () {
+    const source = "isNaN(1);";
+    const killed = sandboxCompile(source, { optimization: "O2", inlineHostIntrinsics: false });
+    assert.doesNotMatch(killed.code, /\$[a-z0-9_]+\(\$[a-z0-9_]+\)/);
+    assert.match(killed.code, /\$applySandbox1\(\$r, /);
+    // O0/O1 compile no call helpers at all (interpreter `$r.call`), Os keeps
+    // the mediated helper but never the direct-call inline form.
+    for (const optimization of ["O0", "O1"]) {
+      const result = sandboxCompile(source, { optimization });
+      assert.doesNotMatch(result.code, /\$[a-z0-9_]+\(\$[a-z0-9_]+\)/);
+      assert.match(result.code, /\$r\.call\(\$f, 1\)/);
+    }
+    const os = sandboxCompile(source, { optimization: "Os" });
+    assert.doesNotMatch(os.code, /\$[a-z0-9_]+\(\$[a-z0-9_]+\)/);
+    assert.match(os.code, /\$applySandbox1\(\$r, /);
+    const trusted = compileProgram(source, { security: "trusted", runtimeModule, optimization: "O0" });
+    assert.doesNotMatch(trusted.code, /\$[a-z0-9_]+\(\$[a-z0-9_]+\)/);
+    assert.match(trusted.code, /\$r\.call\(\$f, 1\)/);
+  });
+});
+
+describe("sablejs inline member host intrinsics (Item 15)", function () {
+  function sandboxCompile(source, options = {}) {
+    return compileProgram(source, { security: "sandbox", runtimeModule, ...options });
+  }
+
+  it("emits identity-guarded direct calls for member intrinsics, sandbox only", function () {
+    const source = "function f(a) { a.push(1); return a.join(\",\"); } f;";
+    const sandbox = sandboxCompile(source, { optimization: "O2" });
+    // Identity guard against the imported raw prototype function, ambient
+    // probes per argument, and a direct Function.prototype.call arm that
+    // reuses the checked callee as the callable.
+    assert.match(sandbox.code, /\$[a-z0-9_]+ !== \$hostJoin/);
+    assert.match(sandbox.code, /\$[a-z0-9_]+ !== \$hostPush/);
+    // Direct arm through the sanitizing helper with the checked callee and
+    // the recorded receiver.
+    assert.match(sandbox.code, /: \$hostCall1\(\$[a-z0-9_]+, \$[a-z0-9_]+, /);
+    assert.match(sandbox.code, /boundary\.ambientValues\.has\(/);
+    assert.equal(sandbox.stats.codegen.inlining.memberIntrinsicCallSites, 2);
+    // Trusted keeps the $apply chain (the same measured decision as item 14).
+    const trusted = compileProgram(source, { security: "trusted", runtimeModule, optimization: "O2" });
+    assert.doesNotMatch(trusted.code, /\$hostJoin/);
+    assert.equal(trusted.stats.codegen.inlining.memberIntrinsicCallSites, 0);
+  });
+
+  it("guards the mutating members with the protected-receiver probe", function () {
+    const source = "function f(a, v) { a.push(v); a.sort(); return a; } f;";
+    const sandbox = sandboxCompile(source, { optimization: "O2" });
+    assert.equal(sandbox.stats.codegen.inlining.memberIntrinsicCallSites, 2);
+    assert.match(sandbox.code, /boundary\.protectedValues\.has\(/);
+    // Read-only members never emit the protected probe (the boundary
+    // classifies them pure and lets them run on protected receivers).
+    const readOnly = sandboxCompile("function f(s) { return s.slice(1); } f;", { optimization: "O2" });
+    assert.doesNotMatch(readOnly.code, /protectedValues\.has\(/);
+    assert.equal(readOnly.stats.codegen.inlining.memberIntrinsicCallSites, 1);
+  });
+
+  it("matches both prototypes for slice and indexOf", function () {
+    const source = "function f(a, s) { return [a.slice(1), a.indexOf(2), s.slice(1), s.indexOf(\"b\")]; } f([2, 3, 4], \"abc\");";
+    const sandbox = sandboxCompile(source, { optimization: "O2" });
+    assert.equal(sandbox.stats.codegen.inlining.memberIntrinsicCallSites, 4);
+    assert.match(sandbox.code, /\$hostSliceArray/);
+    assert.match(sandbox.code, /\$hostSliceString/);
+    assert.match(sandbox.code, /\$hostIndexOfArray/);
+    assert.match(sandbox.code, /\$hostIndexOfString/);
+    const result = run(source, {}, { security: "sandbox", optimization: "O2" });
+    assert.deepStrictEqual(result.value, [[3, 4], 0, "bc", 1]);
+  });
+
+  it("computes all eight members identically to the mediated path", function () {
+    const source =
+      "(function (a) { a.push(4); a.sort(); return [a.join(\",\"), a.slice(1), a.indexOf(4)]; })([3, 1, 2])" +
+      " + \"|\" + (function (s) { return [s.charAt(1), s.indexOf(\"b\", 2), s.slice(1, 3), s.replace(/b/, \"X\")]; })(\"abca\")" +
+      " + \"|\" + (function (s) { return s.replace(/a/, function (m) { return m + m; }); })(\"aba\")" +
+      " + \"|\" + (function (r, s) { return [r.test(s), r.test(\"nope\")]; })(/a/g, \"abca\")";
+    for (const optimization of ["O2", "O0"]) {
+      for (const security of ["sandbox", "trusted"]) {
+        const value = run(source, {}, { security, optimization });
+        const baseline = run(source, {}, { security, optimization, inlineMemberIntrinsics: false });
+        assert.deepStrictEqual(value.value, baseline.value, `${security} ${optimization}`);
+        // The O2 sandbox arm bypasses the boundary for every member call:
+        // zero hostCall mediations with profiling on, where the mediated
+        // baseline counts the full chain (4 calls × 2 invocations + 3
+        // stateless = 11).
+        if (optimization === "O2" && security === "sandbox") {
+          const profiled = run(source, {}, { security, optimization, profileBoundary: true });
+          const profiledBaseline = run(source, {}, {
+            security, optimization, inlineMemberIntrinsics: false, profileBoundary: true,
+          });
+          assert.equal(profiled.instance.boundaryStats().hostCalls, 0);
+          assert.equal(profiledBaseline.instance.boundaryStats().hostCalls, 12);
+          assert.ok(profiled.result.stats.codegen.inlining.memberIntrinsicCallSites > 0);
+        }
+      }
+    }
+  });
+
+  it("routes guest overrides, own or on the prototype chain, to the fallback", function () {
+    const own = "var o = { join: function () { return \"own\"; } }; o.join();";
+    const proto = "function C() {} C.prototype.join = function () { return \"proto\"; }; var o = new C(); o.join();";
+    const onObject = "var o = Object.create({ indexOf: function () { return 99; } }); o.indexOf(1);";
+    for (const security of ["sandbox", "trusted"]) {
+      assert.equal(run(own, {}, { security, optimization: "O2" }).value, "own", security);
+      assert.equal(run(proto, {}, { security, optimization: "O2" }).value, "proto", security);
+      assert.equal(run(onObject, {}, { security, optimization: "O2" }).value, 99, security);
+    }
+  });
+
+  it("keeps boundary semantics for protected receivers", function () {
+    // push on a shared intrinsic receiver must throw the same boundary error
+    // the mediated path throws (sandbox only — trusted has no boundary, and
+    // running it there would mutate the host's Array.prototype).
+    const mutating = "var p = Object.getPrototypeOf([]); p.push(1);";
+    assert.throws(() => run(mutating, {}, { security: "sandbox", optimization: "O2" }).value, /cannot modify a shared intrinsic/);
+    assert.throws(
+      () => run(mutating, {}, { security: "sandbox", optimization: "O2", inlineMemberIntrinsics: false }).value,
+      /cannot modify a shared intrinsic/
+    );
+    // Read-only members on protected receivers run exactly like the
+    // mediated path — join over a protected receiver's own elements is
+    // legal.
+    const readOnly = "Object.getPrototypeOf([]).join(\",\");";
+    for (const security of ["sandbox", "trusted"]) {
+      const value = run(readOnly, {}, { security, optimization: "O2" }).value;
+      const baseline = run(readOnly, {}, { security, optimization: "O2", inlineMemberIntrinsics: false }).value;
+      assert.deepStrictEqual(value, baseline, security);
+    }
+    // test on RegExp.prototype throws the identical sanitized error in
+    // both arms (it is classified pure, so no boundary error either way):
+    // same name and message, and — critically — not a raw host TypeError
+    // with its stack (the sanitization the direct arm must preserve).
+    const testOnPrototype = "Object.getPrototypeOf(/a/).test(\"a\");";
+    function caught(errorOptions, mode) {
+      try {
+        run(testOnPrototype, {}, { security: mode, optimization: "O2", ...errorOptions }).value;
+        return null;
+      } catch (error) {
+        return {
+          name: error.name,
+          message: error.message,
+          sanitized: !(error instanceof TypeError) && typeof error.stack !== "string",
+        };
+      }
+    }
+    for (const security of ["sandbox", "trusted"]) {
+      assert.deepStrictEqual(caught({}, security), caught({ inlineMemberIntrinsics: false }, security), security);
+      // The sanitization promise is the sandbox's; trusted has no boundary
+      // and surfaces the raw host error in both arms.
+      if (security === "sandbox") assert.ok(caught({}, security).sanitized, security);
+    }
+  });
+
+  it("evaluates accessor members exactly once", function () {
+    const source =
+      "var count = 0; var o = {}; Object.defineProperty(o, \"join\", { get: function () { count += 1; return Array.prototype.join; } }); " +
+      "o.join(\",\"); count;";
+    const value = run(source, {}, { security: "sandbox", optimization: "O2" });
+    assert.equal(value.value, 1);
+  });
+
+  it("calls through guest argument objects like the mediated path", function () {
+    const source =
+      "var o = [1, 2]; var f = o.join; [f.call(o), (function () { var a = [1, 2]; return a.join.call(a, \"-\"); })()]";
+    for (const security of ["sandbox", "trusted"]) {
+      assert.deepStrictEqual(run(source, {}, { security, optimization: "O2" }).value, ["1,2", "1-2"], security);
+    }
+    // Sort with a guest comparator runs it unmediated in both paths.
+    const sort = "[3, 1, 2].sort(function (a, b) { return a - b; })";
+    for (const security of ["sandbox", "trusted"]) {
+      assert.deepStrictEqual(run(sort, {}, { security, optimization: "O2" }).value, [1, 2, 3], security);
+    }
+  });
+
+  it("keeps the inline forms off kill-switched, non-O2, and non-sandbox builds", function () {
+    const source = "function f(a) { a.push(1); } f;";
+    const killed = sandboxCompile(source, { optimization: "O2", inlineMemberIntrinsics: false });
+    assert.doesNotMatch(killed.code, /\$hostPush/);
+    assert.match(killed.code, /\$applySandbox1\(\$r, /);
+    assert.equal(killed.stats.codegen.inlining.memberIntrinsicCallSites, 0);
+    for (const optimization of ["O0", "O1", "Os"]) {
+      const result = sandboxCompile(source, { optimization });
+      assert.equal(result.stats.codegen.inlining.memberIntrinsicCallSites, 0, optimization);
+    }
+    const trusted = compileProgram(source, { security: "trusted", runtimeModule, optimization: "O2" });
+    assert.doesNotMatch(trusted.code, /\$hostPush/);
+  });
+
+  it("recovers flushed member-call operands across a control region (item 15b)", function () {
+    // A control-flow region between the operand pushes and the CALL — the
+    // ternary inside the object-literal argument — flushes callable,
+    // receiver, object, and key onto $s. The O2 emitter mirrors $s, recovers
+    // the tail by name, and emits the same inline with a $s trim in place of
+    // the dispatch. The recovery is O2-gated like the rest of item 15.
+    const source =
+      "var a = []; for (var i = 0; i < 500; i++) { a.push({ id: i, tag: i % 2 ? \"x\" : \"y\" }); } a.length;";
+    const on = run(source, {}, { security: "sandbox", optimization: "O2" });
+    const off = run(source, {}, { security: "sandbox", optimization: "O2", inlineMemberIntrinsics: false });
+    assert.equal(on.value, 500);
+    assert.deepStrictEqual(on.value, off.value);
+    assert.ok(on.result.stats.codegen.inlining.memberIntrinsicCallSites >= 1);
+    assert.equal(off.result.stats.codegen.inlining.memberIntrinsicCallSites, 0);
+    // The recovered inline trims $s by the call's operands (count + 2).
+    const compiled = sandboxCompile(source, { optimization: "O2" });
+    assert.match(compiled.code, /\$hostCall1\(/);
+    assert.match(compiled.code, /\$s\.length -= 3;/);
+    // The trim keeps the frame's references in lockstep, so boundary
+    // profiling stays exact on the recovered path.
+    const profiled = run(source, {}, { security: "sandbox", optimization: "O2", profileBoundary: true });
+    assert.equal(profiled.instance.boundaryStats().hostCalls, 0);
+  });
+
+  it("keeps branch-flushed argument values on the mediated dispatch (item 15b)", function () {
+    // When the call argument itself is the exclusive branch value, the
+    // mirror holds only a placeholder for it — the recovery must miss and
+    // the dispatch must produce the alternating values, never a stale
+    // branch constant.
+    const source = "var a = []; for (var i = 0; i < 6; i++) { a.push(i % 2 ? \"x\" : \"y\"); } a.join(\":\");";
+    for (const security of ["sandbox", "trusted"]) {
+      const value = run(source, {}, { security, optimization: "O2" }).value;
+      const baseline = run(source, {}, { security, optimization: "O2", inlineMemberIntrinsics: false }).value;
+      assert.deepStrictEqual(value, baseline, security);
+    }
+    assert.equal(run(source, {}, { security: "sandbox", optimization: "O2" }).value, "y:x:y:x:y:x");
   });
 });
 

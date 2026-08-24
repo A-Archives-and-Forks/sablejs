@@ -4,9 +4,9 @@ const {
   captureArgumentsObject: CAPTURE_ARGUMENTS_OBJECT,
   writePropertyValue: HOST_WRITE_SLOPPY_PROPERTY_VALUE,
 } = require("./sloppy");
-const { SandboxBoundary, capability } = require("./security");
+const { SandboxBoundary, capability, sanitizeHostError } = require("./security");
 
-const ABI_VERSION = "2.0.0-aot.3";
+const ABI_VERSION = "2.0.0-aot.5";
 const EMPTY = Symbol("sable.empty");
 // Brand for REFVAR/PUTVAR reference tokens; a with/catch object can never
 // hold this module-private symbol, so token identity is unambiguous.
@@ -14,8 +14,48 @@ const REF_TOKEN = Symbol("sable.reference");
 const ARRAY_PUSH = Array.prototype.push;
 const ARRAY_POP = Array.prototype.pop;
 const ARRAY_SPLICE = Array.prototype.splice;
+const ARRAY_SLICE = Array.prototype.slice;
 const ARRAY_FROM = Array.from;
 const ARRAY_IS_ARRAY = Array.isArray;
+// Item 15: raw prototype functions exported so generated code can compare a
+// member-call callee against them by identity. These must be the unbound
+// prototype functions — the guest-visible resolved method of `o.join()` is
+// exactly Array.prototype.join, so only the raw object matches.
+const arrayPrototypeJoin = Array.prototype.join;
+const arrayPrototypePush = Array.prototype.push;
+const arrayPrototypeSort = Array.prototype.sort;
+const arrayPrototypeSlice = Array.prototype.slice;
+const arrayPrototypeIndexOf = Array.prototype.indexOf;
+const stringPrototypeCharAt = String.prototype.charAt;
+const stringPrototypeIndexOf = String.prototype.indexOf;
+const stringPrototypeSlice = String.prototype.slice;
+const stringPrototypeReplace = String.prototype.replace;
+const regexpPrototypeTest = RegExp.prototype.test;
+// Item 15: direct-call arms of the inlined host intrinsics (items 14/15).
+// They run the checked callee with the given receiver and fixed arguments
+// (V8's call-apply elimination folds FUNCTION_CALL.call into a direct call)
+// and sanitize any thrown error exactly like the boundary's applyHost, so a
+// throwing intrinsic is observationally identical to the mediated path —
+// the guest sees the same error class, message, and (absent) stack instead
+// of a raw host error that would leak host frames.
+function hostCallIntrinsic0(target, thisValue) {
+  try { return FUNCTION_CALL.call(target, thisValue); } catch (error) { throw sanitizeHostError(error); }
+}
+function hostCallIntrinsic1(target, thisValue, a) {
+  try { return FUNCTION_CALL.call(target, thisValue, a); } catch (error) { throw sanitizeHostError(error); }
+}
+function hostCallIntrinsic2(target, thisValue, a, b) {
+  try { return FUNCTION_CALL.call(target, thisValue, a, b); } catch (error) { throw sanitizeHostError(error); }
+}
+function hostCallIntrinsic3(target, thisValue, a, b, c) {
+  try { return FUNCTION_CALL.call(target, thisValue, a, b, c); } catch (error) { throw sanitizeHostError(error); }
+}
+function hostCallIntrinsic4(target, thisValue, a, b, c, d) {
+  try { return FUNCTION_CALL.call(target, thisValue, a, b, c, d); } catch (error) { throw sanitizeHostError(error); }
+}
+function hostCallIntrinsic5(target, thisValue, a, b, c, d, e) {
+  try { return FUNCTION_CALL.call(target, thisValue, a, b, c, d, e); } catch (error) { throw sanitizeHostError(error); }
+}
 const ARRAY_FOR_EACH = Function.call.bind(Array.prototype.forEach);
 const ARRAY_INDEX_OF = Function.call.bind(Array.prototype.indexOf);
 const ARRAY_LAST_INDEX_OF = Function.call.bind(Array.prototype.lastIndexOf);
@@ -29,6 +69,7 @@ const OBJECT_SET_PROTOTYPE_OF = Object.setPrototypeOf;
 const HAS_OWN_PROPERTY = Function.call.bind(Object.prototype.hasOwnProperty);
 const REFLECT_APPLY = Reflect.apply;
 const REFLECT_CONSTRUCT = Reflect.construct;
+const FUNCTION_CALL = Function.prototype.call;
 const REFLECT_DEFINE_PROPERTY = Reflect.defineProperty;
 const REFLECT_DELETE_PROPERTY = Reflect.deleteProperty;
 const REFLECT_GET = Reflect.get;
@@ -38,7 +79,38 @@ const ARRAY_PROTOTYPE = Array.prototype;
 const OBJECT_PROTOTYPE = Object.prototype;
 const OBJECT_DEFINE_GETTER = Object.prototype.__defineGetter__;
 const OBJECT_DEFINE_SETTER = Object.prototype.__defineSetter__;
+const REFLECT_SET_PROTOTYPE_OF = Reflect.setPrototypeOf;
 let indexedPrototypeUnsafe = false;
+// Object-literal initialization must create own data properties without
+// consulting inherited accessors (ES5.1 11.1.5 -> CreateDataProperty). Once
+// any accessor is installed on Array.prototype/Object.prototype, any chain
+// swap of the two is performed, or any key of a literal is __proto__, the
+// fast assignment path would observe the prototype (an inherited accessor
+// without a setter throws in the strict runtime module), so it falls back
+// to defineData for the rest of the process. Setters cannot be installed by
+// sandboxed programs (the intrinsic graph is protected), so sandbox runs
+// stay on the fast path.
+let prototypeSetterUnsafe = false;
+
+// The two built-in prototypes are captured at module load; a host that
+// installed accessors on them before loading the runtime must disable the
+// fast path too. Object.prototype's own __proto__ accessor is excluded —
+// the initProperty key check already routes __proto__ keys to defineData,
+// and the accessor at that key affects only __proto__ writes.
+(function scanPrototypeAccessors() {
+  for (const proto of [OBJECT_PROTOTYPE, ARRAY_PROTOTYPE]) {
+    const keys = REFLECT_OWN_KEYS(proto);
+    for (let i = 0; i < keys.length; i += 1) {
+      const key = keys[i];
+      if (typeof key !== "string" || key === "__proto__") continue;
+      const descriptor = OBJECT_GET_OWN_PROPERTY_DESCRIPTOR(proto, key);
+      if (descriptor && (HAS_OWN_PROPERTY(descriptor, "get") || HAS_OWN_PROPERTY(descriptor, "set"))) {
+        prototypeSetterUnsafe = true;
+        return;
+      }
+    }
+  }
+})();
 
 function dataDescriptor(value, writable, enumerable, configurable) {
   const descriptor = OBJECT_CREATE(null);
@@ -82,10 +154,17 @@ function defineAccessor(object, key, getter, setter, enumerable, configurable) {
   );
 }
 
+// The internal-array chain is null-based: guest code can never install
+// index accessors on it, so runtime-owned writes through the chain are
+// immune to Array.prototype/Object.prototype pollution. slice is needed by
+// the boundary's argument securing paths, which receive internal arrays as
+// call args (call()/construct() collect them there rather than on a plain
+// Array whose prototype a guest may have polluted).
 const INTERNAL_ARRAY_PROTO = OBJECT_CREATE(null);
 defineData(INTERNAL_ARRAY_PROTO, "push", ARRAY_PUSH, false, false, false);
 defineData(INTERNAL_ARRAY_PROTO, "pop", ARRAY_POP, false, false, false);
 defineData(INTERNAL_ARRAY_PROTO, "splice", ARRAY_SPLICE, false, false, false);
+defineData(INTERNAL_ARRAY_PROTO, "slice", ARRAY_SLICE, false, false, false);
 
 function createIsolatedArray(length = 0) {
   const array = new Array(length);
@@ -109,19 +188,41 @@ function affectsInternalArraySlots(key) {
   return Number.isInteger(index) && index >= 0 && index < 0xffffffff && String(index) === text;
 }
 
+// Any accessor descriptor — an own "get" key, an own "set" key (even set
+// to undefined), or both — makes plain assignment observe the prototype:
+// [[Put]] through an inherited accessor with no setter throws in strict
+// mode and silently fails in sloppy mode, so literal init must not assign.
+function isAccessorDescriptor(descriptor) {
+  return descriptor && (HAS_OWN_PROPERTY(descriptor, "get") || HAS_OWN_PROPERTY(descriptor, "set"));
+}
+
 function observePrototypeMutation(callable, thisValue, args) {
   if ((callable === OBJECT_DEFINE_PROPERTY || callable === REFLECT_DEFINE_PROPERTY) &&
-      isIndexedPrototype(args[0]) && affectsInternalArraySlots(args[1])) {
-    indexedPrototypeUnsafe = true;
+      isIndexedPrototype(args[0])) {
+    if (affectsInternalArraySlots(args[1])) indexedPrototypeUnsafe = true;
+    if (isAccessorDescriptor(args[2])) prototypeSetterUnsafe = true;
   } else if (callable === OBJECT_DEFINE_PROPERTIES && isIndexedPrototype(args[0]) && args[1]) {
     ARRAY_FOR_EACH(REFLECT_OWN_KEYS(args[1]), (key) => {
+      const descriptor = args[1][key];
       if (affectsInternalArraySlots(key)) indexedPrototypeUnsafe = true;
+      if (isAccessorDescriptor(descriptor)) prototypeSetterUnsafe = true;
     });
-  } else if (callable === OBJECT_SET_PROTOTYPE_OF && isIndexedPrototype(args[0])) {
+  } else if ((callable === OBJECT_SET_PROTOTYPE_OF || callable === REFLECT_SET_PROTOTYPE_OF) &&
+             isIndexedPrototype(args[0])) {
     indexedPrototypeUnsafe = true;
+    prototypeSetterUnsafe = true;
   } else if ((callable === OBJECT_DEFINE_GETTER || callable === OBJECT_DEFINE_SETTER) &&
-             isIndexedPrototype(thisValue) && affectsInternalArraySlots(args[0])) {
-    indexedPrototypeUnsafe = true;
+             isIndexedPrototype(thisValue)) {
+    if (affectsInternalArraySlots(args[0])) indexedPrototypeUnsafe = true;
+    // __defineGetter__ installs a getter-only accessor; assignment through
+    // it has no setter to call, so literal init must not assign either.
+    prototypeSetterUnsafe = true;
+  } else if (callable === REFLECT_SET &&
+             (isIndexedPrototype(args[0]) || isIndexedPrototype(args[3]))) {
+    // Reflect.set writes through its receiver (defaults to the target); a
+    // __proto__ write invokes the host accessor and swaps the chain.
+    if (args[1] === "__proto__") prototypeSetterUnsafe = true;
+    else if (affectsInternalArraySlots(args[1])) indexedPrototypeUnsafe = true;
   }
 }
 
@@ -285,12 +386,25 @@ function writePropertyValue(frame, object, key, value) {
 }
 
 function writeStrictPropertyValue(object, key, value, runtime, frame) {
-  if (isIndexedPrototype(object) && affectsInternalArraySlots(key)) {
-    indexedPrototypeUnsafe = true;
-    if (runtime && frame) runtime.hardenFastFrameChain(frame);
+  if (isIndexedPrototype(object)) {
+    if (affectsInternalArraySlots(key)) {
+      indexedPrototypeUnsafe = true;
+      if (runtime && frame) runtime.hardenFastFrameChain(frame);
+    }
+    // Writing __proto__ on either prototype invokes Object.prototype's own
+    // accessor and swaps the chain that literal init consults.
+    if (key === "__proto__") prototypeSetterUnsafe = true;
   }
   object[key] = value;
   return value;
+}
+
+// Sloppy writes must keep silent-failure semantics, so they stay a call
+// into the deliberately non-strict writer; the __proto__ swap check rides
+// on the same call (V8 inlines this thin wrapper).
+function writeSloppyPropertyValue(object, key, value) {
+  if (isIndexedPrototype(object) && key === "__proto__") prototypeSetterUnsafe = true;
+  return HOST_WRITE_SLOPPY_PROPERTY_VALUE(object, key, value);
 }
 
 function findBindingValue(runtime, frame, name) {
@@ -428,9 +542,151 @@ function setGuestPropertyValue(runtime, frame, object, key, value) {
   return writePropertyValue(frame, object, key, stored);
 }
 
+// Sandbox call dispatch. The codegen calls the arity-specialized variant
+// matching the call site's static argument count, so a guest call never
+// builds an args array: the captured Function.prototype.call forwards the
+// fixed arguments without materializing a list (V8 lowers `.call` on a
+// plain callee to a direct call). Measured against the alternatives on
+// Richards (2026-08-23): a per-site membership memo was a ~20% regression
+// (V8's native WeakSet.has beats a manual array memo — 8.4 ns vs 15.7 ns
+// per hit), while the WeakSet probe itself is the cheap half of dispatch;
+// the win came from collapsing the guest fast path into the dispatch
+// function and dropping the per-call array allocation. Non-guest callables
+// fall back to boundary.call with a lazily built array; that path also
+// serves arities above the specialized range.
+function applySandboxValue0(runtime, callable, thisValue) {
+  const boundary = runtime.boundary;
+  if (boundary.guestFunctions.has(callable)) {
+    boundary.count("calls");
+    boundary.count("guestCalls");
+    const previousEntries = boundary.pendingGuestEntries;
+    boundary.pendingGuestEntries += 1;
+    try {
+      return FUNCTION_CALL.call(callable, thisValue);
+    } finally {
+      boundary.pendingGuestEntries = previousEntries;
+    }
+  }
+  if (typeof callable !== "function") {
+    throw new TypeError(`${String(callable)} is not a function`);
+  }
+  return boundary.call(callable, thisValue, []);
+}
+
+function applySandboxValue1(runtime, callable, thisValue, a0) {
+  const boundary = runtime.boundary;
+  if (boundary.guestFunctions.has(callable)) {
+    boundary.count("calls");
+    boundary.count("guestCalls");
+    const previousEntries = boundary.pendingGuestEntries;
+    boundary.pendingGuestEntries += 1;
+    try {
+      return FUNCTION_CALL.call(callable, thisValue, a0);
+    } finally {
+      boundary.pendingGuestEntries = previousEntries;
+    }
+  }
+  if (typeof callable !== "function") {
+    throw new TypeError(`${String(callable)} is not a function`);
+  }
+  return boundary.call(callable, thisValue, [a0]);
+}
+
+function applySandboxValue2(runtime, callable, thisValue, a0, a1) {
+  const boundary = runtime.boundary;
+  if (boundary.guestFunctions.has(callable)) {
+    boundary.count("calls");
+    boundary.count("guestCalls");
+    const previousEntries = boundary.pendingGuestEntries;
+    boundary.pendingGuestEntries += 1;
+    try {
+      return FUNCTION_CALL.call(callable, thisValue, a0, a1);
+    } finally {
+      boundary.pendingGuestEntries = previousEntries;
+    }
+  }
+  if (typeof callable !== "function") {
+    throw new TypeError(`${String(callable)} is not a function`);
+  }
+  return boundary.call(callable, thisValue, [a0, a1]);
+}
+
+function applySandboxValue3(runtime, callable, thisValue, a0, a1, a2) {
+  const boundary = runtime.boundary;
+  if (boundary.guestFunctions.has(callable)) {
+    boundary.count("calls");
+    boundary.count("guestCalls");
+    const previousEntries = boundary.pendingGuestEntries;
+    boundary.pendingGuestEntries += 1;
+    try {
+      return FUNCTION_CALL.call(callable, thisValue, a0, a1, a2);
+    } finally {
+      boundary.pendingGuestEntries = previousEntries;
+    }
+  }
+  if (typeof callable !== "function") {
+    throw new TypeError(`${String(callable)} is not a function`);
+  }
+  return boundary.call(callable, thisValue, [a0, a1, a2]);
+}
+
+function applySandboxValue4(runtime, callable, thisValue, a0, a1, a2, a3) {
+  const boundary = runtime.boundary;
+  if (boundary.guestFunctions.has(callable)) {
+    boundary.count("calls");
+    boundary.count("guestCalls");
+    const previousEntries = boundary.pendingGuestEntries;
+    boundary.pendingGuestEntries += 1;
+    try {
+      return FUNCTION_CALL.call(callable, thisValue, a0, a1, a2, a3);
+    } finally {
+      boundary.pendingGuestEntries = previousEntries;
+    }
+  }
+  if (typeof callable !== "function") {
+    throw new TypeError(`${String(callable)} is not a function`);
+  }
+  return boundary.call(callable, thisValue, [a0, a1, a2, a3]);
+}
+
+function applySandboxValue5(runtime, callable, thisValue, a0, a1, a2, a3, a4) {
+  const boundary = runtime.boundary;
+  if (boundary.guestFunctions.has(callable)) {
+    boundary.count("calls");
+    boundary.count("guestCalls");
+    const previousEntries = boundary.pendingGuestEntries;
+    boundary.pendingGuestEntries += 1;
+    try {
+      return FUNCTION_CALL.call(callable, thisValue, a0, a1, a2, a3, a4);
+    } finally {
+      boundary.pendingGuestEntries = previousEntries;
+    }
+  }
+  if (typeof callable !== "function") {
+    throw new TypeError(`${String(callable)} is not a function`);
+  }
+  return boundary.call(callable, thisValue, [a0, a1, a2, a3, a4]);
+}
+
+// Generic array form: arities above 5, and the pre-arity-specialized entry
+// point retained for callers outside the codegen hot path.
 function applySandboxValue(runtime, callable, thisValue, args) {
-  if (typeof callable !== "function") throw new TypeError(`${String(callable)} is not a function`);
-  return runtime.boundary.call(callable, thisValue, args);
+  const boundary = runtime.boundary;
+  if (boundary.guestFunctions.has(callable)) {
+    boundary.count("calls");
+    boundary.count("guestCalls");
+    const previousEntries = boundary.pendingGuestEntries;
+    boundary.pendingGuestEntries += 1;
+    try {
+      return REFLECT_APPLY(callable, thisValue, args);
+    } finally {
+      boundary.pendingGuestEntries = previousEntries;
+    }
+  }
+  if (typeof callable !== "function") {
+    throw new TypeError(`${String(callable)} is not a function`);
+  }
+  return boundary.call(callable, thisValue, args);
 }
 
 function constructSandboxValue(runtime, constructor, args) {
@@ -438,6 +694,114 @@ function constructSandboxValue(runtime, constructor, args) {
     throw new TypeError(`${String(constructor)} is not a constructor`);
   }
   return runtime.boundary.construct(constructor, args);
+}
+
+// Arity-specialized sandbox construct dispatch, the `new` analog of
+// applySandboxValueN: the callee-side variant matches the static argument
+// count, so guest constructions never allocate an args array — `new`
+// forwards the fixed arguments directly, and the pendingGuestEntries
+// counter keeps the compiled closure's prologue from re-securing values
+// already inside guest space. `new` on a guest closure is exactly
+// Reflect.construct (both set new.target, build the fresh `this` with
+// `constructor.prototype`, and run the closure's construct-as-call return
+// rule), so the fast path is behavior-preserving. Non-guest constructors
+// (wrappers, protected intrinsics, host functions) fall back to the generic
+// boundary path with a lazily built array; that path also serves arities
+// above the specialized range.
+function constructSandboxValue0(runtime, constructor) {
+  const boundary = runtime.boundary;
+  if (boundary.guestFunctions.has(constructor)) {
+    boundary.count("constructs");
+    boundary.count("guestConstructs");
+    const previousEntries = boundary.pendingGuestEntries;
+    boundary.pendingGuestEntries += 1;
+    try {
+      return new constructor();
+    } finally {
+      boundary.pendingGuestEntries = previousEntries;
+    }
+  }
+  return constructSandboxValue(runtime, constructor, []);
+}
+
+function constructSandboxValue1(runtime, constructor, a0) {
+  const boundary = runtime.boundary;
+  if (boundary.guestFunctions.has(constructor)) {
+    boundary.count("constructs");
+    boundary.count("guestConstructs");
+    const previousEntries = boundary.pendingGuestEntries;
+    boundary.pendingGuestEntries += 1;
+    try {
+      return new constructor(a0);
+    } finally {
+      boundary.pendingGuestEntries = previousEntries;
+    }
+  }
+  return constructSandboxValue(runtime, constructor, [a0]);
+}
+
+function constructSandboxValue2(runtime, constructor, a0, a1) {
+  const boundary = runtime.boundary;
+  if (boundary.guestFunctions.has(constructor)) {
+    boundary.count("constructs");
+    boundary.count("guestConstructs");
+    const previousEntries = boundary.pendingGuestEntries;
+    boundary.pendingGuestEntries += 1;
+    try {
+      return new constructor(a0, a1);
+    } finally {
+      boundary.pendingGuestEntries = previousEntries;
+    }
+  }
+  return constructSandboxValue(runtime, constructor, [a0, a1]);
+}
+
+function constructSandboxValue3(runtime, constructor, a0, a1, a2) {
+  const boundary = runtime.boundary;
+  if (boundary.guestFunctions.has(constructor)) {
+    boundary.count("constructs");
+    boundary.count("guestConstructs");
+    const previousEntries = boundary.pendingGuestEntries;
+    boundary.pendingGuestEntries += 1;
+    try {
+      return new constructor(a0, a1, a2);
+    } finally {
+      boundary.pendingGuestEntries = previousEntries;
+    }
+  }
+  return constructSandboxValue(runtime, constructor, [a0, a1, a2]);
+}
+
+function constructSandboxValue4(runtime, constructor, a0, a1, a2, a3) {
+  const boundary = runtime.boundary;
+  if (boundary.guestFunctions.has(constructor)) {
+    boundary.count("constructs");
+    boundary.count("guestConstructs");
+    const previousEntries = boundary.pendingGuestEntries;
+    boundary.pendingGuestEntries += 1;
+    try {
+      return new constructor(a0, a1, a2, a3);
+    } finally {
+      boundary.pendingGuestEntries = previousEntries;
+    }
+  }
+  return constructSandboxValue(runtime, constructor, [a0, a1, a2, a3]);
+}
+
+function constructSandboxValue5(runtime, constructor, a0, a1, a2, a3, a4) {
+  const boundary = runtime.boundary;
+  if (boundary.guestFunctions.has(constructor)) {
+    boundary.count("constructs");
+    boundary.count("guestConstructs");
+    const previousEntries = boundary.pendingGuestEntries;
+    boundary.pendingGuestEntries += 1;
+    try {
+      return new constructor(a0, a1, a2, a3, a4);
+    } finally {
+      boundary.pendingGuestEntries = previousEntries;
+    }
+  }
+  return constructSandboxValue(runtime, constructor, [a0, a1, a2, a3, a4]);
 }
 
 function invokeCompiledFunction(
@@ -578,10 +942,23 @@ class RuntimeInstance {
       for (let index = 0; index < metadata.parameterCount; index += 1) {
         frame.locals[index + 1] = args[index];
       }
+      // Receiver-write classification stamp: computed once on the secured,
+      // boxed receiver (thisValue arrived post-secure and post-box), so
+      // sandbox writes to `this` skip per-write writeTarget resolution. The
+      // underlying WeakMaps are monotone with respect to the receiver, so
+      // the stamp cannot go stale mid-call.
+      if (metadata.usesThisWrites && this.boundary) {
+        frame.thisIsGuest = this.boundary.isUnmediatedWriteTarget(thisValue);
+      }
       return frame;
     }
     const references = metadata.fastFrame ? createFastArray() : createInternalArray();
-    const stack = metadata.fastFrame ? createFastArray() : createInternalArray(0, {
+    // The receiver-marks mirror only matters when a with-environment can be
+    // reached (the sole writers are getLocal/getVar on withBase bindings, and
+    // the sole reader is the this-restore in call()). Scopes with no with in
+    // their static ancestor chain can never see an object environment, so
+    // their stacks stay plain and every push/pop is a native array op.
+    const stack = metadata.fastFrame ? createFastArray() : createInternalArray(0, metadata.withMarks ? {
         onPush(count) {
           for (let index = 0; index < count; index += 1) references.push(null);
         },
@@ -594,7 +971,7 @@ class RuntimeInstance {
             references.splice(start + index - 2, 0, null);
           }
         },
-      });
+      } : null);
     const frame = {
       metadata,
       stack,
@@ -639,6 +1016,10 @@ class RuntimeInstance {
         true,
         false
       );
+    }
+    // Receiver-write classification stamp (see the leafFrame branch above).
+    if (metadata.usesThisWrites && this.boundary) {
+      frame.thisIsGuest = this.boundary.isUnmediatedWriteTarget(thisValue);
     }
     return frame;
   }
@@ -1020,7 +1401,17 @@ class RuntimeInstance {
       const index = Number(key);
       if (Number.isInteger(index) && index >= object.length) object.length = index + 1;
     } else if (value !== EMPTY) {
-      defineData(object, key, value, true, true, true);
+      // The literal object is fresh (no own accessors, extensible, chained
+      // only to Array.prototype/Object.prototype), so a plain assignment
+      // creates the same own data property as defineData — except when an
+      // inherited setter exists (prototypeSetterUnsafe) or the key is
+      // __proto__ (host Object.prototype's own accessor). Object-literal
+      // semantics must bypass both, so those stay on defineData.
+      if (key !== "__proto__" && !prototypeSetterUnsafe) {
+        object[key] = value;
+      } else {
+        defineData(object, key, value, true, true, true);
+      }
     }
   }
 
@@ -1206,11 +1597,24 @@ class RuntimeInstance {
   }
 
   call(frame, count) {
-    const callableIndex = frame.stack.length - count - 2;
-    const referenceThis = frame.references[callableIndex];
-    const args = frame.stack.splice(frame.stack.length - count, count);
-    let thisValue = frame.stack.pop();
-    const callable = frame.stack.pop();
+    const stack = frame.stack;
+    const references = frame.references;
+    const length = stack.length;
+    const callableIndex = length - count - 2;
+    const referenceThis = references[callableIndex];
+    const argsStart = length - count;
+    // Args are collected on the isolated internal-array chain: index writes
+    // must not walk a guest-polluted Array.prototype (a getter-only or
+    // read-only accessor on an index would throw where splice used to define).
+    const args = createInternalArray(count);
+    for (let index = 0; index < count; index += 1) args[index] = stack[argsStart + index];
+    let thisValue = stack[argsStart - 1];
+    const callable = stack[callableIndex];
+    // Consume the args + receiver + callee slots by trimming instead of
+    // splicing: no element shifts, no hooked splice. references keeps the
+    // same parallel trim, and later pushes overwrite the stale slots.
+    stack.length = callableIndex;
+    references.length = callableIndex;
     if (thisValue === undefined && referenceThis !== null && referenceThis !== undefined) {
       thisValue = referenceThis;
     }
@@ -1227,8 +1631,19 @@ class RuntimeInstance {
     }
   }
   construct(frame, count) {
-    const args = frame.stack.splice(frame.stack.length - count, count);
-    const constructor = frame.stack.pop();
+    const stack = frame.stack;
+    const references = frame.references;
+    const length = stack.length;
+    const argsStart = length - count;
+    const constructorIndex = length - count - 1;
+    // Args are collected on the isolated internal-array chain: index writes
+    // must not walk a guest-polluted Array.prototype (a getter-only or
+    // read-only accessor on an index would throw where splice used to define).
+    const args = createInternalArray(count);
+    for (let index = 0; index < count; index += 1) args[index] = stack[argsStart + index];
+    const constructor = stack[constructorIndex];
+    stack.length = constructorIndex;
+    references.length = constructorIndex;
     if (typeof constructor !== "function") throw new TypeError(`${String(constructor)} is not a constructor`);
     if ((constructor === Function || (this.boundary && this.boundary.isFunctionConstructor(constructor))) &&
         count === 1 && frame.metadata.dynamicFunctions.length) {
@@ -1333,26 +1748,61 @@ module.exports = {
   ABI_VERSION,
   RuntimeInstance,
   capability,
+  arrayPrototypeIndexOf,
+  arrayPrototypeJoin,
+  arrayPrototypePush,
+  arrayPrototypeSlice,
+  arrayPrototypeSort,
   applySandboxValue,
+  applySandboxValue0,
+  applySandboxValue1,
+  applySandboxValue2,
+  applySandboxValue3,
+  applySandboxValue4,
+  applySandboxValue5,
   applyValue,
   constructSandboxValue,
+  constructSandboxValue0,
+  constructSandboxValue1,
+  constructSandboxValue2,
+  constructSandboxValue3,
+  constructSandboxValue4,
+  constructSandboxValue5,
   constructValue,
   createProgram,
   deleteGlobalVariableValue,
   deleteVariableValue,
   getArgumentsValue,
   getSandboxPropertyValue,
+  hostCallIntrinsic0,
+  hostCallIntrinsic1,
+  hostCallIntrinsic2,
+  hostCallIntrinsic3,
+  hostCallIntrinsic4,
+  hostCallIntrinsic5,
   initializeCompiledFunction,
+  isPrototypeSetterUnsafe,
   instanceOfTarget,
   invokeCompiledFunction,
   readGlobalVariableValue,
   readVariableValue,
+  regexpPrototypeTest,
   setArgumentsValue,
   setGuestPropertyValue,
   setSandboxPropertyValue,
+  stringPrototypeCharAt,
+  stringPrototypeIndexOf,
+  stringPrototypeReplace,
+  stringPrototypeSlice,
   writeGlobalVariableValue,
   writeVariableValue,
   writePropertyValue,
-  writeSloppyPropertyValue: HOST_WRITE_SLOPPY_PROPERTY_VALUE,
+  writeSloppyPropertyValue,
   writeStrictPropertyValue,
 };
+
+// Item 13: generated code calls this once per inlined literal init; it reads
+// the live monotone flag (a plain data property on exports would go stale
+// when the flag flips mid-run, and the generated code's $r is the runtime
+// instance, not this module).
+function isPrototypeSetterUnsafe() { return prototypeSetterUnsafe; }

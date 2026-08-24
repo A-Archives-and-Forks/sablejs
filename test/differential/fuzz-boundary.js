@@ -83,7 +83,7 @@ class BoundaryGenerator {
     ]);
   }
 
-  valueExpr(depth) {
+  valueExpr(depth, callables) {
     const random = this.random;
     if (depth <= 0 || random() < 0.3) {
       const kind = Math.floor(random() * 6);
@@ -97,51 +97,58 @@ class BoundaryGenerator {
     switch (kind) {
       case 0: {
         const operator = pick(random, ["+", "-", "*", "<", ">", "==", "===", "!=", "!==", "&&", "||"]);
-        return `(${this.valueExpr(depth - 1)} ${operator} ${this.valueExpr(depth - 1)})`;
+        return `(${this.valueExpr(depth - 1, callables)} ${operator} ${this.valueExpr(depth - 1, callables)})`;
       }
       case 1:
-        return `(${pick(random, ["!", "-", "typeof "])}${this.valueExpr(depth - 1)})`;
+        return `(${pick(random, ["!", "-", "typeof "])}${this.valueExpr(depth - 1, callables)})`;
       case 2:
-        return `[${this.valueExpr(depth - 1)}, ${this.valueExpr(depth - 1)}, ${this.valueExpr(depth - 1)}]`;
+        return `[${this.valueExpr(depth - 1, callables)}, ${this.valueExpr(depth - 1, callables)}, ${this.valueExpr(depth - 1, callables)}]`;
       case 3:
-        return `({ a: ${this.valueExpr(depth - 1)}, b: ${this.valueExpr(depth - 1)} })`;
+        return `({ a: ${this.valueExpr(depth - 1, callables)}, b: ${this.valueExpr(depth - 1, callables)} })`;
       case 4:
-        return `(${this.valueExpr(depth - 1)} ? ${this.valueExpr(depth - 1)} : ${this.valueExpr(depth - 1)})`;
+        return `(${this.valueExpr(depth - 1, callables)} ? ${this.valueExpr(depth - 1, callables)} : ${this.valueExpr(depth - 1, callables)})`;
       case 5:
         return `(new Proxy(input, { get: function (t, k) { return t[k]; } }))`;
       case 6:
         return `Object.keys(input).length`;
       case 7:
-      default:
-        return `${pick(random, ["f0", "f1"])}(${this.valueExpr(depth - 1)}, ${this.valueExpr(depth - 1)})`;
+      default: {
+        // Guest calls are restricted per function so the generated program
+        // can never recurse: f0 may call only f1, f1 calls no guest function
+        // (its fn() is a bounded host call), main may call both. Unbounded
+        // recursion used to stall the QuickJS oracle for minutes (wasm stack
+        // exhaustion is slow to surface), so no callable set means no call.
+        if (!callables || !callables.length) return String(Math.floor(random() * 5));
+        return `${pick(random, callables)}(${this.valueExpr(depth - 1, callables)}, ${this.valueExpr(depth - 1, callables)})`;
+      }
     }
   }
 
-  statement(depth, variables, output, allowCapability) {
+  statement(depth, variables, output, allowCapability, callables) {
     const random = this.random;
     const kind = Math.floor(random() * 8);
     switch (kind) {
       case 0: {
         const name = pick(random, variables);
-        output.push(`var ${name} = ${this.valueExpr(depth)};`);
+        output.push(`var ${name} = ${this.valueExpr(depth, callables)};`);
         return;
       }
       case 1: {
         const name = pick(random, variables);
-        output.push(`${name} = ${this.valueExpr(depth)};`);
+        output.push(`${name} = ${this.valueExpr(depth, callables)};`);
         return;
       }
       case 2: {
-        output.push(`if (${this.valueExpr(depth)}) {`);
-        output.push(`  v1 = ${this.valueExpr(depth)};`);
+        output.push(`if (${this.valueExpr(depth, callables)}) {`);
+        output.push(`  v1 = ${this.valueExpr(depth, callables)};`);
         output.push("} else {");
-        output.push(`  v2 = ${this.valueExpr(depth)};`);
+        output.push(`  v2 = ${this.valueExpr(depth, callables)};`);
         output.push("}");
         return;
       }
       case 3: {
         output.push(`for (var i = 0; i < ${1 + Math.floor(random() * 3)}; i++) {`);
-        output.push(`  v3 = ${this.valueExpr(depth)};`);
+        output.push(`  v3 = ${this.valueExpr(depth, callables)};`);
         output.push("}");
         return;
       }
@@ -150,13 +157,13 @@ class BoundaryGenerator {
         // set trap records but forwards; the sandbox must target the proxy
         // target, not whatever the trap returns.
         output.push("var p = new Proxy({}, { set: function (t, k, v) { t[k] = v; return true; } });");
-        output.push("p.x = " + this.valueExpr(depth) + ";");
+        output.push("p.x = " + this.valueExpr(depth, callables) + ";");
         output.push("v3 = p.x;");
         return;
       case 5:
         // defineProperty / delete on own (possibly proxied) objects.
         output.push("var q = new Proxy({ a: 1 }, { get: function (t, k) { return t[k]; } });");
-        output.push("Object.defineProperty(q, \"b\", { value: " + this.valueExpr(depth) + ", enumerable: true, configurable: true });");
+        output.push("Object.defineProperty(q, \"b\", { value: " + this.valueExpr(depth, callables) + ", enumerable: true, configurable: true });");
         output.push("v1 = q.a;");
         output.push("v2 = q.b;");
         output.push("delete q.a;");
@@ -167,30 +174,30 @@ class BoundaryGenerator {
         // ReferenceError in every engine (fine), but a stale Program-level
         // fn leaking from an earlier native case would silently diverge.
         if (!allowCapability) {
-          output.push(`${this.valueExpr(depth)};`);
+          output.push(`${this.valueExpr(depth, callables)};`);
           return;
         }
-        output.push(`try { v0 = fn(${this.valueExpr(depth)}); } catch (e) { v0 = e.name; }`);
+        output.push(`try { v0 = fn(${this.valueExpr(depth, callables)}); } catch (e) { v0 = e.name; }`);
         return;
       case 7:
       default:
-        output.push(`${this.valueExpr(depth)};`);
+        output.push(`${this.valueExpr(depth, callables)};`);
         return;
     }
   }
 
-  functionBody(depth, variables, allowCapability, emitReturn) {
+  functionBody(depth, variables, allowCapability, emitReturn, callables) {
     const output = [];
     // Declare all four cells the statements write: case 4/5 assign v3 and a
     // strict-mode assignment to an undeclared variable is a ReferenceError
     // in every engine (which would poison whole runs, not the boundary).
     for (let index = 0; index < 4; index += 1) {
-      output.push(`var v${index} = ${this.valueExpr(depth - 1)};`);
+      output.push(`var v${index} = ${this.valueExpr(depth - 1, callables)};`);
     }
     for (let index = 0; index < 2 + Math.floor(this.random() * 3); index += 1) {
-      this.statement(depth, variables, output, allowCapability);
+      this.statement(depth, variables, output, allowCapability, callables);
     }
-    if (emitReturn) output.push(`return ${this.valueExpr(depth - 1)};`);
+    if (emitReturn) output.push(`return ${this.valueExpr(depth - 1, callables)};`);
     return output;
   }
 
@@ -231,13 +238,17 @@ class BoundaryGenerator {
     const usesFn = random() < 0.5;
     const lines = [];
     if (!sloppy) lines.push("\"use strict\";");
+    // Callable sets keep the call graph acyclic: f0 may call only f1, f1
+    // calls no guest function, main may call both — bounded depth 3.
     for (let index = 0; index < 2; index += 1) {
       lines.push(`function f${index}(a, b) {`);
-      this.functionBody(1 + Math.floor(random() * 2), ["a", "b", "v0", "v1", "v2", "v3"], usesFn, true).forEach((line) => lines.push(`  ${line}`));
+      this.functionBody(1 + Math.floor(random() * 2), ["a", "b", "v0", "v1", "v2", "v3"], usesFn, true,
+        index === 0 ? ["f1"] : []).forEach((line) => lines.push(`  ${line}`));
       lines.push("}");
     }
     lines.push("function main() {");
-    const body = this.functionBody(1 + Math.floor(random() * 2), ["v0", "v1", "v2", "v3"], usesFn, false);
+    const body = this.functionBody(1 + Math.floor(random() * 2), ["v0", "v1", "v2", "v3"], usesFn, false,
+      ["f0", "f1"]);
     // The arguments facet needs a defined cell in the final array for every
     // program: sloppy always carries the mapped-arguments probe, strict gets
     // it occasionally and otherwise a plain null cell.

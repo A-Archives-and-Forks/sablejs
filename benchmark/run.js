@@ -43,6 +43,12 @@ const compiled = compile(source, {
   inlineLeafFrames,
   inlineSmallFunctions,
   perScopeFactories,
+  deadStoreElimination: process.argv.includes("--no-dse") ? false : undefined,
+  denseSwitch: process.argv.includes("--no-dense-switch") ? false : undefined,
+  framePooling: process.argv.includes("--no-frame-pooling") ? false : undefined,
+  arityConstruct: process.argv.includes("--no-arity-construct") ? false : undefined,
+  slotProvenance: process.argv.includes("--no-slot-provenance") ? false : undefined,
+  inlineGuestWrites: process.argv.includes("--no-inline-guest-writes") ? false : undefined,
 });
 const compileMs = performance.now() - startedAt;
 const generatedModule = { exports: {} };
@@ -53,9 +59,13 @@ new Function("require", "module", "exports", compiled.code)(
   generatedModule.exports
 );
 
+const slotProvenance = compiled.stats.codegen.slotProvenance;
 console.log(
   `[sablejs compile] ${compileMs.toFixed(1)} ms, code=${(Buffer.byteLength(compiled.code) / 1000).toFixed(1)} KB, ` +
-  `fast=${compiled.stats.codegen.fastFrameScopes}, fallback=${compiled.stats.codegen.fallbackScopes}`
+  `fast=${compiled.stats.codegen.fastFrameScopes}, fallback=${compiled.stats.codegen.fallbackScopes}` +
+  (slotProvenance && slotProvenance.trackedSlots
+    ? `, slots=${slotProvenance.trackedScopes}/${slotProvenance.trackedSlots}`
+    : "")
 );
 
 const print = security === "sandbox"

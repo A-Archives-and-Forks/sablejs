@@ -119,8 +119,8 @@ function normalize(value) {
   return JSON.stringify(value);
 }
 
-function runSableJS(security, programSource) {
-  const compiled = compile(programSource, { optimization: "O2", security, runtimeModule });
+function runSableJS(security, programSource, inlineHostIntrinsics = true) {
+  const compiled = compile(programSource, { optimization: "O2", security, runtimeModule, inlineHostIntrinsics });
   const generatedModule = { exports: {} };
   new Function("require", "module", "exports", compiled.code)(require, generatedModule, generatedModule.exports);
   const instance = generatedModule.exports.createInstance({});
@@ -158,7 +158,10 @@ async function main() {
       const nativeEvaluate = globalThis.eval;
       verify = () => nativeEvaluate(programSource);
     } else {
-      const compiled = compile(programSource, { optimization: "O2", security, runtimeModule });
+      const inlineHostIntrinsics = !process.argv.includes("--no-inline-host-intrinsics");
+      const inlineMemberIntrinsics = !process.argv.includes("--no-inline-member-intrinsics");
+      const deferBranchTest = !process.argv.includes("--no-branch-test-deferral");
+      const compiled = compile(programSource, { optimization: "O2", security, runtimeModule, inlineHostIntrinsics, inlineMemberIntrinsics, deferBranchTest });
       const generatedModule = { exports: {} };
       new Function("require", "module", "exports", compiled.code)(require, generatedModule, generatedModule.exports);
       if (profileBoundary) {

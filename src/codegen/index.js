@@ -59,7 +59,287 @@ function jsLiteral(value) {
   return JSON.stringify(value);
 }
 
-function metadata(scope, fastFrame = false, aliases = null, leafFrame = false) {
+// TRUE/FALSE/NULL/UNDEF carry no operand — the value lives in the op name —
+// while INTEGER/NUMBER/STRING carry it in args[0]. Constant-folded ops
+// (e.g. NEG 0 → -0 at O1+) carry the folded value in optimized.literal.
+function literalOperand(instruction) {
+  if (instruction.optimized && instruction.optimized.kind === "literal") {
+    return jsLiteral(instruction.optimized.value);
+  }
+  switch (instruction.op) {
+    case "TRUE": return "true";
+    case "FALSE": return "false";
+    case "NULL": return "null";
+    case "UNDEF": return "void 0";
+    default: return jsLiteral(instruction.args[0]);
+  }
+}
+
+// Hoisted LICM loads read the slot exactly like the inline GETLOCAL form:
+// frame locals via `$l[index]`, or the promoted variable when local
+// promotion claims the slot. The optimizer only hoists reads in scopes
+// with a static frame layout (no with/eval/catch chain), so `$l` is always
+// declared here; a hoist without frame layout would silently miscompile, so
+// fail loudly instead of emitting a broken read.
+function hoistedLocalLoad(context, load) {
+  if (context.localKind !== "frame") {
+    throw new Error(`LICM hoist without frame layout in scope ${context.scope.id}`);
+  }
+  if (context.promotedLocals && context.promotedLocals.has(load.localIndex)) {
+    return promotedLocalName(context, load.localIndex);
+  }
+  return `$l[${load.localIndex}]`;
+}
+
+// A promoted local is a true `$exec` variable declared in the function
+// prologue (`let $p<scope>_<index>;`) instead of a slot in the frame's
+// `locals` array. The slot keeps its dead `void 0` placeholder so every
+// frame constructor, the `$getArguments` parameter mapping, and the
+// metadata layout stay untouched; only GETLOCAL/SETLOCAL (and LICM hoists)
+// divert to the variable.
+function promotedLocalName(context, index) {
+  return `$p${context.scope.id}_${index}`;
+}
+
+// Item 9: per-slot provenance stamps. Each tracked frame local gets a $q flag
+// that records whether writeTarget resolution for the value it currently
+// holds is a provable no-op (see the SETPROP guest-slot branch). The flag is
+// classified once per store instead of per property write; $q is free of the
+// codegen's $p/$v/$t/$gv/$h/$l/$s/$g identifier families.
+function provenanceFlag(context, index) {
+  return `$q${context.scope.id}_${index}`;
+}
+
+// Item 10: inline the guest-write path. A guest-classified receiver (the
+// $q-stamp true branch, the thisIsGuest true branch, or a directly marked
+// guest object) makes writeTarget a provable no-op, and $setGuest's remaining
+// per-write work is (a) the typeof-function check and (b) the strict/sloppy
+// writer dispatch — both below. The inline form emits that work directly at
+// the write site: for a strict scope a native `$o[$k] = v` (writeStrictPropertyValue
+// minus its isIndexedPrototype guard, which is dead on this path: the guard
+// fires only for the host Array/Object prototypes, which are protected
+// intrinsics — isUnmediatedWriteTarget classifies them false, so a
+// guest-classified receiver provably never triggers it), for a sloppy scope a
+// single call to the captured non-strict writer `$writeSloppy`
+// (silent-failure semantics — a native set in the strict generated code would
+// throw where sloppy must no-op). The value-side securing is preserved
+// verbatim (`typeof === "function" ? secureValue : value`), and values whose
+// static op proves primitive (arithmetic/comparison results, literals) skip
+// even that check. Emitted only where context.slotProvenance holds (O2 sandbox
+// frame scopes — the item-9 footprint), so Os/O0/O1/trusted stay byte-identical.
+// Kill switch: `inlineGuestWrites: false` / `--no-inline-guest-writes`.
+const PRIMITIVE_RESULT_OPS = new Set([
+  // Ops whose result is never a function and never an object (mirrors
+  // valueTypeForOperation's primitive outputs, plus ADD — `a + b` is always
+  // string-or-number).
+  "UNDEF", "NULL", "TRUE", "FALSE", "INTEGER", "NUMBER", "STRING",
+  "POS", "NEG", "BITNOT", "INC", "DEC", "POSTINC", "POSTDEC",
+  "MUL", "DIV", "MOD", "SUB", "SHL", "SHR", "USHR", "BITAND", "BITXOR", "BITOR", "ADD",
+  "LT", "GT", "LE", "GE", "EQ", "NE", "STRICTEQ", "STRICTNE", "LOGNOT", "TYPEOF",
+  "DELLOCAL", "DELLOCAL2", "DELVAR", "DELPROP", "DELPROP_S", "IN", "INSTANCEOF",
+]);
+
+// jsLiteral renders: numbers (JSON or NaN/Infinity/-0 forms), double-quoted
+// strings, true/false/null/void 0.
+function isLiteralRender(render) {
+  return /^(NaN|-?Infinity|-0|-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?|true|false|null|void 0|"(?:[^"\\]|\\.)*")$/.test(render);
+}
+
+// A render is pure when reading it twice (the typeof probe and the branch)
+// is side-effect-free and order-independent: named temps (recorded via
+// temporary()), promoted locals and hoisted LICM loads (const, pure), and
+// literals. Stack pops and inline expressions are not — those keep $setGuest.
+function isPureWriteValue(context, render) {
+  if (context.temporaryInstructions.has(render)) return true;
+  if (/^\$(?:p|h)\d+_\d+$/.test(render)) return true;
+  return isLiteralRender(render);
+}
+
+// The value's static op proves it can never be a function (so secureValue's
+// function branch is unreachable) and never an ambient object (the write path
+// only secures functions — secureValue's ambient branch is unreached from
+// $setGuest/$setSandbox, which gate on typeof === "function" only).
+function isProvablyPrimitiveValue(context, render) {
+  const instruction = context.temporaryInstructions.get(render);
+  if (instruction && PRIMITIVE_RESULT_OPS.has(instruction.op)) return true;
+  if (instruction && instruction.optimized && instruction.optimized.kind === "literal") {
+    const folded = instruction.optimized.value;
+    return typeof folded !== "object" && typeof folded !== "function";
+  }
+  return isLiteralRender(render);
+}
+
+// Record a temp's producing instruction for the write-path purity check.
+// Deliberately NOT routed through temporary(): the record is consulted only
+// by isPureWriteValue/isProvablyPrimitiveValue (inline guest writes), while
+// instructionTemporaries ("reuse" optimization) is left untouched so
+// enabling inline writes never changes reuse behavior.
+function recordWriteTemp(context, name, instruction) {
+  context.temporaryInstructions.set(name, instruction);
+  return name;
+}
+
+// Returns the guest-branch write expression, or null when the site must keep
+// the $setGuest call (non-O2 context, or a value render that is not pure).
+function guestWriteExpression(context, object, key, value) {
+  if (!context.slotProvenance || !context.inlineGuestWrites || !isPureWriteValue(context, value)) return null;
+  const secured = isProvablyPrimitiveValue(context, value)
+    ? value
+    : `(typeof ${value} === "function" ? $r.boundary.secureValue(${value}) : ${value})`;
+  return context.scope.strict
+    ? `${object}[${key}] = ${secured}`
+    : `$writeSloppy(${object}, ${key}, ${secured})`;
+}
+
+// Item 9: the SETPROP/SETPROP_S branch for a receiver that is a frame local.
+// The $q flag carries the store-time classification; the lazy `=== undefined`
+// fallback covers slots whose first store predated discovery (no
+// classification line was emitted for it). Sloppy parameter slots are
+// readable by the mapped arguments proxy — a direct frame.locals write — so
+// once arguments are materialized the stamp may be stale and the write takes
+// the full sandbox path. Dropped slots (mixed-path setLocal conflicts) take
+// the full path too. Returns true when the branch was taken.
+function emitProvenanceWriteSite(lines, indent, context, origin, object, key, value) {
+  const plan = context.provenanceSlots;
+  if (!plan) return false;
+  if (plan.dropped.has(origin.index)) {
+    lines.push(`${indent}$setSandbox($r, ${context.writeProperty}, ${object}, ${key}, ${value});`);
+    return true;
+  }
+  plan.tracked.add(origin.index);
+  const scope = context.scope;
+  const guard = !scope.strict &&
+    scope.parameters.includes(scope.variables[origin.index - 1])
+    ? "!$f.argumentsInitialized && "
+    : "";
+  const flag = provenanceFlag(context, origin.index);
+  const guest = guestWriteExpression(context, object, key, value) ||
+    `$setGuest($r, $f, ${object}, ${key}, ${value})`;
+  lines.push(`${indent}(${guard}(${flag} === undefined ? ${flag} = $r.boundary.isUnmediatedWriteTarget(${object}) : ${flag})) ? ${guest} : $setSandbox($r, ${context.writeProperty}, ${object}, ${key}, ${value});`);
+  return true;
+}
+
+// Item 14: identifier calls of these five host intrinsics inline into a
+// direct call (see case "CALL"). They are pure intrinsics whose results are
+// always primitives, so the direct call is observationally identical to the
+// boundary dispatch as long as no argument is an ambient host object.
+const HOST_INTRINSIC_NAMES = new Set(["isNaN", "parseFloat", "parseInt", "Number", "String"]);
+
+// Item 15: member calls of these host prototype functions inline into a
+// direct `callee.call(receiver, ...)` (see case "CALL"). The set covers the
+// workload-hot members {join, push, charAt, indexOf, slice, sort, replace,
+// test}; the resolved callee is compared by identity against the raw
+// prototype functions imported from the runtime module, so a guest own
+// property, prototype redefinition, or wrapper always routes to the fallback.
+const MEMBER_INTRINSIC_NAMES = new Set(["join", "push", "charAt", "indexOf", "slice", "sort", "replace", "test"]);
+// The boundary's MUTATES_RECEIVER set contains exactly these two members;
+// their inline must route protected receivers (intrinsic graph objects) to
+// the fallback, where assertMutable throws the same boundary error.
+const MUTATING_MEMBER_INTRINSICS = new Set(["push", "sort"]);
+// Identity anchors per member. slice and indexOf exist on both
+// Array.prototype and String.prototype, so their guards must match either.
+const MEMBER_INTRINSIC_GUARDS = {
+  join: ["$hostJoin"],
+  push: ["$hostPush"],
+  sort: ["$hostSort"],
+  charAt: ["$hostCharAt"],
+  replace: ["$hostReplace"],
+  test: ["$hostTest"],
+  slice: ["$hostSliceArray", "$hostSliceString"],
+  indexOf: ["$hostIndexOfArray", "$hostIndexOfString"],
+};
+
+// Item 15b: runtime-stack operand counts for the fallback dispatch. The O2
+// emitter flushes the entire codegen stack onto $s before every dispatch and
+// the runtime helper pops its operands from there, so a member call whose
+// operands were flushed at a region boundary (a control-flow value between
+// the operand pushes and the CALL — e.g. a ternary inside an object literal
+// argument) can be recovered from the codegen's $s mirror and still inlined.
+// The counts mirror the runtime helpers exactly (verified against
+// src/runtime/index.js); ops with conditional or unknown stack shapes taint
+// the mirror instead, which conservatively disables recovery until the next
+// flush. Net deltas come from OpSpec.
+const DISPATCH_STACK_POPS = {
+  GETPROP: 2, GETPROP_S: 1, SETPROP: 3, SETPROP_S: 2, DELPROP: 2, DELPROP_S: 1,
+  INITPROP: 2, INITGETTER: 2, INITSETTER: 2, IN: 2, INSTANCEOF: 2,
+  ITERATOR: 1, EVAL: 1, WITH: 1, CATCH: 1, THROW: 1, RETURN: 1, PUTVAR: 1,
+  TYPEOF: 1, POS: 1, NEG: 1, BITNOT: 1, LOGNOT: 1, INC: 1, DEC: 1,
+  POSTINC: 1, POSTDEC: 1,
+  MUL: 2, DIV: 2, MOD: 2, ADD: 2, SUB: 2, SHL: 2, SHR: 2, USHR: 2,
+  LT: 2, GT: 2, LE: 2, GE: 2, EQ: 2, NE: 2, STRICTEQ: 2, STRICTNE: 2,
+  BITAND: 2, BITXOR: 2, BITOR: 2,
+  CLOSURE: 0, REFVAR: 0, DUP: 0, POP: 1,
+  // Literal pushes via $r.pushLiteral (the optimized-literal path).
+  INTEGER: 0, NUMBER: 0, STRING: 0,
+};
+
+// Item 13: inline the INITPROP fast path for literal initialization on a
+// provably fresh guest object. The runtime helper's remaining per-init work
+// for a fresh literal is: the assertMutable call (a no-op — protected objects
+// are realm intrinsics; a literal temp created mid-run can never be in
+// protectedValues/propertyTarget), the EMPTY-hole length branch (unreachable —
+// EMPTY is pushed via $r.pushEmpty, which flushes the model stack, so a hole
+// init never has all three operands pending), the __proto__ key check (the
+// key is a static literal — excluded below when it spells __proto__), the
+// prototypeSetterUnsafe flag check (kept live via the $prototypesHaveSetters
+// module import — the generated $r is the runtime instance, not the module),
+// and the function-value securing (preserved via the typeof probe, skipped
+// when the value's static op proves primitive). The fallback branch
+// re-materializes the full unpopped operand stack so $r.initProperty($f)
+// sees exactly what the runtime path would.
+function emitInlineInitProperty(lines, indent, context, stack) {
+  if (!context.inlineGuestInit) return false;
+  if (stack.length < 3) return false;
+  const value = stack[stack.length - 1];
+  const key = stack[stack.length - 2];
+  const object = stack[stack.length - 3];
+  const origin = context.temporaryOrigins.get(object);
+  if (!origin || origin.kind !== "guest-object") return false;
+  // Static literal keys only, and never __proto__ (assignment through the
+  // host accessor swaps the chain where defineData must create an own prop).
+  const keyInstruction = context.temporaryInstructions.get(key);
+  const safeKey = keyInstruction && (
+    keyInstruction.op === "INTEGER" || keyInstruction.op === "NUMBER" ||
+    (keyInstruction.op === "STRING" && keyInstruction.args[0] !== "__proto__")
+  );
+  if (!safeKey) return false;
+  // Model-stack entries are write-once temps, so reading the value twice
+  // (probe + assignment) is pure; only the probe eligibility needs the
+  // static op classification.
+  const secured = context.security === "sandbox" &&
+      !isProvablyPrimitiveValue(context, value)
+    ? `(typeof ${value} === "function" ? $r.boundary.secureValue(${value}) : ${value})`
+    : value;
+  stack.pop();
+  stack.pop();
+  stack.pop();
+  lines.push(`${indent}if ($prototypesHaveSetters()) {`);
+  lines.push(`${indent}  $s.push(${object}, ${key}, ${value});`);
+  lines.push(`${indent}  $r.initProperty($f);`);
+  // The runtime initProperty pops value + key and keeps the object on $s;
+  // mirror that (the object stays available for a following call).
+  if (context.runtimeStack) {
+    context.runtimeStack.push(object, key, value);
+    context.runtimeStack.length -= 2;
+  }
+  lines.push(`${indent}} else {`);
+  lines.push(`${indent}  ${object}[${key}] = ${secured};`);
+  lines.push(`${indent}}`);
+  stack.push(object);
+  return true;
+}
+
+const OBJECT_LITERAL_VALUE_OPS = new Set(["INTEGER", "NUMBER", "STRING", "TRUE", "FALSE", "NULL", "UNDEF"]);
+
+// A property value is foldable when it is a plain literal or a
+// constant-folded op (NEG/arithmetic folded to a literal by the optimizer).
+function isFoldableLiteralValue(instruction) {
+  if (instruction.elided) return false;
+  if (instruction.optimized && instruction.optimized.kind === "literal") return true;
+  return OBJECT_LITERAL_VALUE_OPS.has(instruction.op);
+}
+
+function metadata(scope, fastFrame = false, aliases = null, leafFrame = false, usesThisWrites = false, withMarks = false) {
   const alias = (name) => aliases && aliases.has(name) ? aliases.get(name) : name;
   return {
     id: scope.id,
@@ -68,12 +348,17 @@ function metadata(scope, fastFrame = false, aliases = null, leafFrame = false) {
     strict: scope.strict,
     lightweight: scope.lightweight,
     usesArguments: scope.usesArguments,
+    usesThisWrites,
     parameterCount: scope.parameterCount,
     parameters: scope.parameters.map(alias),
     variables: scope.variables.map(alias),
     dynamicFunctions: scope.dynamicFunctions.map((dynamicScope) => dynamicScope === -1 ? -1 : dynamicScope.id),
     fastFrame,
     leafFrame,
+    // Only scopes with a with (or eval) in their static ancestor chain can
+    // ever resolve a withBase binding at runtime; the runtime keeps the
+    // receiver-marks stack sync only for those (see createFrame).
+    withMarks,
   };
 }
 
@@ -280,6 +565,16 @@ function createInlineExpressionPlan(scope, budget) {
     );
     if (selfRead) return null;
     instructions = instructions.slice(3);
+  } else if (instructions.length >= 2 && instructions[0].op === "CURRENT" &&
+      instructions[1].op === "POP" &&
+      scope.instructions.some((instruction) => instruction.elided &&
+        (instruction.op === "SETLOCAL" || instruction.op === "SETLOCAL2") &&
+        instruction.offset > instructions[0].offset && instruction.offset < instructions[1].offset)) {
+    // Prologue self-binding store was DSE-elided (dead-store elimination):
+    // the body never reads its own name — a real read would have kept the
+    // store live — so there is no self-binding to guard and the CURRENT/POP
+    // pair is the whole prologue.
+    instructions = instructions.slice(2);
   }
 
   const firstReturn = instructions.findIndex((instruction) => instruction.op === "RETURN");
@@ -372,6 +667,8 @@ function createInlinePlans(program, options, codegenStats) {
     callSites: 0,
     guardedCallSites: 0,
     instructionsInlined: 0,
+    hostIntrinsicCallSites: 0,
+    memberIntrinsicCallSites: 0,
   };
   return plans;
 }
@@ -379,6 +676,8 @@ function createInlinePlans(program, options, codegenStats) {
 function createCodegenContext(scope, options, codegenStats) {
   const enabled = options.stackToLocal !== false &&
     (options.optimization === "O2" || options.optimization === "Os");
+  const denseSwitch = options.denseSwitch !== false;
+  const arityConstruct = options.arityConstruct !== false;
   let localKind = null;
   if (enabled && !scope.script && options.directVariableScopeIds.has(scope.id)) {
     localKind = "frame";
@@ -386,6 +685,27 @@ function createCodegenContext(scope, options, codegenStats) {
     DYNAMIC_LOCAL_OPERATIONS.has(instruction.op)
   )) {
     localKind = "global";
+  }
+  // Item 9: slot-provenance stamps ($q flags) are emitted for O2 frame
+  // scopes only. Soundness shape matches local promotion: lightweight scopes
+  // have no CLOSURE ops (so no descendant can write a slot through a
+  // captured-locals render), no with/eval/catch (direct variable resolution),
+  // and no sloppy arguments use in the scope itself; the mapped-arguments
+  // proxy writes parameter slots directly, which the $f.argumentsInitialized
+  // guard at write sites covers. Os stays untouched — the flags would cost
+  // minified bytes against the size optimizer's purpose.
+  const slotProvenance = options.slotProvenance !== false &&
+    options.optimization === "O2" && localKind === "frame" && scope.lightweight;
+  let provenanceSlots = null;
+  if (slotProvenance) {
+    provenanceSlots = options.provenanceSlotPlans && options.provenanceSlotPlans.get(scope.id);
+    if (!provenanceSlots && options.provenanceSlotPlans) {
+      // The plan is shared across regeneration attempts: tracked slots get
+      // the flag; dropped slots were found to be written through the
+      // mixed-path runtime helpers and are excluded permanently.
+      provenanceSlots = { tracked: new Set(), dropped: new Set() };
+      options.provenanceSlotPlans.set(scope.id, provenanceSlots);
+    }
   }
   const variableKind = (name) => {
     if (name === "arguments" && scope.usesArguments) {
@@ -432,11 +752,52 @@ function createCodegenContext(scope, options, codegenStats) {
     variableKind,
     writeProperty: scope.strict ? "$writeStrict" : "$writeSloppy",
     localKind,
+    promotedLocals: options.promotedLocalPlans && options.promotedLocalPlans.get(scope.id) || null,
+    usesThisWrites: false,
+    slotProvenance,
+    provenanceSlots,
+    inlineGuestWrites: options.inlineGuestWrites !== false,
+    inlineGuestInit: options.optimization === "O2" && options.inlineGuestInit !== false,
+    inlineHostIntrinsics: options.optimization === "O2" && options.inlineHostIntrinsics !== false,
+    inlineMemberIntrinsics: options.optimization === "O2" && options.inlineMemberIntrinsics !== false,
+    foldLiteralChains: options.optimization === "O2" && options.foldLiteralChains !== false,
+    deferBranchTest: options.deferBranchTest !== false,
+    denseSwitch,
+    arityConstruct,
     scope,
     stats: codegenStats.stackToLocal,
     instructionTemporaries: new Map(),
+    // Item 15: GETPROP_S temps whose static key is a member intrinsic, mapped
+    // to { name, receiver }. Keyed by temp name rather than attached to the
+    // temp's origin so chained reads off the callee keep their mediated
+    // semantics. A stale record is harmless — the CALL guard compares the
+    // live callee value by identity.
+    memberIntrinsicCallees: new Map(),
+    // Item 15b: mirror of the runtime stack $s for flushed-operand recovery.
+    // Entries are temp names from flush() or null for anonymous dispatch
+    // results and exclusive branch values; the recovery only ever inspects
+    // the tail, so placeholders and taints (null) both conservatively
+    // disable it. O2 only — the recovery is O2-gated by inlineMemberIntrinsics.
+    runtimeStack: options.optimization === "O2" ? [] : null,
+    // Set while emitting if/else consequent/alternate blocks: the branch's
+    // flushed values are exclusive (only the taken branch exists at
+    // runtime), so flush() mirrors them as count-only placeholders and the
+    // join correction drops the dead branch's share.
+    branchExclusive: false,
+    // Item 18: branch-test stack round-trip elimination. Branch emitters set
+    // expectBranchTest to the END OFFSET of a test range; only the final
+    // batch of that range (whose end matches the offset) may record the test
+    // in pendingBranchTest instead of pushing it to $s — a nested region's
+    // boundary ends a batch early, and matching by offset keeps those
+    // sub-batch flushes honest (they push normally). The branch tests the
+    // pending temp directly. Single-consumption by construction (the branch
+    // pops the test), height-neutral (push+pop both skipped, mirror
+    // untouched), gated on !chunkOpen for temp scope.
+    expectBranchTest: false,
+    pendingBranchTest: null,
     globalValueProducerOffsets,
     temporaryOrigins: new Map(),
+    temporaryInstructions: new Map(),
     knownFunctionBindings: new Map(),
     inlining: codegenStats.inlining,
     inlinePlans: options.inlinePlans,
@@ -473,12 +834,70 @@ function emitScopePrologue(lines, context) {
   if (!context.enabled) return;
   lines.push("  const $s = $f.stack;");
   if (context.localKind === "frame") lines.push("  const $l = $f.locals;");
+  if (context.promotedLocals && context.promotedLocals.size) {
+    // Phase 2 promotes strict parameter slots: their initial values still
+    // come from the call arguments, so promoted params are initialized from
+    // $f.callArgs in the declaration — $exec only receives ($r, $f), while
+    // $args lives in the enclosing factory closures. (The frame literal
+    // keeps the slot for constructors and the arguments mapping, but nothing
+    // reads it.)
+    const declarations = Array.from(context.promotedLocals, (index) =>
+      index <= context.scope.parameterCount
+        ? `${promotedLocalName(context, index)} = $f.callArgs[${index - 1}]`
+        : promotedLocalName(context, index)
+    );
+    lines.push(`  let ${declarations.join(", ")};`);
+  }
   if (context.localKind === "global" || context.directVariables) lines.push("  const $g = $r.global;");
   if (!context.sizeOptimized && context.globalValueProducerOffsets.size) {
     lines.push(`  let ${Array.from(context.globalValueProducerOffsets, (offset) =>
       `$gv${context.scope.id}_${offset}`
     ).join(", ")};`);
   }
+}
+
+// Item 15b: apply a fallback dispatch's runtime-stack effect to the $s
+// mirror. The runtime helper pops its operands from $s and pushes its result
+// (the codegen later pops that via load()); the mirror does the same with
+// temp names as flush entries and null as anonymous results. Ops whose pop
+// shape is conditional (JCASE, NEXTITER) or unmodeled taint the mirror —
+// recovery then stays disabled until the next flush re-arms it.
+function applyDispatchedStackEffect(context, instruction) {
+  const model = context.runtimeStack;
+  if (!model) return;
+  let pops;
+  let net;
+  if (instruction.optimized && instruction.optimized.kind === "drop-inputs") {
+    // The optimized form REPLACES the dispatch with N bare pops.
+    pops = instruction.optimized.count;
+    net = -pops;
+  } else {
+    switch (instruction.op) {
+      case "CALL": pops = instruction.args[0] + 2; net = -(instruction.args[0] + 1); break;
+      case "NEW": pops = instruction.args[0] + 1; net = -instruction.args[0]; break;
+      case "JCASE":
+      case "NEXTITER":
+        context.runtimeStack = null;
+        return;
+      default: {
+        pops = DISPATCH_STACK_POPS[instruction.op];
+        if (pops === undefined) {
+          context.runtimeStack = null;
+          return;
+        }
+        const spec = OpSpec.byName[instruction.op];
+        net = spec && typeof spec.stack === "number" ? spec.stack : 0;
+      }
+    }
+  }
+  if (pops > model.length) {
+    // The dispatch popped below the last flush (or the mirror under-counted);
+    // the tail is no longer recoverable. Taint conservatively.
+    context.runtimeStack = null;
+    return;
+  }
+  model.length -= pops;
+  for (let index = 0; index < pops + net; index += 1) model.push(null);
 }
 
 function emitStackToLocalRange(lines, scope, instructions, indent, context) {
@@ -492,12 +911,39 @@ function emitStackToLocalRange(lines, scope, instructions, indent, context) {
   let chunkConsts = 0;
   let chunkOpen = false;
 
-  // Collapse NEWARRAY + (literal-index, literal-value, INITPROP) chains into
-  // native array literals. Giant data literals otherwise emit one helper
-  // round-trip per element: hundreds of KB of source become tens of MB of
-  // generated code that overflows V8's default stack when first compiled.
+  // Collapse NEWARRAY + (literal-index, literal-value, INITPROP) chains and
+  // NEWOBJECT + (STRING key, literal value, INITPROP) chains into native
+  // array/object literals. Item 17 extends the fold recursively: a value may
+  // be a fresh nested object/array temp whose own chain folds inline, so
+  // data literals with object-valued properties emit as one native literal
+  // instead of one guarded keyed store per property (giant data literals
+  // otherwise emit one helper round-trip per element: hundreds of KB of
+  // source become tens of MB of generated code that overflows V8's default
+  // stack when first compiled, and each round-trip pays a
+  // $prototypesHaveSetters() guard call + typeof probe + keyed store).
+  //
+  // Safety: a native literal defines own data properties (DefineOwnProperty
+  // semantics), so it can never trigger Object.prototype setters — the fold
+  // is strictly more correct than the guard path, which is why no guard is
+  // emitted for folded properties. The folded values are fresh unobserved
+  // temps (write-once model-stack discipline), so the sandbox loses only
+  // mediation that was a no-op, and `__proto__` keys never fold: native
+  // literal syntax gives it Annex-B prototype-setting meaning while ES5.1
+  // treats it as a plain property. Duplicate keys keep the last-wins
+  // semantics of both the literal and the INITPROP sequence. A nested temp
+  // folds only when its def chain is contiguous within the current fold and
+  // its def offset is not a reuse/licm source or global value producer —
+  // those instructions' consumers would still reference the temp name whose
+  // const declaration the fold elides.
   const arrayLiteralRanges = new Map();
-  {
+  const objectLiteralRanges = new Map();
+  // Kill switch --no-fold-literal-chains: reproduce the exact pre-item-17
+  // shape — the shallow fold (literal-valued props only) with every
+  // remaining INITPROP on the guard+store path. Note the kill switch must
+  // NOT disable the shallow fold: an entirely unfolded giant data literal
+  // emits a $exec0 with tens of thousands of statements whose Turbofan
+  // optimization explodes memory (the item-17 A/B lesson).
+  if (!context.foldLiteralChains) {
     const literalOps = new Set(["INTEGER", "NUMBER", "STRING"]);
     for (let start = 0; start < instructions.length; start += 1) {
       const instruction = instructions[start];
@@ -517,8 +963,109 @@ function emitStackToLocalRange(lines, scope, instructions, indent, context) {
         matched += 1;
       }
       if (matched > 0) {
-        arrayLiteralRanges.set(instruction.offset, { elements, endIndex: cursor });
+        arrayLiteralRanges.set(instruction.offset, { source: `[${elements.join(", ")}]`, endIndex: cursor });
         start = cursor - 1;
+      }
+    }
+    for (let start = 0; start < instructions.length; start += 1) {
+      const instruction = instructions[start];
+      if (instruction.op !== "NEWOBJECT" || instruction.elided || instruction.unreachable) continue;
+      const entries = [];
+      let cursor = start + 1;
+      let matched = 0;
+      while (true) {
+        const key = instructions[cursor];
+        if (!key || key.op !== "STRING") break;
+        if (key.args[0] === "__proto__") break;
+        const value = instructions[cursor + 1];
+        if (!value || !isFoldableLiteralValue(value)) break;
+        const init = instructions[cursor + 2];
+        if (!init || init.op !== "INITPROP") break;
+        entries.push(`${jsLiteral(key.args[0])}: ${literalOperand(value)}`);
+        cursor += 3;
+        matched += 1;
+      }
+      if (matched > 0) {
+        objectLiteralRanges.set(instruction.offset, { source: `{ ${entries.join(", ")} }`, endIndex: cursor });
+        start = cursor - 1;
+      }
+    }
+  } else {
+    const foldExcluded = new Set();
+    for (const instruction of instructions) {
+      if (instruction.optimized &&
+          (instruction.optimized.kind === "reuse" || instruction.optimized.kind === "licm")) {
+        foldExcluded.add(instruction.optimized.sourceOffset);
+      }
+    }
+
+    // Resolves the literal chain starting at `offset`: a foldable literal op
+    // (rendered directly), or a NEWOBJECT/NEWARRAY whose INITPROP chain folds
+    // recursively. Returns { source, endCursor } where endCursor is the index
+    // of the last consumed instruction, or null when the chain does not fold
+    // (the caller keeps the runtime/guard path for the unmatched tail).
+    function resolveLiteralChain(instructions, offset, depth) {
+      const instruction = instructions[offset];
+      if (!instruction || instruction.elided || instruction.unreachable) return null;
+      if (isFoldableLiteralValue(instruction)) {
+        return { source: literalOperand(instruction), endCursor: offset };
+      }
+      if (depth >= 8 || (instruction.op !== "NEWOBJECT" && instruction.op !== "NEWARRAY")) return null;
+      if (foldExcluded.has(instruction.offset) ||
+          context.globalValueProducerOffsets.has(instruction.offset)) return null;
+      const cursor = offset + 1;
+      if (instruction.op === "NEWARRAY") {
+        const elements = [];
+        let matched = 0;
+        let position = cursor;
+        while (true) {
+          const key = instructions[position];
+          if (!key || !["INTEGER", "NUMBER"].includes(key.op) || Number(key.args[0]) !== matched) break;
+          const resolved = resolveLiteralChain(instructions, position + 1, depth + 1);
+          if (!resolved) break;
+          const init = instructions[resolved.endCursor + 1];
+          if (!init || init.op !== "INITPROP") break;
+          elements.push(resolved.source);
+          position = resolved.endCursor + 2;
+          matched += 1;
+        }
+        if (matched === 0) return null;
+        return { source: `[${elements.join(", ")}]`, endCursor: position - 1 };
+      }
+      const entries = [];
+      let matched = 0;
+      let position = cursor;
+      while (true) {
+        const key = instructions[position];
+        if (!key || key.op !== "STRING") break;
+        if (key.args[0] === "__proto__") break;
+        const resolved = resolveLiteralChain(instructions, position + 1, depth + 1);
+        if (!resolved) break;
+        const init = instructions[resolved.endCursor + 1];
+        if (!init || init.op !== "INITPROP") break;
+        entries.push(`${jsLiteral(key.args[0])}: ${resolved.source}`);
+        position = resolved.endCursor + 2;
+        matched += 1;
+      }
+      if (matched === 0) return null;
+      return { source: `{ ${entries.join(", ")} }`, endCursor: position - 1 };
+    }
+
+    for (let start = 0; start < instructions.length; start += 1) {
+      const instruction = instructions[start];
+      if (instruction.elided || instruction.unreachable) continue;
+      if (instruction.op === "NEWARRAY") {
+        const resolved = resolveLiteralChain(instructions, start, 0);
+        if (resolved && resolved.endCursor > start) {
+          arrayLiteralRanges.set(instruction.offset, { source: resolved.source, endIndex: resolved.endCursor + 1 });
+          start = resolved.endCursor;
+        }
+      } else if (instruction.op === "NEWOBJECT") {
+        const resolved = resolveLiteralChain(instructions, start, 0);
+        if (resolved && resolved.endCursor > start) {
+          objectLiteralRanges.set(instruction.offset, { source: resolved.source, endIndex: resolved.endCursor + 1 });
+          start = resolved.endCursor;
+        }
       }
     }
   }
@@ -556,6 +1103,7 @@ function emitStackToLocalRange(lines, scope, instructions, indent, context) {
     }
     if (instruction) {
       context.temporaryRegions.set(name, context.temporaryScope());
+      context.temporaryInstructions.set(name, instruction);
     }
     if (origin) context.temporaryOrigins.set(name, origin);
     return name;
@@ -564,13 +1112,41 @@ function emitStackToLocalRange(lines, scope, instructions, indent, context) {
   function load() {
     if (stack.length) return stack.pop();
     context.stats.stackLoads += 1;
+    // The popped value is a dispatch result sitting on $s; mirror the pop.
+    if (context.runtimeStack) context.runtimeStack.pop();
     return temporary("$s.pop()");
   }
 
-  function flush() {
+  function flush(deferBranchTest = false) {
     if (!stack.length) return;
+    if (deferBranchTest && context.deferBranchTest && !context.sizeOptimized && !chunkOpen && stack.length === 1) {
+      // Item 18: the branch test already sits in a single in-scope temp —
+      // test it directly instead of the $s.push/$s.pop round-trip. Height-
+      // neutral (both sides skipped, mirror untouched), single-consumption
+      // (the branch is the only reader of a test value), and gated on
+      // !chunkOpen so the temp's const stays in scope at the branch site.
+      context.pendingBranchTest = stack[0];
+      stack.length = 0;
+      return;
+    }
     lines.push(`${indent}$s.push(${stack.join(", ")});`);
     context.stats.stackStores += stack.length;
+    // Mirror the flush. A tainted mirror (null) re-arms here: the flushed
+    // entries sit on top of whatever unknown state preceded, and the recovery
+    // only ever inspects the tail above it.
+    const model = context.runtimeStack;
+    if (model) {
+      if (context.branchExclusive) {
+        // Exclusive branch exit: the flushed values exist only if this
+        // branch is taken, so the mirror records the count with
+        // placeholders; the join correction pops the dead branch's share.
+        for (let index = 0; index < stack.length; index += 1) model.push(null);
+      } else {
+        model.push(...stack);
+      }
+    } else {
+      context.runtimeStack = stack.slice();
+    }
     stack.length = 0;
     if (context.sizeOptimized) reusableTemporary = 0;
     if (chunkConsts >= CHUNK_CONSTS) {
@@ -621,22 +1197,25 @@ function emitStackToLocalRange(lines, scope, instructions, indent, context) {
       case "INTEGER":
       case "NUMBER":
       case "STRING":
-        stack.push(temporary(jsLiteral(instruction.args[0])));
+        stack.push(recordWriteTemp(context, temporary(jsLiteral(instruction.args[0])), instruction));
         return true;
       case "UNDEF":
-        stack.push(temporary("void 0"));
+        stack.push(recordWriteTemp(context, temporary("void 0"), instruction));
         return true;
       case "NULL":
-        stack.push(temporary("null"));
+        stack.push(recordWriteTemp(context, temporary("null"), instruction));
         return true;
       case "TRUE":
-        stack.push(temporary("true"));
+        stack.push(recordWriteTemp(context, temporary("true"), instruction));
         return true;
       case "FALSE":
-        stack.push(temporary("false"));
+        stack.push(recordWriteTemp(context, temporary("false"), instruction));
         return true;
       case "THIS":
-        stack.push(temporary("$f.thisValue"));
+        // The sandbox write path can skip writeTarget resolution for writes
+        // to the call receiver when the frame-stamped thisIsGuest flag says
+        // writeTarget(this) is a provable no-op (see SETPROP below).
+        stack.push(temporary("$f.thisValue", instruction, { kind: "this-value" }));
         return true;
       case "CURRENT":
         stack.push(temporary("$f.currentFunction"));
@@ -692,18 +1271,27 @@ function emitStackToLocalRange(lines, scope, instructions, indent, context) {
       case "GETLOCAL2": {
         if (!context.localKind) return false;
         const index = instruction.args[0];
-        const expression = context.localKind === "frame"
-          ? `$l[${index}]`
-          : `$g[${jsLiteral(scope.variables[index - 1])}]`;
+        const promoted = context.promotedLocals && context.promotedLocals.has(index);
+        if (promoted) context.stats.promotedLoads += 1;
+        const expression = promoted
+          ? promotedLocalName(context, index)
+          : context.localKind === "frame"
+            ? `$l[${index}]`
+            : `$g[${jsLiteral(scope.variables[index - 1])}]`;
         const knownFunction = context.knownFunctionBindings.get(index);
         // The guest-object provenance pass marks GETLOCAL loads that provably
         // hold guest-created objects; sandbox property writes to them can
-        // skip writeTarget resolution.
+        // skip writeTarget resolution. Otherwise, in a provenance-eligible
+        // scope the load records the slot itself: write sites keyed to a
+        // tracked slot consult its $q flag instead of resolving writeTarget
+        // per write (the flag is classified at stores — see SETLOCAL).
         const origin = knownFunction
           ? { kind: "known-function", identity: knownFunction.identity, scopeId: knownFunction.scopeId }
           : instruction.guestObjectOutput
             ? { kind: "guest-object" }
-            : null;
+            : context.slotProvenance
+              ? { kind: "guest-slot", index }
+              : null;
         stack.push(temporary(expression, instruction, origin));
         return true;
       }
@@ -713,7 +1301,12 @@ function emitStackToLocalRange(lines, scope, instructions, indent, context) {
         const index = instruction.args[0];
         const value = stack[stack.length - 1];
         if (context.localKind === "frame") {
-          lines.push(`${indent}$l[${index}] = ${value};`);
+          if (context.promotedLocals && context.promotedLocals.has(index)) {
+            context.stats.promotedStores += 1;
+            lines.push(`${indent}${promotedLocalName(context, index)} = ${value};`);
+          } else {
+            lines.push(`${indent}$l[${index}] = ${value};`);
+          }
         } else {
           lines.push(`${indent}${context.writeProperty}($g, ${jsLiteral(scope.variables[index - 1])}, ${value});`);
         }
@@ -722,6 +1315,17 @@ function emitStackToLocalRange(lines, scope, instructions, indent, context) {
           context.knownFunctionBindings.set(index, origin);
         } else {
           context.knownFunctionBindings.delete(index);
+        }
+        // Item 9: a store to a tracked slot reclassifies its $q flag. Values
+        // with static guest provenance (created by guest code, never wrappers
+        // or protected intrinsics) classify to the constant true; everything
+        // else resolves at runtime, exactly as writeTarget would.
+        if (context.provenanceSlots && context.provenanceSlots.tracked.has(index)) {
+          const unmediated = origin && (origin.kind === "guest-object" ||
+            origin.kind === "closure" || origin.kind === "known-function");
+          lines.push(`${indent}${provenanceFlag(context, index)} = ${unmediated
+            ? "true"
+            : `$r.boundary.isUnmediatedWriteTarget(${value})`};`);
         }
         return true;
       }
@@ -753,9 +1357,15 @@ function emitStackToLocalRange(lines, scope, instructions, indent, context) {
           } else if (variable.kind === "captured") {
             stack.push(temporary(capturedLocal(variable)));
           } else if (variable.kind === "declared-global") {
-            stack.push(temporary(`$g[${jsLiteral(instruction.args[0])}]`));
+            stack.push(temporary(`$g[${jsLiteral(instruction.args[0])}]`, null,
+              HOST_INTRINSIC_NAMES.has(instruction.args[0])
+                ? { kind: "host-intrinsic", name: instruction.args[0] }
+                : null));
           } else {
-            stack.push(temporary(`$readGlobal($g, ${jsLiteral(instruction.args[0])}, true)`));
+            stack.push(temporary(`$readGlobal($g, ${jsLiteral(instruction.args[0])}, true)`, null,
+              HOST_INTRINSIC_NAMES.has(instruction.args[0])
+                ? { kind: "host-intrinsic", name: instruction.args[0] }
+                : null));
           }
         }
         return true;
@@ -818,11 +1428,20 @@ function emitStackToLocalRange(lines, scope, instructions, indent, context) {
         const expression = context.security === "sandbox"
           ? (mediated ? `$getSandbox($r, ${object}, ${jsLiteral(staticName)})` : `${object}[${jsLiteral(staticName)}]`)
           : `${object}[${jsLiteral(staticName)}]`;
-        stack.push(temporary(
+        const temp = temporary(
           expression,
           instruction,
           context.security === "sandbox" && mediated ? { kind: "mediated" } : null
-        ));
+        );
+        // Item 15: record raw (unmediated) reads of the member intrinsics so
+        // the CALL case can identity-guard them. Mediated reads are excluded
+        // — their callee may be a wrapper, which can never match the raw
+        // prototype identity anyway.
+        if (context.inlineMemberIntrinsics && context.security === "sandbox" &&
+            !mediated && MEMBER_INTRINSIC_NAMES.has(staticName)) {
+          context.memberIntrinsicCallees.set(temp, { name: staticName, receiver: object });
+        }
+        stack.push(temp);
         return true;
       }
       case "SETPROP": {
@@ -837,9 +1456,30 @@ function emitStackToLocalRange(lines, scope, instructions, indent, context) {
           const origin = context.temporaryOrigins.get(object);
           const guestObject = origin && (origin.kind === "guest-object" ||
             origin.kind === "closure" || origin.kind === "known-function");
-          lines.push(guestObject
-            ? `${indent}$setGuest($r, $f, ${object}, ${key}, ${value});`
-            : `${indent}$setSandbox($r, ${context.writeProperty}, ${object}, ${key}, ${value});`);
+          // A write to the call receiver is classified once per call: the
+          // frame stamp records whether writeTarget($this) is a no-op, so the
+          // per-write resolution can be skipped whenever it is. The stamp is
+          // computed on the same secured, boxed receiver the write path sees,
+          // and the underlying WeakMaps are monotone with respect to it, so
+          // the ternary is exact — never a stale fast guess.
+          if (origin && origin.kind === "guest-slot") {
+            emitProvenanceWriteSite(lines, indent, context, origin, object, key, value);
+          } else if (origin && origin.kind === "this-value") {
+            context.usesThisWrites = true;
+            const guest = guestWriteExpression(context, object, key, value) ||
+              `$setGuest($r, $f, ${object}, ${key}, ${value})`;
+            lines.push(`${indent}($f.thisIsGuest ? ${guest} : $setSandbox($r, ${context.writeProperty}, ${object}, ${key}, ${value}));`);
+          } else {
+            // Only provably-guest receivers may inline the write: the
+            // guest-slot and this-value branches above are classification-
+            // gated, and here guestObject marks guest-created objects. Any
+            // other receiver (globals, mediated reads, protected intrinsics)
+            // keeps the full $setSandbox path — writeTarget resolution is
+            // exactly what blocks `Math.polluted = 1`-shaped attacks.
+            lines.push(guestObject
+              ? `${indent}${guestWriteExpression(context, object, key, value) || `$setGuest($r, $f, ${object}, ${key}, ${value})`};`
+              : `${indent}$setSandbox($r, ${context.writeProperty}, ${object}, ${key}, ${value});`);
+          }
         } else {
           lines.push(`${indent}${context.writeProperty}(${object}, ${key}, ${value});`);
         }
@@ -853,9 +1493,25 @@ function emitStackToLocalRange(lines, scope, instructions, indent, context) {
           const origin = context.temporaryOrigins.get(object);
           const guestObject = origin && (origin.kind === "guest-object" ||
             origin.kind === "closure" || origin.kind === "known-function");
-          lines.push(guestObject
-            ? `${indent}$setGuest($r, $f, ${object}, ${jsLiteral(instruction.args[0])}, ${value});`
-            : `${indent}$setSandbox($r, ${context.writeProperty}, ${object}, ${jsLiteral(instruction.args[0])}, ${value});`);
+          const key = jsLiteral(instruction.args[0]);
+          if (origin && origin.kind === "guest-slot") {
+            emitProvenanceWriteSite(lines, indent, context, origin, object, key, value);
+          } else if (origin && origin.kind === "this-value") {
+            context.usesThisWrites = true;
+            const guest = guestWriteExpression(context, object, key, value) ||
+              `$setGuest($r, $f, ${object}, ${key}, ${value})`;
+            lines.push(`${indent}($f.thisIsGuest ? ${guest} : $setSandbox($r, ${context.writeProperty}, ${object}, ${key}, ${value}));`);
+          } else {
+            // Only provably-guest receivers may inline the write: the
+            // guest-slot and this-value branches above are classification-
+            // gated, and here guestObject marks guest-created objects. Any
+            // other receiver (globals, mediated reads, protected intrinsics)
+            // keeps the full $setSandbox path — writeTarget resolution is
+            // exactly what blocks `Math.polluted = 1`-shaped attacks.
+            lines.push(guestObject
+              ? `${indent}${guestWriteExpression(context, object, key, value) || `$setGuest($r, $f, ${object}, ${key}, ${value})`};`
+              : `${indent}$setSandbox($r, ${context.writeProperty}, ${object}, ${key}, ${value});`);
+          }
         } else {
           lines.push(`${indent}${context.writeProperty}(${object}, ${jsLiteral(instruction.args[0])}, ${value});`);
         }
@@ -864,12 +1520,34 @@ function emitStackToLocalRange(lines, scope, instructions, indent, context) {
       }
       case "CALL": {
         const count = instruction.args[0];
-        if (scope.dynamicFunctions.length || stack.length < count + 2) return false;
+        if (scope.dynamicFunctions.length || stack.length < count + 2) {
+          // Item 15b: a control-flow region between the operand pushes and
+          // the CALL (e.g. a ternary inside an object-literal argument)
+          // flushed the operands onto $s as materialized consts. The $s
+          // mirror tracks that tail; when it is exactly this call's operands,
+          // emit the same inline the stack path would and trim $s in place
+          // of the dispatch.
+          if (!scope.dynamicFunctions.length &&
+              recoverFlushedIntrinsicCall(instruction, count)) return true;
+          return false;
+        }
         const args = stack.splice(stack.length - count, count);
         const thisValue = stack.pop();
         const callable = stack.pop();
+        if (emitIntrinsicCallInline(callable, thisValue, args)) return true;
         if (context.security === "sandbox") {
-          stack.push(temporary(`$applySandbox($r, ${callable}, ${thisValue}, [${args.join(", ")}])`));
+          // Arity-specialized dispatch: the callee-side variant matches the
+          // static argument count, so guest calls never allocate an args
+          // array (the fast path forwards fixed arguments via the captured
+          // Function.prototype.call). Arities above the specialized range
+          // fall back to the generic array form.
+          const callHelper = args.length <= 5
+            ? `$applySandbox${args.length}`
+            : "$applySandbox";
+          const callArgs = args.length <= 5
+            ? (args.length ? `, ${args.join(", ")}` : "")
+            : `, [${args.join(", ")}]`;
+          stack.push(temporary(`${callHelper}($r, ${callable}, ${thisValue}${callArgs})`));
           return true;
         }
         const origin = context.temporaryOrigins.get(callable);
@@ -903,9 +1581,46 @@ function emitStackToLocalRange(lines, scope, instructions, indent, context) {
         if (scope.dynamicFunctions.length || stack.length < count + 1) return false;
         const args = stack.splice(stack.length - count, count);
         const constructor = stack.pop();
-        stack.push(temporary(context.security === "sandbox"
-          ? `$constructSandbox($r, ${constructor}, [${args.join(", ")}])`
-          : `$construct(${constructor}, [${args.join(", ")}])`));
+        // The provenance pass marks NEWs whose constructor is pinned to a
+        // return-safe guest closure: the result is always a fresh guest
+        // object, so property writes to it can skip writeTarget resolution.
+        let expression;
+        if (context.security === "sandbox") {
+          if (context.arityConstruct) {
+            // Arity-specialized dispatch, the `new` analog of the CALL fast
+            // path: the callee-side variant matches the static argument
+            // count, so guest constructions never allocate an args array
+            // (the fast path invokes the compiled closure through host `new`
+            // with fixed arguments). Arities above the specialized range
+            // fall back to the generic array form.
+            const constructHelper = args.length <= 5
+              ? `$constructSandbox${args.length}`
+              : "$constructSandbox";
+            const constructArgs = args.length <= 5
+              ? (args.length ? `, ${args.join(", ")}` : "")
+              : `, [${args.join(", ")}]`;
+            expression = `${constructHelper}($r, ${constructor}${constructArgs})`;
+          } else {
+            expression = `$constructSandbox($r, ${constructor}, [${args.join(", ")}])`;
+          }
+        } else if (context.arityConstruct && /^[$A-Za-z_][\w$]*(\.[$A-Za-z_][\w$]*|\[\d+\])*$/.test(constructor)) {
+          // Trusted mode has no boundary: host `new` on the constructor
+          // expression is exactly Reflect.construct(constructor, args) (same
+          // [[Construct]], newTarget = constructor, same TypeError for
+          // non-constructors), so the helper call and the args array are
+          // both unnecessary. Only simple identifier / member / index
+          // callees inline; anything else keeps the runtime path.
+          expression = `new ${constructor}(${args.join(", ")})`;
+        } else {
+          expression = `$construct(${constructor}, [${args.join(", ")}])`;
+        }
+        stack.push(temporary(
+          expression,
+          instruction,
+          context.security === "sandbox" && instruction.guestObjectOutput
+            ? { kind: "guest-object" }
+            : null
+        ));
         return true;
       }
       case "POSTINC":
@@ -931,25 +1646,185 @@ function emitStackToLocalRange(lines, scope, instructions, indent, context) {
     }
     const unary = NATIVE_UNARY_EXPRESSIONS[spec.helper];
     if (unary) {
-      stack.push(temporary(unary(load())));
+      stack.push(recordWriteTemp(context, temporary(unary(load())), instruction));
       return true;
     }
     const operator = NATIVE_BINARY_OPERATORS[spec.helper];
     if (operator) {
       const right = load();
       const left = load();
-      stack.push(temporary(`(${left} ${operator} ${right})`));
+      stack.push(recordWriteTemp(context, temporary(`(${left} ${operator} ${right})`), instruction));
       return true;
     }
     return false;
+  }
+
+  // Item 14/15 shared inline emission, used by both the stack path (operands
+  // popped off the codegen stack) and the item-15b recovery path (operands
+  // recovered by name from the $s mirror). Returns true when the call was
+  // inlined; the caller then treats the call as fully emitted.
+  function emitIntrinsicCallInline(callable, thisValue, args) {
+    // Item 14 (sandbox): identifier calls of the five host intrinsics
+    // inline into a direct call. The callee is the live GETVAR read, so
+    // guest redefinitions of the global binding are honored exactly like
+    // the fallback — no capture, no shadow flag. All five are pure and
+    // return primitives, so the direct call is observationally identical
+    // to the boundary dispatch; the one divergence is an ambient host
+    // object reaching the intrinsic through an argument, which the
+    // sandbox probe routes to the fallback (the boundary would reject it
+    // the same way).
+    // Sandbox-only (measured 2026-08-24): the trusted $apply chain is
+    // already fully optimized by V8 (inlined applyValue → escaped args
+    // array → direct call), so the inline's per-site win there is tiny
+    // and the shape change perturbs the enclosing functions' V8
+    // optimization — trusted Typescript measured −6..−7% across three
+    // interleaved runs (11 rounds) while all four of its site shapes won
+    // +15..27% in isolation; sandbox is the mirror image (boundary.call →
+    // callHost → secureArguments → applyHost is genuinely expensive;
+    // sandbox Typescript measured +22.8% median), so the inline fires in
+    // sandbox only and trusted keeps $apply.
+    const calleeOrigin = context.temporaryOrigins.get(callable);
+    const thisValueInstruction = context.temporaryInstructions.get(thisValue);
+    if (context.inlineHostIntrinsics && context.security === "sandbox" &&
+        calleeOrigin &&
+        calleeOrigin.kind === "host-intrinsic" &&
+        HOST_INTRINSIC_NAMES.has(calleeOrigin.name) &&
+        thisValueInstruction && thisValueInstruction.op === "UNDEF") {
+      const callHelper = args.length <= 5 ? `$applySandbox${args.length}` : "$applySandbox";
+      const callArgs = args.length <= 5
+        ? (args.length ? `, ${args.join(", ")}` : "")
+        : `, [${args.join(", ")}]`;
+      const fallback = `${callHelper}($r, ${callable}, ${thisValue}${callArgs})`;
+      if (args.length) {
+        if (args.length > 5) {
+          // No sanitizing helper above arity 5; these sites are cold, so
+          // keep the boundary dispatch.
+          stack.push(temporary(fallback));
+        } else {
+          const probes = args.map((argument) =>
+            `typeof ${argument} === "object" && ${argument} !== null && ` +
+            `$r.boundary.ambientValues.has(${argument})`);
+          // The direct arm runs the checked callee through the
+          // sanitizing $hostCallN helper: String/Number arguments with
+          // throwing ToPrimitive methods would otherwise surface a raw
+          // host error (different class, host stack) where the boundary
+          // throws a sanitized one. The helper is a module const binding
+          // that V8 inlines into the site, and its inner
+          // Function.prototype.call folds into a direct call, so the
+          // per-site cost is the same as the bare variable call.
+          stack.push(temporary(`(${probes.join(" || ")} ? ${fallback} : $hostCall${args.length}(${callable}, ${thisValue}${args.length ? `, ${args.join(", ")}` : ""}))`));
+        }
+      } else {
+        // Zero-argument forms (isNaN(), String(), ...) cannot throw —
+        // no ToPrimitive coercion on a missing first argument — so the
+        // bare variable call stays. A variable callee passes undefined
+        // this, and the variable call keeps normal call feedback (3.4%
+        // better than the (0, f)() sequence-expression shape on the
+        // first Typescript pass).
+        stack.push(temporary(`${callable}()`));
+      }
+      context.inlining.hostIntrinsicCallSites += 1;
+      return true;
+    }
+    // Item 15 (sandbox): member calls of the hot host prototype functions
+    // inline into a direct Function.prototype.call. GETPROP_S recorded
+    // the callee temp in memberIntrinsicCallees with its receiver temp;
+    // requiring thisValue to be that exact temp pins the member-call
+    // shape (the frontend reuses the receiver temp as the member-call
+    // this). The guard compares the live-resolved callee by identity
+    // against the imported raw prototype functions, so a guest own
+    // property, prototype redefinition, or wrapper routes to the
+    // fallback; the direct arm never re-reads the member, so accessor
+    // side effects run exactly once like the boundary read. The direct
+    // arm is the sanitizing $hostCallN helper with the checked callee
+    // and the recorded receiver as this — the receiver is the exact
+    // object the member call would run against, and the helper's
+    // Function.prototype.call folds into a direct call under V8's
+    // call-apply elimination.
+    // The probes mirror the boundary's dispatch exactly: the pure
+    // members (join, charAt, indexOf, slice, replace, test) get no
+    // receiver inspection from callHost, so only ambient arguments route
+    // to the fallback (an ambient function argument — replace's callback
+    // — would run unmediated in the direct arm, where the boundary would
+    // wrap it); the mutating members (push, sort) additionally route
+    // protected receivers to the fallback, where assertMutable throws —
+    // the read-only members skip the protected probe because the
+    // boundary classifies them pure and lets them run on protected
+    // receivers (test mutates lastIndex and still passes). No ambient
+    // receiver probe: the boundary has none.
+    const memberCallee = context.inlineMemberIntrinsics &&
+      context.memberIntrinsicCallees.get(callable);
+    if (context.security === "sandbox" && memberCallee &&
+        thisValue === memberCallee.receiver && args.length <= 5) {
+      const probes = [`(${MEMBER_INTRINSIC_GUARDS[memberCallee.name].map((anchor) => `${callable} !== ${anchor}`).join(" && ")})`];
+      for (const argument of args) {
+        probes.push(`typeof ${argument} === "object" && ${argument} !== null && ` +
+          `$r.boundary.ambientValues.has(${argument})`);
+      }
+      if (MUTATING_MEMBER_INTRINSICS.has(memberCallee.name)) {
+        probes.push(`$r.boundary.protectedValues.has(${thisValue})`);
+      }
+      const callHelper = args.length <= 5 ? `$applySandbox${args.length}` : "$applySandbox";
+      const callArgs = args.length <= 5
+        ? (args.length ? `, ${args.join(", ")}` : "")
+        : `, [${args.join(", ")}]`;
+      const fallback = `${callHelper}($r, ${callable}, ${thisValue}${callArgs})`;
+      // Direct arm through the sanitizing $hostCallN helper: a throwing
+      // intrinsic (test on a non-regexp receiver, a throwing sort
+      // comparator) must surface the same sanitized error the boundary
+      // throws, not a raw host error with its stack.
+      const direct = `$hostCall${args.length}(${callable}, ${thisValue}${args.length ? `, ${args.join(", ")}` : ""})`;
+      stack.push(temporary(`(${probes.join(" || ")} ? ${fallback} : ${direct})`));
+      context.inlining.memberIntrinsicCallSites += 1;
+      return true;
+    }
+    return false;
+  }
+
+  // Item 15b: a control region between the operand pushes and the CALL
+  // flushed the operands onto $s as materialized consts, so the stack path
+  // above never sees them. The $s mirror knows them by name. The runtime
+  // indexes the call's operands from the END of $s (callableIndex =
+  // length - count - 2), so the mirror tail is checked the same way — a
+  // stale prefix is expected (e.g. an initProperty keeping the target
+  // object on $s for a following member call) and stays below the trim.
+  // Conservative by construction: the recorded member callee must sit at
+  // the exact runtime index and the receiver must match its record, so a
+  // drifted mirror (a mis-table'd dispatch pop) can only cause a miss,
+  // never a false recovery. When it fires, emit the same inline and trim $s
+  // in place of the dispatch. The inline evaluates the temps by name, so
+  // the trim may follow the const emission; the $s.length assignment keeps
+  // the frame's references hooks in lockstep exactly like the runtime's own
+  // call trim.
+  function recoverFlushedIntrinsicCall(instruction, count) {
+    const model = context.runtimeStack;
+    if (!model) return false;
+    const callableIndex = model.length - count - 2;
+    if (callableIndex < 0) return false;
+    const callable = model[callableIndex];
+    const thisValue = model[callableIndex + 1];
+    if (typeof callable !== "string" || typeof thisValue !== "string") return false;
+    for (let index = callableIndex + 2; index < model.length; index += 1) {
+      if (typeof model[index] !== "string") return false;
+    }
+    if (!emitIntrinsicCallInline(callable, thisValue, model.slice(callableIndex + 2))) return false;
+    lines.push(`${indent}$s.length -= ${count + 2};`);
+    model.length = callableIndex;
+    return true;
   }
 
   for (let loopIndex = 0; loopIndex < instructions.length; loopIndex += 1) {
     const instruction = instructions[loopIndex];
     const arrayLiteral = arrayLiteralRanges.get(instruction.offset);
     if (arrayLiteral) {
-      stack.push(temporary(`[${arrayLiteral.elements.join(", ")}]`, instruction, { kind: "guest-object" }));
+      stack.push(temporary(arrayLiteral.source, instruction, { kind: "guest-object" }));
       loopIndex = arrayLiteral.endIndex - 1;
+      continue;
+    }
+    const objectLiteral = objectLiteralRanges.get(instruction.offset);
+    if (objectLiteral) {
+      stack.push(temporary(objectLiteral.source, instruction, { kind: "guest-object" }));
+      loopIndex = objectLiteral.endIndex - 1;
       continue;
     }
     if (instruction.op === "RETURN") {
@@ -962,6 +1837,11 @@ function emitStackToLocalRange(lines, scope, instructions, indent, context) {
       lines.push(`${indent}throw ${value};`);
       continue;
     }
+    if (instruction.op === "INITPROP" && emitInlineInitProperty(lines, indent, context, stack)) {
+      context.stats.instructions += 1;
+      context.stats.helpersAvoided += 1;
+      continue;
+    }
     const instructionCount = context.stats.instructions;
     const helperCount = context.stats.helpersAvoided;
     if (direct(instruction)) {
@@ -972,8 +1852,23 @@ function emitStackToLocalRange(lines, scope, instructions, indent, context) {
     context.stats.helpersAvoided = helperCount;
     flush();
     lines.push(`${indent}${callForInstruction(instruction, context)}`);
+    applyDispatchedStackEffect(context, instruction);
   }
-  flush();
+  // Item 18: the final batch of an armed test range may defer the branch
+  // test (a single in-scope temp) instead of pushing it to $s; the caller's
+  // branchValue consumes the pending value. The flag is matched to this
+  // batch's end offset (the last instruction's end — HIR offsets are
+  // contiguous, so this equals the batch end unless trailing instructions
+  // were elided, which falls back conservatively) so sub-batch flushes
+  // inside nested regions push normally; the flag is cleared whenever the
+  // armed range ends, whether or not the deferral fired.
+  const rangeEnd = instructions.length ? instructions[instructions.length - 1].end : -1;
+  if (context.expectBranchTest === rangeEnd) {
+    flush(true);
+    context.expectBranchTest = false;
+  } else {
+    flush();
+  }
   if (chunkOpen) lines.push(`${indent}}`);
 }
 
@@ -1038,11 +1933,24 @@ function emitStraightRange(lines, scope, start, end, indent, context) {
 }
 
 function branchValue(context) {
-  return context && context.enabled ? "$s.pop()" : "$r.branch($f)";
+  if (context && context.enabled) {
+    if (context.pendingBranchTest) {
+      // Item 18: the range's final flush deferred the test into a temp; the
+      // branch tests it directly (nothing was pushed, so no mirror pop).
+      const value = context.pendingBranchTest;
+      context.pendingBranchTest = null;
+      return value;
+    }
+    // The branch test was pushed by the range's final flush; mirror the pop.
+    if (context.runtimeStack) context.runtimeStack.pop();
+    return "$s.pop()";
+  }
+  return "$r.branch($f)";
 }
 
 function emitLoopCondition(lines, scope, region, indent, context) {
   if (!Number.isInteger(region.branch)) return;
+  context.expectBranchTest = region.branch;
   emitStraightRange(lines, scope, region.testStart, region.branch, indent, context);
   const branch = scope.instructions.find((instruction) => instruction.offset === region.branch);
   const exitsWhenTrue = branch.op === "JTRUE";
@@ -1062,16 +1970,18 @@ function generateSimpleStructuredScope(scope, region, context) {
 
   const loopHeaders = new Set([region.testStart, region.bodyStart, region.start]);
   (scope.loopInvariantLoads || []).filter((load) => loopHeaders.has(load.header)).forEach((load) => {
-    lines.push(`  const $h${scope.id}_${load.sourceOffset} = $l[${load.localIndex}];`);
+    lines.push(`  const $h${scope.id}_${load.sourceOffset} = ${hoistedLocalLoad(context, load)};`);
   });
 
   lines.push(`  $loop${region.id}: while (true) {`);
   if (region.kind === "DoWhile") {
     emitStraightRange(lines, scope, region.bodyStart, region.bodyEnd, "    ", context);
+    context.expectBranchTest = region.branch;
     emitStraightRange(lines, scope, region.testStart, region.branch, "    ", context);
     const branch = scope.instructions.find((instruction) => instruction.offset === region.branch);
     lines.push(`    if (${branch.op === "JTRUE" ? "!" : ""}${branchValue(context)}) break $loop${region.id};`);
   } else if (region.kind === "ForIn") {
+    context.expectBranchTest = region.branch;
     emitStraightRange(lines, scope, region.testStart, region.branch, "    ", context);
     const branch = scope.instructions.find((instruction) => instruction.offset === region.branch);
     lines.push(`    if (${branch.op === "JFALSE" ? "!" : ""}${branchValue(context)}) break $loop${region.id};`);
@@ -1093,16 +2003,37 @@ function generateSimpleStructuredIf(scope, region, context) {
   const lines = [`function $exec${scope.id}($r, $f) {`];
   emitScopePrologue(lines, context);
   emitStraightRange(lines, scope, 0, region.testStart, "  ", context);
+  context.expectBranchTest = region.branch;
   emitStraightRange(lines, scope, region.testStart, region.branch, "  ", context);
   const branch = scope.instructions.find((instruction) => instruction.offset === region.branch);
   const consequentWhenTrue = branch.op === "JTRUE" || region.alternateStart === null;
+  // Item 15b: same exclusive-branch mirror correction as emitRegion's If
+  // case — the branch blocks flush count-only placeholders and the join
+  // pops the dead branch's share when both branches have the same net $s
+  // delta (the base is measured after the branchValue pop).
+  const previousExclusive = context.branchExclusive;
+  context.branchExclusive = true;
   lines.push(`  if (${consequentWhenTrue ? "" : "!"}${branchValue(context)}) {`);
+  const mirrorBase = context.runtimeStack ? context.runtimeStack.length : null;
   emitStraightRange(lines, scope, region.consequentStart, region.consequentEnd, "    ", context);
+  const f1 = context.runtimeStack && mirrorBase !== null
+    ? context.runtimeStack.length - mirrorBase
+    : null;
   if (region.alternateStart !== null) {
     lines.push("  } else {");
     emitStraightRange(lines, scope, region.alternateStart, region.alternateEnd, "    ", context);
   }
+  const f2 = context.runtimeStack && f1 !== null
+    ? context.runtimeStack.length - mirrorBase - f1
+    : null;
+  context.branchExclusive = previousExclusive;
   lines.push("  }");
+  const model = context.runtimeStack;
+  if (model && f1 !== null && f1 === f2) {
+    model.length -= f1;
+  } else if (model) {
+    context.runtimeStack = null;
+  }
   emitStraightRange(lines, scope, region.end, scope.codeLength, "  ", context);
   lines.push("}");
   return lines.join("\n");
@@ -1335,6 +2266,7 @@ function generateStructuredScope(scope, plan, context) {
     if (region.kind === "For") {
       emitRange(region.updateStart, region.updateEnd, indent, region);
     } else if (region.kind === "DoWhile") {
+      context.expectBranchTest = region.branch;
       emitRange(region.testStart, region.branch, indent, region);
       lines.push(`${indent}if (${branchCondition(region) ? "!" : ""}${branchValue(context)}) break $loop${region.id};`);
     }
@@ -1345,26 +2277,50 @@ function generateStructuredScope(scope, plan, context) {
     const headers = new Set([region.testStart, region.bodyStart, region.start]);
     (scope.loopInvariantLoads || []).filter((load) => headers.has(load.header)).forEach((load) => {
       lines.push(
-        `${indent}const $h${scope.id}_${load.sourceOffset} = $l[${load.localIndex}];`
+        `${indent}const $h${scope.id}_${load.sourceOffset} = ${hoistedLocalLoad(context, load)};`
       );
     });
   }
 
   function emitRegion(region, indent) {
     if (region.kind === "If" || region.kind === "Conditional") {
+      context.expectBranchTest = region.branch;
       emitRange(region.testStart, region.branch, indent, region);
       const trueConsequent = branchCondition(region) || region.alternateStart === null;
+      // Item 15b: exclusive branch blocks flush their pending values into
+      // the $s mirror as count-only placeholders; at the join, pop the dead
+      // branch's share when both branches have the same net $s delta, else
+      // taint (the count is ambiguous when the taken branch's gain is
+      // unknown). The base is measured after the branchValue pop so the
+      // condition's pop is not charged to the consequent's delta.
+      const previousExclusive = context.branchExclusive;
+      context.branchExclusive = true;
       lines.push(`${indent}if (${trueConsequent ? "" : "!"}${branchValue(context)}) {`);
+      const mirrorBase = context.runtimeStack ? context.runtimeStack.length : null;
       emitRange(region.consequentStart, region.consequentEnd, `${indent}  `, region);
+      const f1 = context.runtimeStack && mirrorBase !== null
+        ? context.runtimeStack.length - mirrorBase
+        : null;
       if (region.alternateStart !== null) {
         lines.push(`${indent}} else {`);
         emitRange(region.alternateStart, region.alternateEnd, `${indent}  `, region);
       }
+      const f2 = context.runtimeStack && f1 !== null
+        ? context.runtimeStack.length - mirrorBase - f1
+        : null;
+      context.branchExclusive = previousExclusive;
       lines.push(`${indent}}`);
+      const model = context.runtimeStack;
+      if (model && f1 !== null && f1 === f2) {
+        model.length -= f1;
+      } else if (model) {
+        context.runtimeStack = null;
+      }
       return;
     }
 
     if (region.kind === "Logical") {
+      context.expectBranchTest = region.branch;
       emitRange(region.leftStart, region.branch, indent, region);
       const branch = instructionsByOffset.get(region.branch);
       const evaluateRightWhenTrue = branch.op === "JFALSE";
@@ -1375,6 +2331,70 @@ function generateStructuredScope(scope, plan, context) {
     }
 
     if (region.kind === "Switch") {
+      // Dense path (item 7b): every non-default case test is a single
+      // compile-time constant (integer/number/string/boolean/null/undefined
+      // or a constant-folded expression) with distinct SameValueZero values,
+      // so the host switch compares the discriminant directly — no per-case
+      // $r.caseJump calls, no selector variable, no guard chain. ES5 switch
+      // semantics are strict equality (===) on the already-evaluated
+      // discriminant, exactly what a native switch implements, and constant
+      // tests have no side effects, so the generic path's short-circuit
+      // guard is vacuous. Distinct SameValueZero labels can never both
+      // ===-match the same input (NaN === x is always false; any other
+      // ===-match fixes the input to the label), so first-match semantics
+      // coincide. Duplicates are rejected for the host compiler (duplicate
+      // case labels are a SyntaxError) and fall back to the generic chain.
+      // The discriminant was materialized by the range's final flush, so
+      // $s.pop() captures it; the guest stack ends up identical to the
+      // generic path (discriminant consumed exactly once on every path).
+      // Gated on the stack-to-local emitter: at O0/O1 there is no `$s`
+      // alias and every op is a runtime call.
+      const caseTests = region.cases.map((caseRegion) => {
+        if (caseRegion.default) return { default: true };
+        const branch = instructionsByOffset.get(caseRegion.branch);
+        if (!branch || branch.unreachable) return { constant: false };
+        const real = [];
+        for (let offset = caseRegion.testStart; offset < caseRegion.branch; offset += 1) {
+          const instruction = instructionsByOffset.get(offset);
+          if (instruction && !instruction.elided) real.push(instruction);
+        }
+        if (real.length !== 1) return { constant: false };
+        const instruction = real[0];
+        if (instruction.optimized && instruction.optimized.kind === "literal") {
+          return { constant: true, value: instruction.optimized.value };
+        }
+        switch (instruction.op) {
+          case "INTEGER":
+          case "NUMBER":
+          case "STRING":
+            return { constant: true, value: instruction.args[0] };
+          case "TRUE": return { constant: true, value: true };
+          case "FALSE": return { constant: true, value: false };
+          case "NULL": return { constant: true, value: null };
+          case "UNDEF": return { constant: true, value: undefined };
+          default: return { constant: false };
+        }
+      });
+      const seen = new Set();
+      const constantCaseCount = caseTests.filter((test) => !test.default).length;
+      const dense = context.enabled && context.denseSwitch && constantCaseCount >= 2 &&
+        caseTests.every((test) => test.default || (test.constant && (seen.has(test.value) ? false : (seen.add(test.value), true))));
+      if (dense) {
+        const discriminant = `$d${region.id}`;
+        emitRange(region.discriminantStart, region.discriminantEnd, indent, region);
+        lines.push(`${indent}const ${discriminant} = $s.pop();`);
+        if (context.runtimeStack) context.runtimeStack.pop();
+        lines.push(`${indent}$switch${region.id}: switch (${discriminant}) {`);
+        region.cases.forEach((caseRegion, index) => {
+          const test = caseTests[index];
+          lines.push(`${indent}  ${test.default ? "default" : `case ${jsLiteral(test.value)}`}:`);
+          emitRange(caseRegion.bodyStart, caseRegion.bodyEnd, `${indent}    `, region);
+        });
+        lines.push(`${indent}}`);
+        context.stats.denseSwitches += 1;
+        context.stats.denseSwitchCases += constantCaseCount;
+        return;
+      }
       const selector = `$case${region.id}`;
       lines.push(`${indent}let ${selector} = -1;`);
       emitRange(region.discriminantStart, region.discriminantEnd, indent, region);
@@ -1482,14 +2502,17 @@ function generateStructuredScope(scope, plan, context) {
     const bodyIndent = `${indent}  `;
     if (region.kind === "DoWhile") {
       emitRange(region.bodyStart, region.bodyEnd, bodyIndent, region);
+      context.expectBranchTest = region.branch;
       emitRange(region.testStart, region.branch, bodyIndent, region);
       lines.push(`${bodyIndent}if (${branchCondition(region) ? "!" : ""}${branchValue(context)}) break $loop${region.id};`);
     } else if (region.kind === "ForIn") {
+      context.expectBranchTest = region.branch;
       emitRange(region.testStart, region.branch, bodyIndent, region);
       lines.push(`${bodyIndent}if (${branchCondition(region) ? "" : "!"}${branchValue(context)}) break $loop${region.id};`);
       emitRange(region.bodyStart, region.bodyEnd, bodyIndent, region);
     } else {
       if (Number.isInteger(region.branch)) {
+        context.expectBranchTest = region.branch;
         emitRange(region.testStart, region.branch, bodyIndent, region);
         lines.push(`${bodyIndent}if (${branchCondition(region) ? "" : "!"}${branchValue(context)}) break $loop${region.id};`);
       }
@@ -1549,17 +2572,66 @@ function generateScope(scope, options, codegenStats) {
     code = code.replace("\n", `\n${declaration}\n`);
     codegenStats.sizeOptimization.temporarySlots += context.sizeTemporarySlots.size;
   }
-  return code;
+  if (context.provenanceSlots && context.provenanceSlots.tracked.size) {
+    // Item 9: declare every tracked slot's $q flag. The stamp is classified
+    // lazily at the first write site (`$q === undefined ? classify : $q`) and
+    // reclassified at every SETLOCAL; an unconditional prologue classification
+    // of parameter slots is deliberately omitted — it would run once per call
+    // even when the function's write sites never execute (early returns), and
+    // the lazy fallback classifies the identical initial value at the first
+    // write, so a prologue classification saves nothing (measured: DeltaBlue
+    // −6.9% with it, recovered on removal). The mapped-arguments guard still
+    // gates staleness for sloppy parameter slots either way.
+    const declaration = `  let ${Array.from(context.provenanceSlots.tracked).map((index) => provenanceFlag(context, index)).join(", ")};`;
+    code = code.replace("\n", `\n${declaration}\n`);
+  }
+  return { code, usesThisWrites: context.usesThisWrites };
 }
 
-function generateLeafFactory(scope, security) {
+// The pooled frame's locals array is only ever read by the $exec body it
+// serves: leaf frames are lightweight and stackless, so no runtime helper
+// observes them (getLocal/setLocal/findBinding walk environment chains the
+// frame does not participate in), and arguments-materialized frames are
+// retired, never pooled. Resetting only the slots the body can actually
+// read keeps the reused array on V8's packed-elements fast path: storing
+// `void 0` into a double-representation array transitions it to generic
+// elements, after which every double-valued local is boxed into a
+// HeapNumber on each acquire. Returns a Set of slot indices, or null to
+// reset every slot when the body does something unusual (computed-index
+// access, a bare reference to the array) that the scan cannot classify.
+function computeLeafLocalsReads(execCode, localCount) {
+  const body = execCode.replace(/const \$l = \$f\.locals;\n?/, "");
+  if (/\$l\b(?!\[\d+\])|\$f\.locals(?!\[)/.test(body)) return null;
+  const reads = new Set();
+  for (const match of body.matchAll(/\$l\[(\d+)\]/g)) {
+    const index = Number(match[1]);
+    if (index >= localCount) return null;
+    const tail = body.slice(match.index + match[0].length);
+    if (!/^\s*=/.test(tail)) reads.add(index);
+  }
+  return reads;
+}
+
+function generateLeafFactory(scope, security, shape = {}) {
   const localCount = scope.variables.length + 1;
   const locals = localsLiteral(scope, localCount);
+  // Retired frames are chained through a poolNext field on the frame object
+  // itself, so the freelist needs no container and never touches
+  // Array.prototype (which trusted-mode guest code could pollute). Frames
+  // that ever materialized an arguments object are retired, never pooled:
+  // the arguments proxy holds the frame and lazily maps its locals, so
+  // reusing the frame would alias a different call's parameters.
+  const pool = shape.framePooling !== false;
+  const localsReads = pool ? shape.localsReads : null;
+  const thisStamp = shape.usesThisWrites && security === "sandbox"
+    ? ", thisIsGuest: $r.boundary.isUnmediatedWriteTarget($this)"
+    : "";
   const lines = [
     `function $make${scope.id}($r, $environment) {`,
     `  const $execute = $exec${scope.id};`,
     `  const $metadata = $meta${scope.id};`,
     "  let $compiled;",
+    ...(pool ? ["  let $poolHead = null;"] : []),
     "  $compiled = function(...$args) {",
     "    let $this = this;",
   ];
@@ -1582,15 +2654,60 @@ function generateLeafFactory(scope, security) {
     "    if (!$metadata.strict) {",
     "      if ($this === void 0 || $this === null) $this = $r.global;",
     "      else if (typeof $this !== \"object\" && typeof $this !== \"function\") $this = Object($this);",
-    "    }",
-    `    const $f = { metadata: $metadata, locals: [${locals}], thisValue: $this, currentFunction: $compiled, callerFrame: $r.currentFrame, callArgs: $args };`
+    "    }"
   );
+  if (pool) {
+    // Acquire: reuse the pooled frame (the slots the body reads are
+    // rewritten in place with the initial values, so no per-call allocation
+    // at all) or build a fresh one. Metadata and currentFunction are
+    // constant per factory, so the reuse path omits them. thisIsGuest is
+    // receiver-dependent and must be re-stamped for the new call. Slots the
+    // body never reads keep whatever the previous call left (or the
+    // literal's `void 0`): the frame is unreachable while pooled, so a
+    // stale value is never observed — and skipping those stores keeps the
+    // reused array on the packed-elements fast path (see
+    // computeLeafLocalsReads). localsReads === null (unclassifiable body)
+    // resets every slot, the safe superset.
+    const slotResets = [];
+    for (let index = 0; index < localCount; index += 1) {
+      if (localsReads && !localsReads.has(index)) continue;
+      const initial = index > 0 && index <= scope.parameterCount ? `$args[${index - 1}]` : "void 0";
+      slotResets.push(`      $f.locals[${index}] = ${initial};`);
+    }
+    lines.push(
+      "    let $f = $poolHead;",
+      "    if ($f) {",
+      "      $poolHead = $f.poolNext;",
+      ...slotResets,
+      "      $f.thisValue = $this;",
+      "      $f.callerFrame = $r.currentFrame;",
+      "      $f.callArgs = $args;",
+      ...(shape.usesThisWrites && security === "sandbox"
+        ? ["      $f.thisIsGuest = $r.boundary.isUnmediatedWriteTarget($this);"]
+        : []),
+      "    } else {",
+      `      $f = { metadata: $metadata, locals: [${locals}], thisValue: $this, currentFunction: $compiled, callerFrame: $r.currentFrame, callArgs: $args${thisStamp} };`,
+      "    }"
+    );
+  } else {
+    lines.push(
+      `    const $f = { metadata: $metadata, locals: [${locals}], thisValue: $this, currentFunction: $compiled, callerFrame: $r.currentFrame, callArgs: $args${thisStamp} };`
+    );
+  }
   lines.push(
     "    $r.currentFrame = $f;",
     "    try {",
     "      return $execute($r, $f);",
     "    } finally {",
     "      $r.currentFrame = $f.callerFrame;",
+    ...(pool
+      ? [
+          "      if (!$f.argumentsInitialized) {",
+          "        $f.poolNext = $poolHead;",
+          "        $poolHead = $f;",
+          "      }",
+        ]
+      : []),
     "    }",
     "  };",
     "  return $initializeCompiled($r, $compiled, $metadata);",
@@ -1601,7 +2718,7 @@ function generateLeafFactory(scope, security) {
 
 function generateFactory(scope, leafFrame = false, security = "sandbox", fastFrame = false, shape = {}) {
   if (scope.script) return null;
-  if (leafFrame) return generateLeafFactory(scope, security);
+  if (leafFrame) return generateLeafFactory(scope, security, shape);
   if (fastFrame) return generateFastFrameFactory(scope, security, shape);
   return [
     `function $make${scope.id}($r, $environment, $execute = $exec${scope.id}, $metadata = $meta${scope.id}) {`,
@@ -1680,6 +2797,11 @@ function generateFastFrameFactory(scope, security, shape = {}) {
   if (shape.needsEnvironment) frameFields.push("environment: null");
   if (shape.needsDynamicBindings) frameFields.push("dynamicBindings: Object.create(null)");
   if (shape.hasLineRefs) frameFields.push("line: 0", "column: 0");
+  // Receiver-write classification stamp: computed once on the secured, boxed
+  // receiver so per-write writeTarget resolution can be skipped for it.
+  if (shape.usesThisWrites && security === "sandbox") {
+    frameFields.push("thisIsGuest: $r.boundary.isUnmediatedWriteTarget($this)");
+  }
   lines.push(`    const $f = { ${frameFields.join(", ")} };`);
   if (shape.needsEnvironment) {
     lines.push(`    $f.environment = { kind: "frame", frame: $f, outer: $environment };`);
@@ -1702,19 +2824,55 @@ function generateFastFrameFactory(scope, security, shape = {}) {
 
 const RUNTIME_IMPORTS = Object.freeze([
   ["applySandboxValue", "$applySandbox"],
+  ["applySandboxValue0", "$applySandbox0"],
+  ["applySandboxValue1", "$applySandbox1"],
+  ["applySandboxValue2", "$applySandbox2"],
+  ["applySandboxValue3", "$applySandbox3"],
+  ["applySandboxValue4", "$applySandbox4"],
+  ["applySandboxValue5", "$applySandbox5"],
   ["applyValue", "$apply"],
   ["constructSandboxValue", "$constructSandbox"],
+  ["constructSandboxValue0", "$constructSandbox0"],
+  ["constructSandboxValue1", "$constructSandbox1"],
+  ["constructSandboxValue2", "$constructSandbox2"],
+  ["constructSandboxValue3", "$constructSandbox3"],
+  ["constructSandboxValue4", "$constructSandbox4"],
+  ["constructSandboxValue5", "$constructSandbox5"],
   ["constructValue", "$construct"],
   ["createProgram", "$createProgram"],
   ["deleteGlobalVariableValue", "$deleteGlobal"],
   ["deleteVariableValue", "$deleteVar"],
   ["getArgumentsValue", "$getArguments"],
   ["getSandboxPropertyValue", "$getSandbox"],
+  // Items 14/15: sanitizing direct-call arms for the inlined host
+  // intrinsics — the runtime helper runs the checked callee and sanitizes
+  // any thrown error like the boundary's applyHost.
+  ["hostCallIntrinsic0", "$hostCall0"],
+  ["hostCallIntrinsic1", "$hostCall1"],
+  ["hostCallIntrinsic2", "$hostCall2"],
+  ["hostCallIntrinsic3", "$hostCall3"],
+  ["hostCallIntrinsic4", "$hostCall4"],
+  ["hostCallIntrinsic5", "$hostCall5"],
   ["initializeCompiledFunction", "$initializeCompiled"],
+  ["isPrototypeSetterUnsafe", "$prototypesHaveSetters"],
   ["instanceOfTarget", "$instanceOfTarget"],
   ["invokeCompiledFunction", "$invokeCompiled"],
   ["readGlobalVariableValue", "$readGlobal"],
   ["readVariableValue", "$readVar"],
+  // Item 15: identity anchors for the member-call host-intrinsic inline. The
+  // generated guard compares a resolved member callee against these raw
+  // prototype functions; as immutable module const bindings, V8 constant-
+  // folds the comparison to a plain reference compare.
+  ["arrayPrototypeJoin", "$hostJoin"],
+  ["arrayPrototypePush", "$hostPush"],
+  ["arrayPrototypeSort", "$hostSort"],
+  ["arrayPrototypeSlice", "$hostSliceArray"],
+  ["arrayPrototypeIndexOf", "$hostIndexOfArray"],
+  ["stringPrototypeCharAt", "$hostCharAt"],
+  ["stringPrototypeIndexOf", "$hostIndexOfString"],
+  ["stringPrototypeSlice", "$hostSliceString"],
+  ["stringPrototypeReplace", "$hostReplace"],
+  ["regexpPrototypeTest", "$hostTest"],
   ["setArgumentsValue", "$setArguments"],
   ["setGuestPropertyValue", "$setGuest"],
   ["setSandboxPropertyValue", "$setSandbox"],
@@ -1735,6 +2893,7 @@ function generate(program, options = {}) {
     fallbackScopes: 0,
     fastFrameScopes: 0,
     leafFrameScopes: 0,
+    framePooledScopes: 0,
     inlineLeafFrameScopes: 0,
     inlineFastFrameScopes: 0,
     inlining: null,
@@ -1748,7 +2907,13 @@ function generate(program, options = {}) {
       stackStores: 0,
       sizeTemporaryAssignments: 0,
       sizeTemporaryReuses: 0,
+      promotedLoads: 0,
+      promotedStores: 0,
+      denseSwitches: 0,
+      denseSwitchCases: 0,
     },
+    localPromotion: null,
+    slotProvenance: null,
   };
   codegenStats.sizeOptimization = {
     enabled: options.optimization === "Os",
@@ -1834,6 +2999,57 @@ function generate(program, options = {}) {
   const directVariableScopeIds = new Set(program.scopes
     .filter((scope) => !hasDynamicChain(scope))
     .map((scope) => scope.id));
+  // Item 6: local promotion (all securities since Phase 3). Slots in
+  // "frame"-layout scopes (O2/Os, non-script, direct variable resolution)
+  // are promoted from `$f.locals` elements to real `$exec` prologue
+  // variables. Soundness: a scope with no CLOSURE op creates no nested
+  // closure, so no other frame's environment chain can ever contain this
+  // frame's environment node — the locals array is unreachable by the
+  // runtime name-walk (findBinding/getVar/setVar/hasVar) and by captured
+  // reads from any descendant (there are none). No with/eval/catch keeps
+  // the scope's own code on the inline path and no dynamicFunctions keeps
+  // it off the `$r.call` fallback; no GETLOCAL2/SETLOCAL2 keeps
+  // capture-visible slots out. The promoted slot keeps its dead `void 0`
+  // placeholder in the locals array, so every frame constructor, the
+  // `$getArguments` parameter mapping, and the metadata layout stay
+  // untouched — only GETLOCAL/SETLOCAL (and LICM hoists) divert to the
+  // variable. Phase 2 ships strict parameters: strict scopes also promote
+  // parameter slots, because `arguments` is unmapped there
+  // (createArgumentsObject builds its `frame.locals`-reading mapped proxy
+  // only for sloppy frames) and fn.arguments/fn.caller are PoisonPill
+  // accessors — no runtime path reads a parameter back through the locals
+  // array. Phase 3 (sandbox): the eligibility has no security term — a
+  // boundary review found no sandbox path that observes frame.locals
+  // (secureValue/writeTarget/isUnmediatedWriteTarget operate on values,
+  // never frames; the getLocal/writeLocalValue evalFrame branches target
+  // the eval caller, which carries the excluded EVAL op). Phase 1's
+  // "trusted only" gate was a staging decision, not a soundness boundary.
+  const promotedLocalPlans = new Map();
+  if (options.optimization === "O2" || options.optimization === "Os") {
+    program.scopes.forEach((scope) => {
+      if (scope.script || !directVariableScopeIds.has(scope.id) ||
+          scope.dynamicFunctions.length) return;
+      if (scope.instructions.some((instruction) =>
+        DYNAMIC_LOCAL_OPERATIONS.has(instruction.op) ||
+        instruction.op === "CLOSURE" ||
+        instruction.op === "GETLOCAL2" ||
+        instruction.op === "SETLOCAL2"
+      )) return;
+      const indexes = new Set();
+      // Phase 2: strict scopes start at slot 1 (parameters included), sloppy
+      // scopes stay above the parameter range (the mapped arguments proxy
+      // reads parameter slots through frame.locals).
+      const firstIndex = scope.strict ? 1 : scope.parameterCount + 1;
+      for (let index = firstIndex; index <= scope.variables.length; index += 1) {
+        indexes.add(index);
+      }
+      if (indexes.size) promotedLocalPlans.set(scope.id, indexes);
+    });
+  }
+  // Item 9: slot-provenance plans ($q flags). The plan maps scopeId to the
+  // tracked/dropped slot sets; the context consults it lazily, so empty plans
+  // only appear for scopes that actually discover write sites.
+  const provenanceSlotPlans = new Map();
   const entryScope = scopesById.get(program.entry);
   const globalNames = new Set(entryScope && entryScope.script ? entryScope.variables : []);
   const codegenOptions = {
@@ -1844,10 +3060,120 @@ function generate(program, options = {}) {
     identifierAliases,
     identifierProtection,
     inlinePlans,
+    promotedLocalPlans,
+    provenanceSlotPlans,
     scopesById,
   };
   const generatedScopes = program.scopes.map((scope) => {
-    let code = generateScope(scope, codegenOptions, codegenStats);
+    let scopeCode;
+    let usesThisWrites;
+    const promoted = promotedLocalPlans.get(scope.id);
+    // Item 9: slot-provenance stamps are eligible under the same isolation
+    // shape as promotion (direct variable resolution, no closures, no
+    // dynamic ops — scope.lightweight implies all three). Mirror the
+    // context's predicate exactly, including the stackToLocal gate.
+    const provenanceEligible = options.slotProvenance !== false &&
+      options.stackToLocal !== false && options.optimization === "O2" &&
+      !scope.script && scope.lightweight && directVariableScopeIds.has(scope.id);
+    if (promoted || provenanceEligible) {
+      // Mixed-path fallback: a stack-height mismatch (e.g. a constant-folded
+      // ternary merge) sends GETLOCAL/SETLOCAL/DELLOCAL through the runtime
+      // helpers, which read and write the locals array — the dead `void 0`
+      // placeholder for a promoted slot. Demote exactly the affected slots
+      // (they stay on the live array) and regenerate. Emission is
+      // deterministic, so one retry per demoted set converges; the guard
+      // below is a backstop against an (unreachable) cycle. A provenance
+      // tracked slot written through $r.setLocal would bypass its $q store
+      // classification, so such slots are dropped from the tracking plan —
+      // permanently, via the dropped set, which keeps regeneration from
+      // re-adding them.
+      const initialCount = promoted ? promoted.size : 0;
+      let attempts = 0;
+      for (;;) {
+        const snapshot = { ...codegenStats.stackToLocal };
+        ({ code: scopeCode, usesThisWrites } = generateScope(scope, codegenOptions, codegenStats));
+        const conflicting = [];
+        Array.from(scopeCode.matchAll(/\$r\.(?:getLocal|setLocal|deleteLocal)\(\$f, (\d+)\)/g),
+          (match) => Number(match[1])).forEach((index) => {
+          if (promoted && promoted.has(index) && !conflicting.includes(index)) conflicting.push(index);
+        });
+        // Belt-and-suspenders against optimizer/codegen predicate drift: a
+        // hoisted load rendered `$l[index]` for a promoted slot would read
+        // the dead placeholder, so such slots are demoted too.
+        Array.from(scopeCode.matchAll(/const \$h\d+_\d+ = \$l\[(\d+)\];/g),
+          (match) => Number(match[1])).forEach((index) => {
+          if (promoted && promoted.has(index) && !conflicting.includes(index)) conflicting.push(index);
+        });
+        const plan = provenanceSlotPlans.get(scope.id);
+        if (plan) {
+          Array.from(scopeCode.matchAll(/\$r\.setLocal\(\$f, (\d+)\)/g),
+            (match) => Number(match[1])).forEach((index) => {
+            if (plan.tracked.has(index) && !conflicting.includes(index)) {
+              plan.tracked.delete(index);
+              plan.dropped.add(index);
+              conflicting.push(index);
+            }
+          });
+        }
+        // A name-based runtime write ($r.setVar — a SETVAR whose operand was
+        // flushed off the model stack) resolves through findBinding and writes
+        // frame.locals directly, bypassing both the promoted variable and the
+        // $q store classification. Demote/drop every slot it targets, exactly
+        // like the indexed setLocal demotions above; the name in the output is
+        // the identifier-protection alias, so map it back through the alias
+        // table.
+        {
+          const aliases = identifierAliases.get(scope.id);
+          const aliasOf = (index) => {
+            const original = scope.variables[index - 1];
+            return aliases && aliases.has(original) ? aliases.get(original) : original;
+          };
+          Array.from(scopeCode.matchAll(/\$r\.setVar\(\$f, ("(?:[^"\\]|\\.)*")\)/g),
+            (match) => JSON.parse(match[1])).forEach((name) => {
+            for (const index of promoted) {
+              if (index >= 1 && index <= scope.variables.length &&
+                  aliasOf(index) === name && !conflicting.includes(index)) conflicting.push(index);
+            }
+            if (plan) {
+              for (const index of Array.from(plan.tracked)) {
+                if (index >= 1 && index <= scope.variables.length && aliasOf(index) === name) {
+                  plan.tracked.delete(index);
+                  plan.dropped.add(index);
+                  if (!conflicting.includes(index)) conflicting.push(index);
+                }
+              }
+            }
+          });
+        }
+        if (!conflicting.length) break;
+        conflicting.forEach((index) => promoted && promoted.delete(index));
+        Object.assign(codegenStats.stackToLocal, snapshot);
+        attempts += 1;
+        if (attempts > initialCount + scope.variables.length + 1) {
+          throw new Error(`Local promotion demotion did not converge in scope ${scope.id}`);
+        }
+      }
+    } else {
+      ({ code: scopeCode, usesThisWrites } = generateScope(scope, codegenOptions, codegenStats));
+    }
+    // Local promotion must never coexist with runtime name-walk or
+    // environment-chain helpers: the eligibility predicate derives frame
+    // isolation from the absence of closures and dynamic operations, so any
+    // of these means the predicate and the emitter have drifted — fail
+    // loudly. ($r.call/$r.construct legitimately appear after a runtime-
+    // stack op — e.g. INITPROP with a non-literal value — without touching
+    // locals; $r.getLocal/setLocal/deleteLocal for promoted indexes and
+    // name-based $r.setVar writes — a SETVAR whose operand was flushed —
+    // are handled by the demotion loop above, which demotes every slot they
+    // touch, so the remaining setVar sites only ever target live-array
+    // slots.)
+    if ((promoted && promoted.size) || provenanceEligible) {
+      const leaked = scopeCode.match(/\$r\.(?:getVar|hasVar|delVar|beginWith|evalStatic|closure)|\$readVar|\$writeVar|\$deleteVar/);
+      if (leaked) {
+        throw new Error(`Local promotion compiled runtime helper ${leaked[0]} into scope ${scope.id}`);
+      }
+    }
+    let code = scopeCode;
     // Non-lightweight scopes resolve bindings through findBinding at runtime,
     // which walks environment frames and reads dynamicBindings; their factory
     // frames must carry the full createFrame field set. Script frames always
@@ -1867,7 +3193,27 @@ function generate(program, options = {}) {
       !code.includes("$f.environment") &&
       !/\$r\.[A-Za-z_$][\w$]*\(\$f/.test(code);
     if (leafFrame) codegenStats.leafFrameScopes += 1;
-    return { scope, code, fastFrame, leafFrame };
+    return { scope, code, fastFrame, leafFrame, usesThisWrites };
+  });
+  // Demotion (mixed-path fallbacks) may have shrunk the plan; report the
+  // final shape. Non-eligible modes leave the plan empty, so zeros here.
+  codegenStats.localPromotion = {
+    eligibleScopes: promotedLocalPlans.size,
+    promotedSlots: Array.from(promotedLocalPlans.values())
+      .reduce((sum, indexes) => sum + indexes.size, 0),
+  };
+  // Item 9: report the final tracking shape (demotion may have dropped
+  // slots). Scopes whose plans shrank to nothing are not counted.
+  codegenStats.slotProvenance = {
+    trackedScopes: 0,
+    trackedSlots: 0,
+    droppedSlots: 0,
+  };
+  provenanceSlotPlans.forEach((plan) => {
+    if (!plan.tracked.size) return;
+    codegenStats.slotProvenance.trackedScopes += 1;
+    codegenStats.slotProvenance.trackedSlots += plan.tracked.size;
+    codegenStats.slotProvenance.droppedSlots += plan.dropped.size;
   });
   // Frames along the ancestor chain of a dynamic (with/eval/catch) scope are
   // walked by runtime binding lookups, so their environment nodes and
@@ -1883,7 +3229,7 @@ function generate(program, options = {}) {
   });
   const generatedFactories = [];
   if (options.perScopeFactories !== false) {
-    generatedScopes.forEach(({ scope, leafFrame, fastFrame, code }) => {
+    generatedScopes.forEach(({ scope, leafFrame, fastFrame, code, usesThisWrites }) => {
       const inlineLeafFrame = leafFrame && options.inlineLeafFrames !== false;
       const inlineFastFrame = fastFrame && !inlineLeafFrame && options.inlineFastFrames !== false;
       const needsEnvironment = inlineFastFrame && (
@@ -1895,8 +3241,14 @@ function generate(program, options = {}) {
         needsEnvironment,
         needsDynamicBindings: dynamicChainAncestorIds.has(scope.id),
         hasLineRefs: code.includes("$f.line"),
+        usesThisWrites,
+        framePooling: options.framePooling !== false,
+        ...(inlineLeafFrame && options.framePooling !== false
+          ? { localsReads: computeLeafLocalsReads(code, scope.variables.length + 1) }
+          : {}),
       });
       if (factory && inlineLeafFrame) codegenStats.inlineLeafFrameScopes += 1;
+      if (factory && inlineLeafFrame && options.framePooling !== false) codegenStats.framePooledScopes += 1;
       if (factory && inlineFastFrame) codegenStats.inlineFastFrameScopes += 1;
       if (factory) generatedFactories.push(factory);
     });
@@ -1910,12 +3262,14 @@ function generate(program, options = {}) {
     '"use strict";',
     `const { ${imports.map(([exported, local]) => `${exported}: ${local}`).join(", ")} } = require(${JSON.stringify(runtimeModule)});`,
   ];
-  generatedScopes.forEach(({ scope, fastFrame, leafFrame }) =>
+  generatedScopes.forEach(({ scope, fastFrame, leafFrame, usesThisWrites }) =>
     lines.push(`const $meta${scope.id} = ${JSON.stringify(metadata(
       scope,
       fastFrame,
       identifierAliases.get(scope.id),
-      leafFrame
+      leafFrame,
+      usesThisWrites,
+      hasWithEvalAncestor(scope)
     ))};`)
   );
   generatedScopes.forEach(({ code }) => lines.push(code));

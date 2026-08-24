@@ -95,6 +95,9 @@ const backend = argument("backend", "");
 const useQuickJS = backend === "quickjs";
 const identifierProtection = argument("identifier-protection", "alias");
 const compileOnly = process.argv.includes("--compile-only");
+const inlineHostIntrinsics = !process.argv.includes("--no-inline-host-intrinsics");
+const inlineMemberIntrinsics = !process.argv.includes("--no-inline-member-intrinsics");
+const deferBranchTest = !process.argv.includes("--no-branch-test-deferral");
 const leafFrames = argument("leaf-frames", "true") !== "false";
 const perScopeFactories = argument(
   "per-scope-factories",
@@ -138,6 +141,9 @@ const compiled = useQuickJS ? null : compile(source, {
   identifierProtection,
   leafFrames,
   perScopeFactories,
+  inlineHostIntrinsics,
+  inlineMemberIntrinsics,
+  deferBranchTest,
   runtimeModule,
 });
 const compileMs = performance.now() - compileStartedAt;
@@ -161,7 +167,8 @@ if (useQuickJS) {
     `compile=${compileMs.toFixed(1)} ms, source=${(Buffer.byteLength(source) / 1000).toFixed(1)} KB, ` +
     `code=${(Buffer.byteLength(compiled.code) / 1000).toFixed(1)} KB, fast=${compiled.stats.codegen.fastFrameScopes}, ` +
     `leaf=${compiled.stats.codegen.leafFrameScopes}, fallback=${compiled.stats.codegen.fallbackScopes}, ` +
-    `aliases=${compiled.stats.codegen.identifierProtection.aliasedBindings}`
+    `aliases=${compiled.stats.codegen.identifierProtection.aliasedBindings}, ` +
+    `intrinsic=${compiled.stats.codegen.inlining.hostIntrinsicCallSites}`
   );
 }
 

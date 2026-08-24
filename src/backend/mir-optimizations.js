@@ -18,11 +18,32 @@ function instructionMap(scope) {
   return new Map(scope.instructions.map((instruction) => [instruction.offset, instruction]));
 }
 
+const DYNAMIC_LOCAL_OPERATIONS = new Set([
+  "WITH", "ENDWITH", "EVAL", "CATCH", "ENDCATCH",
+]);
+
+// Mirrors codegen's hasDynamicChain: with/eval/catch environments shadow name
+// resolution at runtime, so these scopes get no direct frame layout (no `$l`)
+// and their loads must stay on the stack-machine path.
+function hasDynamicChain(scope, scopesById, memo) {
+  if (memo.has(scope.id)) return memo.get(scope.id);
+  const parent = scope.parentId != null ? scopesById.get(scope.parentId) : null;
+  const dynamic = scope.instructions.some((instruction) =>
+    DYNAMIC_LOCAL_OPERATIONS.has(instruction.op)
+  ) || (parent != null && hasDynamicChain(parent, scopesById, memo));
+  memo.set(scope.id, dynamic);
+  return dynamic;
+}
+
 // Locals in a lightweight function are backed by a private array and cannot be
 // observed by with/eval or captured closures. Parameters are deliberately
-// excluded because sloppy arguments can alias them.
+// excluded in sloppy mode because the mapped `arguments` object can alias
+// them; in strict mode `arguments` is unmapped and `fn.arguments`/`fn.caller`
+// are poison-pill accessors, so no aliasing path exists and parameters are
+// propagable like any private local.
 function canPropagateLocal(scope, index) {
-  return scope.lightweight && !scope.script && index > scope.parameterCount;
+  if (!scope.lightweight || scope.script) return false;
+  return index > scope.parameterCount || scope.strict;
 }
 
 function analysisMIR(hirProgram, stats, existingMIR) {
@@ -271,17 +292,47 @@ function loopRegionForHeader(hirScope, header) {
   );
 }
 
+// Item 6 (local promotion) mirror: codegen promotes every non-parameter
+// slot of a direct-variable scope with no closures, no capture-visible slot
+// ops, and no dynamic-function fallback — and, since Phase 2, every slot
+// including parameters when the scope is strict (`arguments` is unmapped
+// there) — to a real `$p<scope>_<index>` prologue variable
+// (src/codegen/index.js, `promotedLocalPlans`). Since Phase 3 the plan has
+// no security term. A LICM hoist of such a slot would compile to
+// `const $h = $p...;` — a pure alias of a register read — so the pass skips
+// it. The mirror is conservative: a mismatch in either direction costs an
+// alias or a lost load elimination, never a miscompile, and codegen's
+// post-generation assertion catches the unsafe drift.
+function isPromotionEligibleScope(scope) {
+  if (scope.dynamicFunctions.length) return false;
+  return !scope.instructions.some((instruction) =>
+    instruction.op === "CLOSURE" ||
+    instruction.op === "GETLOCAL2" ||
+    instruction.op === "SETLOCAL2"
+  );
+}
+
 // Only private non-parameter local reads are hoisted. Such reads cannot invoke
 // guest code, and lightweight scopes prove that with/eval/closures cannot
 // mutate the slot. A loop-local write remains a hard kill.
-function runLoopInvariantCodeMotion(hirProgram, stats, existingMIR) {
+function runLoopInvariantCodeMotion(hirProgram, stats, existingMIR, options = {}) {
   const mir = analysisMIR(hirProgram, stats, existingMIR);
   let loadsHoisted = 0;
   let usesReplaced = 0;
+  // Mirrors the codegen plan (which has no security term since Phase 3).
+  const promotionEligible = true;
 
   mir.scopes.forEach((mirScope) => {
     const hirScope = hirProgram.scopes.find((scope) => scope.id === mirScope.id);
+    // Codegen emits hoisted reads as direct frame accesses (`$l[index]`),
+    // which only exist for scopes with a static local layout. Scopes with a
+    // dynamic chain (with/eval/catch ops, own or inherited) have no frame
+    // layout, and the runtime's stack-based getLocal cannot serve as a
+    // hoisted value expression — so their loads must not be hoisted.
     if (!hirScope.lightweight || hirScope.script || !mirScope.loops.length) return;
+    const scopesById = new Map(hirProgram.scopes.map((scope) => [scope.id, scope]));
+    const dynamicChainMemo = new Map();
+    if (hasDynamicChain(hirScope, scopesById, dynamicChainMemo)) return;
     const instructions = instructionMap(hirScope);
     const loopPlans = mirScope.loops.map((loop) => ({
       ...loop,
@@ -306,6 +357,8 @@ function runLoopInvariantCodeMotion(hirProgram, stats, existingMIR) {
       if (!["GETLOCAL", "GETLOCAL2"].includes(operation.op)) return;
       const index = operation.args[0];
       if (!canPropagateLocal(hirScope, index)) return;
+      if (promotionEligible && isPromotionEligibleScope(hirScope) &&
+          (index > hirScope.parameterCount || hirScope.strict)) return;
       const loop = loopPlans.find((candidate) =>
         candidate.blocks.has(block.start) && !candidate.writes.has(index)
       );
@@ -335,6 +388,169 @@ function runLoopInvariantCodeMotion(hirProgram, stats, existingMIR) {
   });
 
   stats.loopInvariantCodeMotion = { loadsHoisted, usesReplaced };
+  return mir;
+}
+
+// Item 7a (dead-store elimination): a SETLOCAL whose value is never read on
+// any path before the next store (or delete, or scope exit) is dead —
+// "must-use" liveness over the MIR CFG (backward fixpoint: a slot is live
+// at a position iff some path from there reads it before the next
+// store/delete; live grows monotonically and converges in loop-depth passes).
+// This subsumes the same-block store->store case (the kill is simply in the
+// same block) and the scope-level never-read case (the name-binding prologue
+// `CURRENT SETLOCAL name POP` when the body never references its own name,
+// and `var x = init` whose every read was folded by copy-prop). Reads that
+// earlier passes rewrote (`optimized` marks: literal/duplicate/reuse/licm)
+// no longer read the slot — their value comes from the folded literal or a
+// dominating load — so they neither consume nor kill. DELLOCAL is also a
+// no-op here: deleteLocal pushes false for lightweight frames without
+// touching the slot, so the stored value stays observable to later reads
+// (only the op's own no-op body runs; nothing removes the binding).
+// Eligibility is canPropagateLocal (private locals, sloppy non-parameter
+// slots, strict parameters since item 4): mapped sloppy `arguments` can
+// observe PARAMETER slots at runtime through frame.locals (the proxy reads
+// the slot lazily), script scopes are globals, and with/eval/closure scopes
+// have env-chain observers — all excluded. Scopes with a dynamic chain
+// (with/eval/catch ops, own or inherited — hasDynamicChain, same gate as
+// LICM and the codegen's frame layout) are additionally skipped wholesale:
+// every try/catch/finally region carries a CATCH op, so a try body's stores
+// can be read on the exception path (handler/finally/continuation), which
+// the MIR CFG has no edge for, and the runtime name-walk can reach the env
+// node of a nested catch scope that reads this frame's locals by name.
+// Frame-layout scopes can contain none of these, so eliding their dead
+// stores is unobservable. Everything else is unreachable
+// from the runtime name-walk (the promotion soundness argument, Phase 3:
+// no security term), so eliding a store to a never-read slot is
+// unobservable. SETLOCAL is a stack PEEK
+// (codegen's direct path reads the stack top without popping), so eliding a
+// dead store is a pure instruction-skip — no stack traffic to clean, unlike
+// DCE's POP chains; the stored value keeps its original consumer. Elision
+// happens after every value-moving pass (copy-prop, LICM, GVN, local-CSE),
+// so the provenance mark written later cannot go stale.
+function runDeadStoreElimination(hirProgram, stats, existingMIR) {
+  const mir = analysisMIR(hirProgram, stats, existingMIR);
+  let storesEliminated = 0;
+  // Shared across scopes: hasDynamicChain is a pure function of the scope
+  // graph (walking own ops, then the parent chain), so ancestor results are
+  // reused instead of recomputed for every nested scope.
+  const scopesById = new Map(hirProgram.scopes.map((scope) => [scope.id, scope]));
+  const dynamicChainMemo = new Map();
+
+  mir.scopes.forEach((mirScope) => {
+    if (!mirScope.blocks.length) return;
+    const hirScope = hirProgram.scopes.find((scope) => scope.id === mirScope.id);
+    // Scopes with a dynamic chain (with/eval/catch ops, own or inherited) are
+    // skipped wholesale, mirroring LICM and the codegen's frame-layout
+    // decision: their loads run through the runtime's stack-based getLocal,
+    // their env node is reachable from the runtime name-walk (a nested catch
+    // scope can read this frame's locals by name — a read no op-level
+    // liveness can see), and every try/catch/finally region carries a CATCH
+    // op, so the try body's stores can be read on the exception path (the
+    // handler/finally/continuation), which the MIR CFG has no edge for.
+    // Frame-layout scopes can contain none of these, so eliding their dead
+    // stores is unobservable. (test262 S12.14_A15: a `result += 2` store
+    // inside `try {} finally { break }` was mis-elided because the THROW
+    // block has no successors — the finally's `break` path reads the slot.)
+    if (hasDynamicChain(hirScope, scopesById, dynamicChainMemo)) return;
+    const instructions = instructionMap(hirScope);
+    const isRead = (operation) => {
+      if (operation.op !== "GETLOCAL" && operation.op !== "GETLOCAL2") return false;
+      const instruction = instructions.get(operation.offset);
+      // Unmarked (or missing) reads consume the slot. `literal`/`duplicate`/
+      // `licm` reads were rewritten by copy-prop/local-CSE/LICM and no longer
+      // touch it (folded literal, stack-top copy of an adjacent load, or
+      // hoisted-load alias whose own real read DSE sees). `reuse` reads are
+      // NOT safe to elide stores for: the reuse source can lose its temporary
+      // to a later peephole elision, and codegen then falls back to a real
+      // slot read. That costs nothing — no store can sit between a reuse and
+      // its dominating source (any store kills GVN availability), so the
+      // source load's own read already keeps exactly those stores live.
+      if (!instruction || instruction.elided) return false;
+      if (instruction.optimized && instruction.optimized.kind !== "reuse") return false;
+      return true;
+    };
+    const isStore = (operation) =>
+      operation.op === "SETLOCAL" || operation.op === "SETLOCAL2";
+    const isSlotAccess = (operation) =>
+      isStore(operation) || operation.op === "GETLOCAL" || operation.op === "GETLOCAL2";
+
+    // Per-slot must-use liveness. Slots with no stores are skipped; every
+    // access of an eligible slot is assessed exactly once per fixpoint pass.
+    const slots = new Set();
+    mirScope.blocks.forEach((block) => block.operations.forEach((operation) => {
+      if (isSlotAccess(operation)) slots.add(operation.args[0]);
+    }));
+
+    slots.forEach((slot) => {
+      if (!canPropagateLocal(hirScope, slot)) return;
+      // Successors are block START OFFSETS (mirScope.loops headers/backedges
+      // are too), so the liveness maps are keyed by block.start.
+      const liveIn = new Map();
+      const liveOut = new Map();
+      mirScope.blocks.forEach((block) => {
+        liveIn.set(block.start, false);
+        liveOut.set(block.start, false);
+      });
+      let changed = true;
+      let iterations = 0;
+      while (changed && iterations < 256) {
+        changed = false;
+        iterations += 1;
+        mirScope.blocks.forEach((block) => {
+          // Backward transfer: live at a position = live after the block
+          // (needed by some successor) plus any read after the position;
+          // a store satisfies earlier needs and kills them. Reads
+          // rewritten by earlier passes (`optimized` marks) neither read
+          // the slot nor kill it — no-ops, liveness flows through them
+          // unchanged. DELLOCAL is also a no-op: deleteLocal pushes false
+          // for lightweight frames without touching the slot, so a later
+          // read still observes the stored value. The access filter gates
+          // on the op FIRST: other ops' first argument (immediates like
+          // NUMBER values, jump targets) can numerically collide with a
+          // slot index and must never touch liveness.
+          let live = liveOut.get(block.start);
+          for (let i = block.operations.length - 1; i >= 0; i -= 1) {
+            const operation = block.operations[i];
+            if (!isSlotAccess(operation) || operation.args[0] !== slot) continue;
+            if (operation.op === "GETLOCAL" || operation.op === "GETLOCAL2") {
+              if (isRead(operation)) live = true;
+            } else if (isStore(operation)) {
+              live = false;
+            }
+          }
+          const out = block.successors.reduce((acc, start) => acc || liveIn.get(start), false);
+          if (out !== liveOut.get(block.start) || live !== liveIn.get(block.start)) changed = true;
+          liveOut.set(block.start, out);
+          liveIn.set(block.start, live);
+        });
+      }
+      // Fixpoint is stable: elide every store at a dead position. Same
+      // transfer as above — optimized reads and DELLOCAL are no-ops, so a
+      // store that a folded read or a no-op delete sits between and a real
+      // downstream read (same block or successor) stays live.
+      mirScope.blocks.forEach((block) => {
+        let live = liveOut.get(block.start);
+        for (let i = block.operations.length - 1; i >= 0; i -= 1) {
+          const operation = block.operations[i];
+          if (!isSlotAccess(operation) || operation.args[0] !== slot) continue;
+          if (operation.op === "GETLOCAL" || operation.op === "GETLOCAL2") {
+            if (isRead(operation)) live = true;
+            continue;
+          }
+          if (isStore(operation) && !live) {
+            const instruction = instructions.get(operation.offset);
+            if (instruction && !instruction.elided) {
+              instruction.elided = true;
+              storesEliminated += 1;
+            }
+          }
+          live = false;
+        }
+      });
+    });
+  });
+
+  stats.deadStoreElimination = { storesEliminated };
   return mir;
 }
 
@@ -386,6 +602,7 @@ function runDeadCodeElimination(hirProgram, stats, existingMIR) {
 module.exports = {
   runCopyPropagation,
   runDeadCodeElimination,
+  runDeadStoreElimination,
   runGlobalValueNumbering,
   runLocalCSE,
   runLoopInvariantCodeMotion,

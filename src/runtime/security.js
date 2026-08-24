@@ -215,10 +215,11 @@ class SandboxBoundary {
     // Opt-in hot-path counters for sandbox-tax analysis. `profileBoundary`
     // must be enabled at createInstance; counting is skipped otherwise.
     this.stats = {
-      calls: 0, // boundary.call entries
+      calls: 0, // dispatch entries
       guestCalls: 0, // guest-function dispatch (counter + apply)
       hostCalls: 0, // callHost mediations
       constructs: 0, // boundary.construct entries
+      guestConstructs: 0, // guest-function construct fast path (arity-specialized)
       writeTargets: 0, // property writes resolved through the boundary
       mediatedGets: 0, // boundary.get reads
       functionWrites: 0, // property writes whose value needed securing
@@ -315,6 +316,20 @@ class SandboxBoundary {
   // the exact object the caller writes to. Guest proxies cannot steer the
   // resolution (their traps never fire here), so the checked object is always
   // the written object.
+  // Complement of writeTarget's no-op condition, computed without the counter
+  // and without throwing: true iff writeTarget(value) would return `value`
+  // unchanged. Used to classify sandbox `this` receivers once per call so
+  // per-write writeTarget resolution can be skipped on the hot path. The
+  // pinning test asserts the two cannot drift: for any value,
+  // isUnmediatedWriteTarget(v) === false whenever writeTarget(v) throws or
+  // returns a target other than v.
+  isUnmediatedWriteTarget(value) {
+    if (value === this.functionConstructor) return false;
+    if (this.wrapperTargets.get(value) !== undefined) return false;
+    if (isObject(value) && this.protectedValues.has(value)) return false;
+    return true;
+  }
+
   writeTarget(value, operation = "modify") {
     this.count("writeTargets");
     if (value === this.functionConstructor) {
@@ -814,4 +829,4 @@ class SandboxBoundary {
   }
 }
 
-module.exports = { SandboxBoundary, boundaryError, capability };
+module.exports = { SandboxBoundary, boundaryError, capability, sanitizeHostError };

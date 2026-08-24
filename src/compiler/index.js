@@ -58,6 +58,7 @@ class AOTCompiler {
       fallbackScopes: 0,
       fastFrameScopes: 0,
       leafFrameScopes: 0,
+      framePooledScopes: 0,
       inlineLeafFrameScopes: 0,
       inlineFastFrameScopes: 0,
       inlining: null,
@@ -71,7 +72,12 @@ class AOTCompiler {
         stackStores: 0,
         sizeTemporaryAssignments: 0,
         sizeTemporaryReuses: 0,
+        promotedLoads: 0,
+        promotedStores: 0,
+        denseSwitches: 0,
+        denseSwitchCases: 0,
       },
+      localPromotion: null,
     });
     const requestedFactories = options.perScopeFactories;
     const factoryCandidates = optimization === "Os" && requestedFactories === undefined

@@ -1178,6 +1178,132 @@ describe("sablejs guest-object write fast path (local-safe IR distinction)", fun
     }
   });
 
+  it("fast-paths this-writes via the frame stamp and keeps mediated receivers guarded", function () {
+    // Receiver writes (`this.n = ...`) are classified once per call; the
+    // generated code must read the frame stamp instead of resolving
+    // writeTarget per write.
+    const loaded = load(
+      "function Counter() { this.n = 0; }" +
+      "Counter.prototype.inc = function (v) { this.n = this.n + v; return this.n; };" +
+      "var c = new Counter(); c.inc(1); c.inc(2); c.n;",
+      { optimization: "O2" }
+    );
+    const instance = loaded.program.createInstance({ profileBoundary: true });
+    assert.equal(instance.run(), 3);
+    assert.match(loaded.result.code, /\$f\.thisIsGuest/);
+    assert.match(loaded.result.code, /"usesThisWrites":true/);
+    // Exactly one writeTarget remains: the `Counter.prototype.inc` store,
+    // whose base is an unmarked GETVAR result. Both `this.n` writes and the
+    // two `c.inc` calls skip per-write resolution entirely.
+    assert.equal(instance.boundaryStats().writeTargets, 1);
+
+    // The stamp is an exact complement of writeTarget: a protected intrinsic
+    // receiver must still hit the guarded path and throw, at every level.
+    for (const optimization of ["O0", "O1", "O2", "Os"]) {
+      assert.throws(
+        () => run("var o = Math; function F() { this.x = 1; } F.call(o);", undefined, { optimization }),
+        /sablejs sandbox boundary/,
+        `${optimization} allowed a write to a protected receiver`
+      );
+    }
+    // And a plain guest receiver stays writable through the stamp path.
+    for (const optimization of ["O0", "O1", "O2", "Os"]) {
+      assert.equal(
+        run("var o = { n: 1 }; function F() { this.n = this.n + 1; } F.call(o); o.n;", undefined, { optimization }).value,
+        2
+      );
+    }
+  });
+
+  it("fast-paths new-of-guest-closure results and keeps unsafe constructors guarded", function () {
+    // A return-safe guest constructor: `new` always yields the fresh object,
+    // so writes to the result skip writeTarget resolution.
+    const safeLoaded = load(
+      "function Point(x, y) { this.x = x; this.y = y; }" +
+      "var p = new Point(1, 2); p.x = 3; p.x + p.y;",
+      { optimization: "O2" }
+    );
+    const safe = safeLoaded.program.createInstance({ profileBoundary: true });
+    assert.equal(safe.run(), 5);
+    assert.equal(safeLoaded.result.stats.guestProvenance.markedNews, 1);
+    assert.match(safeLoaded.result.code, /setGuestPropertyValue/);
+    assert.equal(safe.boundaryStats().writeTargets, 0);
+
+    // A constructor that can return an object is NOT return-safe: the mark
+    // must be withheld and writes stay on the guarded path.
+    const unsafeLoaded = load(
+      "function G() { return { ok: 1 }; }" +
+      "var g = new G(); g.x = 1; g.x;",
+      { optimization: "O2" }
+    );
+    const unsafe = unsafeLoaded.program.createInstance({ profileBoundary: true });
+    assert.equal(unsafe.run(), 1);
+    assert.equal(unsafeLoaded.result.stats.guestProvenance.markedNews, 0);
+    assert.match(unsafeLoaded.result.code, /setSandboxPropertyValue/);
+    assert.ok(unsafe.boundaryStats().writeTargets > 0);
+
+    // new of an intrinsic name is never marked: the host can inject a
+    // hostile constructor under the same global name at instance creation,
+    // so a static mark would be unsound. Writes to the result stay guarded.
+    const intrinsicLoaded = load(
+      "var a = new Array(3); a[0] = 7; a[1] = 8; a[0] + a[1];",
+      { optimization: "O2" }
+    );
+    const intrinsic = intrinsicLoaded.program.createInstance({ profileBoundary: true });
+    assert.equal(intrinsic.run(), 15);
+    assert.equal(intrinsicLoaded.result.stats.guestProvenance.markedNews, 0);
+    assert.ok(intrinsic.boundaryStats().writeTargets >= 2);
+  });
+
+  it("pins isUnmediatedWriteTarget to writeTarget's no-op condition", function () {
+    // The frame stamp is only sound if it is the exact complement of
+    // writeTarget's resolution: whenever writeTarget(v) throws or returns a
+    // target other than v, isUnmediatedWriteTarget(v) must be false, and
+    // vice versa. Sweep representative values through both.
+    const loaded = run("({ a: 1 });", { print: sablejs.capability(() => 1) });
+    const instance = loaded.instance;
+    const boundary = instance.boundary;
+    const wrapper = instance.global.print;
+    const values = [
+      instance.global,
+      instance.global.Object,
+      globalThis.Math,
+      globalThis.JSON,
+      globalThis.Date,
+      globalThis.Function,
+      boundary.functionConstructor,
+      boundary.redactedToString,
+      wrapper,
+      () => 1,
+      {},
+      [],
+      Object(1),
+      Object.create(null),
+      undefined,
+      null,
+      1,
+      "s",
+      true,
+      NaN,
+    ];
+    for (const value of values) {
+      let noOp;
+      try {
+        // Object.is: `===` is false for NaN, which would mis-flag a genuine
+        // no-op as a target change.
+        noOp = Object.is(boundary.writeTarget(value), value);
+      } catch {
+        noOp = false;
+      }
+      const label = value === null ? "null" : typeof value;
+      assert.equal(
+        boundary.isUnmediatedWriteTarget(value),
+        noOp,
+        `isUnmediatedWriteTarget diverged from writeTarget for a ${label} value`
+      );
+    }
+  });
+
   it("fast-paths phi-joined guest objects and keeps mixed joins guarded", function () {
     const joined = run("var o = (g.flag ? {} : {}); o.x = 1; o.x;", { g: { flag: 1 } }, { optimization: "O2" });
     assert.equal(joined.value, 1);
@@ -1187,5 +1313,265 @@ describe("sablejs guest-object write fast path (local-safe IR distinction)", fun
     const mixed = run("var o = (g.flag ? {} : Math.PI); o.x = 1; o.x;", { g: { flag: 1 } }, { optimization: "O2" });
     assert.equal(mixed.value, 1);
     assert.match(mixed.result.code, /setSandboxPropertyValue/);
+  });
+
+  it("emits arity-specialized dispatch for guest calls and the generic form above five args", function () {
+    const loaded = load(
+      "var f0 = function () { return 0; }; var f1 = function (a) { return a; }; " +
+      "var f5 = function (a, b, c, d, e) { return a + b + c + d + e; }; " +
+      "var f6 = function (a, b, c, d, e, f) { return f; }; " +
+      "f0(); f1(1); f5(1, 2, 3, 4, 5); f6(1, 2, 3, 4, 5, 6);",
+      { optimization: "O2" }
+    );
+    assert.match(loaded.result.code, /applySandboxValue0: \$applySandbox0/);
+    assert.match(loaded.result.code, /applySandboxValue1: \$applySandbox1/);
+    assert.match(loaded.result.code, /applySandboxValue5: \$applySandbox5/);
+    // Six-argument calls keep the generic array form.
+    assert.match(loaded.result.code, /applySandboxValue: \$applySandbox/);
+    assert.match(loaded.result.code, /\$applySandbox\(\$r, [^)]*, \[[^\]]{4,}\]\)/);
+  });
+
+  it("dispatches arities 0-5 and >5 with correct results and this bindings", function () {
+    const source =
+      "var box = { base: 10, call: function () { return this.base; } }; " +
+      "var zero = function () { return 0; }; " +
+      "var one = function (a) { return a; }; " +
+      "var two = function (a, b) { return a * b; }; " +
+      "var three = function (a, b, c) { return a + b + c; }; " +
+      "var four = function (a, b, c, d) { return a - b - c - d; }; " +
+      "var five = function (a, b, c, d, e) { return a + b + c + d + e; }; " +
+      "var six = function (a, b, c, d, e, f) { return a + b + c + d + e + f; }; " +
+      "result = zero() + one(1) + two(2, 3) + three(1, 2, 3) + " +
+      "four(10, 1, 2, 3) + five(1, 2, 3, 4, 5) + six(1, 2, 3, 4, 5, 6) + " +
+      "box.call();";
+    for (const optimization of ["O0", "O1", "O2", "Os"]) {
+      const ran = run(source, undefined, { optimization });
+      assert.equal(ran.value, 0 + 1 + 6 + 6 + 4 + 15 + 21 + 10, `arity dispatch at ${optimization}`);
+    }
+  });
+
+  it("ignores guest-overridden .call/.apply on the fast dispatch path", function () {
+    // The arity-specialized fast path forwards via the captured
+    // Function.prototype.call, so guest code overwriting callable.call must
+    // not hijack the invocation (and the overwritten property is honored by
+    // direct member calls, matching the host).
+    const source =
+      "var hijack = function (a) { return a + 1; }; " +
+      "hijack.call = function () { return 999; }; " +
+      "result = hijack(1) + (hijack.call === Function.prototype.call ? 1 : 0);";
+    const ran = run(source, undefined, { optimization: "O2" });
+    assert.equal(ran.value, 2, "call site dispatches to the closure, not to hijack.call");
+  });
+
+  it("keeps dispatch entry accounting across the arity variants", function () {
+    const loaded = load(
+      "var f = function (a) { return a; }; " +
+      "var h = f; result = h(3);",
+      { optimization: "O2" }
+    );
+    const instance = loaded.program.createInstance({ profileBoundary: true });
+    assert.equal(instance.run(), 3);
+    const stats = instance.boundary.stats;
+    assert.equal(stats.calls, 1, "one dispatch entry");
+    assert.equal(stats.guestCalls, 1, "one guest dispatch");
+    assert.equal(stats.hostCalls, 0, "no host mediation");
+
+    const hostLoaded = load("result = Math.max(3, 7);", { optimization: "O2" });
+    const hostInstance = hostLoaded.program.createInstance({ profileBoundary: true });
+    assert.equal(hostInstance.run(), 7);
+    const hostStats = hostInstance.boundary.stats;
+    assert.equal(hostStats.guestCalls, 0);
+    assert.equal(hostStats.hostCalls, 1);
+  });
+
+  it("throws the host-style TypeError for non-function callables through every arity", function () {
+    for (const source of ["42();", "var t = 1; t(2);", "var s = 'x'; s();", "var u; u();"]) {
+      assert.throws(
+        () => run(source, undefined, { optimization: "O2" }),
+        (error) => error instanceof TypeError && /is not a function/.test(String(error.message)),
+        source
+      );
+    }
+  });
+});
+
+describe("sablejs literal-init fast path (prototype setter guard, audit 2026-08-23)", function () {
+  it("creates own data properties for plain literals in both modes", function () {
+    for (const security of ["sandbox", "trusted"]) {
+      const value = run(
+        "var o = { a: 1, b: 'x', c: null }; [o.a, o.b, o.c === null, Object.getOwnPropertyDescriptor(o, 'a').writable];",
+        undefined,
+        { optimization: "O2", security }
+      ).value;
+      assert.deepStrictEqual(value, [1, "x", true, true], security);
+    }
+  });
+
+  it("initializes array literal holes and length without observing the prototype", function () {
+    const value = run(
+      "var a = [1, , 3]; [a.length, a[0], a[1], a[2], 1 in a];",
+      undefined,
+      { optimization: "O2", security: "trusted" }
+    ).value;
+    assert.deepStrictEqual(value, [3, 1, undefined, 3, false]);
+  });
+
+  it("bypasses inherited setters for literals but not for assignments (trusted mode)", function () {
+    // After a setter lands on Object.prototype, literal init must still
+    // create own data properties (ES5.1 CreateDataProperty). Plain
+    // assignment observes the inherited setter only when no own property
+    // shadows it — and once the literal has created one, re-assignment
+    // writes that own property without touching the setter.
+    const value = run(
+      "var hits = 0; " +
+      "Object.prototype.__defineSetter__('boom', function () { hits += 1; }); " +
+      "var o = { boom: 41 }; " +   // literal init: own data prop, setter not fired
+      "o.boom = 42; " +            // own prop shadows the setter: still not fired
+      "var o2 = {}; " +
+      "o2.boom = 5; " +            // no own prop: assignment fires the setter
+      "var result = [o.boom, hits, Object.getOwnPropertyDescriptor(o, 'boom').writable, o2.boom]; " +
+      "delete Object.prototype.boom; " +
+      "result;",
+      undefined,
+      { optimization: "O2", security: "trusted" }
+    ).value;
+    assert.deepStrictEqual(value, [42, 1, true, undefined]);
+  });
+
+  it("treats an accessor descriptor with set: undefined as unsafe for assignment", function () {
+    const value = run(
+      "var hits = 0; " +
+      "Object.defineProperty(Object.prototype, 'k', { set: function () { hits += 1; }, configurable: true }); " +
+      "var o = { k: 7 }; " +
+      "[o.k, hits];",
+      undefined,
+      { optimization: "O2", security: "trusted" }
+    ).value;
+    assert.deepStrictEqual(value, [7, 0]);
+  });
+
+  it("keeps __proto__ literal keys as data properties (ES5.1, not prototype assignment)", function () {
+    const value = run(
+      "var p = { marker: 1 }; var o = { __proto__: p }; " +
+      "[o.__proto__ === p, Object.getOwnPropertyDescriptor(o, '__proto__').writable, o.marker];",
+      undefined,
+      { optimization: "O2", security: "trusted" }
+    ).value;
+    assert.deepStrictEqual(value, [true, true, undefined]);
+  });
+
+  it("keeps literal semantics stable after defineProperties setter installs", function () {
+    const value = run(
+      "var hits = 0; " +
+      "Object.defineProperties(Object.prototype, { g: { set: function () { hits += 1; } } }); " +
+      "var o = { g: 5 }; " +
+      "[o.g, hits];",
+      undefined,
+      { optimization: "O2", security: "trusted" }
+    ).value;
+    assert.deepStrictEqual(value, [5, 0]);
+  });
+
+  it("keeps sandbox literals immune to prototype setter attempts (blocked mutation)", function () {
+    assert.throws(
+      () => run(
+        "Object.prototype.__defineSetter__('boom', function () {}); 1;",
+        undefined,
+        { optimization: "O2", security: "sandbox" }
+      ),
+      /sablejs sandbox boundary/,
+      "sandbox must block prototype setter installation"
+    );
+  });
+
+  it("bypasses getter-only accessors installed via defineProperty (no 'set' key)", function () {
+    // A getter-only accessor is still an accessor: assignment through it
+    // has no setter to call (TypeError in the strict runtime module), so
+    // literal init must not assign — the guard flags any accessor, not
+    // just setters. Plain sloppy assignment on a missing own key stays a
+    // silent no-op (the getter still answers reads).
+    const value = run(
+      "Object.defineProperty(Object.prototype, 'k', { get: function () { return 9; }, configurable: true }); " +
+      "var v = 7; " +
+      "var o = {k: v}; " +
+      "var o2 = {}; " +
+      "o2.k = 5; " +
+      "[o.k, o2.k, Object.getOwnPropertyDescriptor(o, 'k').writable];",
+      undefined,
+      { optimization: "O2", security: "trusted" }
+    ).value;
+    assert.deepStrictEqual(value, [7, 9, true]);
+  });
+
+  it("bypasses getter-only accessors installed via __defineGetter__", function () {
+    const value = run(
+      "Object.prototype.__defineGetter__('q', function () { return 10; }); " +
+      "var v = 7; " +
+      "var o = {q: v}; " +
+      "var result = [o.q]; " +
+      "delete Object.prototype.q; " + // __defineGetter__ installs enumerable; don't leave it
+      "result;",
+      undefined,
+      { optimization: "O2", security: "trusted" }
+    ).value;
+    assert.deepStrictEqual(value, [7]);
+  });
+
+  it("bypasses getter-only accessors installed via defineProperties", function () {
+    const value = run(
+      "Object.defineProperties(Object.prototype, { r: { get: function () { return 11; } } }); " +
+      "var v = 7; " +
+      "var o = {r: v}; " +
+      "[o.r];",
+      undefined,
+      { optimization: "O2", security: "trusted" }
+    ).value;
+    assert.deepStrictEqual(value, [7]);
+  });
+
+  it("keeps literal inits intact after a failed sloppy __proto__ chain swap", function () {
+    // Modern hosts make Object.prototype an immutable-prototype exotic: a
+    // __proto__ write on it throws (sloppy included), so the chain never
+    // changes — the write-path guard flag is defensive for hosts without
+    // that behavior. This pins host parity: the write throws and a
+    // subsequent literal still creates own data properties.
+    const value = run(
+      "var hits = 0; " +
+      "var caught = false; " +
+      "try { Object.prototype.__proto__ = { set k(f) { hits += 1; } }; } catch (e) { caught = true; } " +
+      "var v = 7; " +
+      "var o = {k: v}; " +
+      "[caught, o.k, hits, Object.getOwnPropertyDescriptor(o, 'k').writable];",
+      undefined,
+      { optimization: "O2", security: "trusted" }
+    ).value;
+    assert.deepStrictEqual(value, [true, 7, 0, true]);
+  });
+
+  it("keeps literal inits intact after a failed strict __proto__ chain swap", function () {
+    const value = run(
+      '"use strict"; ' +
+      "var caught = false; " +
+      "try { Object.prototype.__proto__ = { a: 1 }; } catch (e) { caught = true; } " +
+      "var v = 7; " +
+      "var o = {k: v}; " +
+      "[caught, o.k, Object.getOwnPropertyDescriptor(o, 'k').writable];",
+      undefined,
+      { optimization: "O2", security: "trusted" }
+    ).value;
+    assert.deepStrictEqual(value, [true, 7, true]);
+  });
+
+  it("keeps literal inits intact after a failed Reflect.set __proto__ swap", function () {
+    const value = run(
+      "var caught = false; " +
+      "try { Reflect.set(Object.prototype, '__proto__', { a: 1 }); } catch (e) { caught = true; } " +
+      "var v = 7; " +
+      "var o = {k: v}; " +
+      "[caught, o.k, Object.getOwnPropertyDescriptor(o, 'k').writable];",
+      undefined,
+      { optimization: "O2", security: "trusted" }
+    ).value;
+    assert.deepStrictEqual(value, [true, 7, true]);
   });
 });
