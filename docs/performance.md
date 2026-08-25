@@ -1,6 +1,25 @@
 # Performance
 
-Higher scores are better. Results below were collected on Linux x64 with Node.js 24.14.0, V8 13.6, an Intel Core i5-12400F, and `quickjs-emscripten` 0.32.0.
+[README](../README.md) · [Get started](../README.md#quick-start) · [Migration](migration-v2.md) · [Security](security.md) · [Choosing an execution model](comparison.md)
+
+Each section states whether higher or lower values are better and whether its
+figures are medians or single measured runs. Results were collected on Linux
+x64 with Node.js 24.14.0, V8 13.6, an Intel Core i5-12400F, and
+`quickjs-emscripten` 0.32.0.
+
+## At a glance
+
+| Benchmark | sablejs O2 sandbox | QuickJS-WASM 0.32.0 | Sampling |
+| --- | ---: | ---: | --- |
+| V8 Benchmark Suite 7 score (higher is better) | 2,202 | 1,181 | median of 3 |
+| SunSpider 1.0, 23 tests (ms; lower is better) | 515.5 | 597.7 | median of 3 |
+| Kraken 1.1, 14 tests (ms; lower is better) | 15,935.3 | 27,081.9 | single run |
+
+On this reference harness, sablejs sandbox reaches 1.86x the QuickJS-WASM V8
+Benchmark Suite score and completes the SunSpider and Kraken subsets 1.16x
+and 1.70x faster. These comparisons characterize this machine, corpus, and
+harness—not universal application performance. The full sections below
+document adaptations, exclusions, artifact sizes, variance, and reproduction.
 
 ## V8 Benchmark Suite 7
 
@@ -115,7 +134,7 @@ Octane is pinned to final revision `570ad1ccfe86e3eecba0636c8f932ac08edec517`. O
 | Box2D | 3,017 | 2,296 | 3,608 |
 | **Geometric score** | **2,674** | **2,088** | **1,472** |
 
-Sandbox retains 78.1% of trusted throughput on the Octane subset and scores 1.42x QuickJS-WASM. All generated scopes used structured or straight-line codegen (`fallbackScopes=0`). Octane figures are single measured runs; the other suites below use three-sample medians. (* Splay for sandbox/QuickJS is derived from the same run's geometric score — the printed score is the geometric mean over the nine metrics including SplayLatency — with under 1% derivation error, smaller than the run-to-run variance.)
+Sandbox retains 78.1% of trusted throughput on the Octane subset and scores 1.42x QuickJS-WASM. All generated scopes used structured or straight-line codegen (`fallbackScopes=0`). Octane figures are single measured runs; SunSpider uses three-sample medians, while Kraken also uses single measured runs. (* Splay for sandbox/QuickJS is derived from the same run's geometric score — the printed score is the geometric mean over the nine metrics including SplayLatency — with under 1% derivation error, smaller than the run-to-run variance.)
 
 ### Pre-items baseline A/B (2026-08-24)
 

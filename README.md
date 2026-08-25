@@ -1,24 +1,37 @@
-![LOGO](./logo.jpg)
+<h1 align="center">
+  <img src="./logo.jpg" alt="sablejs" width="720">
+</h1>
+
+**A fast, debuggable AOT execution layer for user-authored and AI-generated JavaScript—without an embedded JavaScript VM.**
 
 [![Ubuntu CI](https://github.com/ErosZy/sablejs/actions/workflows/ci.yml/badge.svg)](https://github.com/ErosZy/sablejs/actions/workflows/ci.yml)
+[![npm beta](https://img.shields.io/npm/v/sablejs/beta?label=npm%20beta)](https://www.npmjs.com/package/sablejs)
 [![License](https://img.shields.io/github/license/ErosZy/sablejs)](LICENSE)
 [![Release](https://img.shields.io/github/v/release/ErosZy/sablejs)](https://github.com/ErosZy/sablejs/releases)
 
-sablejs is a **small AOT-compiled execution layer** for running **user-authored and AI-generated JavaScript** in browsers. Guest code gets **standard ECMAScript objects, copied data, and explicit capabilities** — not ambient access to the host object graph or platform APIs. It is built for **rules, plugins, formulas, and other untrusted logic**.
+> sablejs was inspired by Figma's [journey to a WebAssembly-based plugin sandbox](https://www.figma.com/blog/how-we-built-the-figma-plugin-system/) and its later use of the [QuickJS runtime](https://www.figma.com/plugin-docs/updates/2020/07/07/version-1-update-16/). As AI reshapes how software is built, sablejs is evolving around three goals:
+>
+> 1. **Fast by design.** AOT-compile guest code into host JavaScript instead of interpreting it inside an embedded VM.
+> 2. **Built to be debugged.** Emit Source Map v3 mappings and expose generated code, HIR, and MIR for inspection.
+> 3. **Built for AI-generated code.** Make generated programs easier to constrain, integrate, inspect, and test.
+
+sablejs compiles ES5.1 guest programs into direct host JavaScript. In the default `sandbox` mode, guest code receives standard ECMAScript objects, copied data, and explicit capabilities—not ambient access to the host object graph or platform APIs. Modern syntax can be downleveled before compilation, and generated artifacts run in browsers, Workers, Node, Deno, and Bun.
+
+[Get started](#quick-start) · [npm](https://www.npmjs.com/package/sablejs) · [Migrate from v1](docs/migration-v2.md) · [Compare approaches](docs/comparison.md) · [Browser example](examples/browser/) · [Worker example](examples/worker/) · [Performance](docs/performance.md) · [Security](docs/security.md)
 
 ## Why sablejs
 
-sablejs AOT-compiles untrusted JavaScript into direct host JavaScript while limiting guest access to **standard ECMAScript objects, copied data, and explicit capabilities**.
+- **Host-engine execution.** Precompiled programs run as direct JavaScript on the host engine; the normal `run()` path does not evaluate guest source at runtime.
+- **No embedded JavaScript VM.** There is no interpreter binary to initialize or another VM layer to debug.
+- **Explicit boundaries.** Sandbox globals are copied, host functions become revocable capabilities, and ambient platform APIs remain unavailable unless deliberately exposed.
+- **Practical debugging.** Source maps, generated code, HIR, and MIR connect runtime failures back to guest programs.
+- **Operational isolation.** Dedicated Worker support lets hosts enforce wall-clock timeouts around compute-only programs.
 
-- The normal precompiled `run()` path does not evaluate guest source at
-  runtime. The optional trusted-artifact `worker.evaluate()` loader uses
-  `new Function` at Worker privilege and is documented separately.
-- No ambient browser APIs. 
-- No embedded JavaScript VM.
+On the reference V8 Benchmark Suite 7 run, sablejs O2 sandbox scores **2,202**, compared with **1,181** for QuickJS-WASM 0.32.0. These are harness-specific results, not a universal performance claim; see the [methodology and full results](docs/performance.md).
 
 ## Use cases
 
-- **AI-generated code**: safely run LLM-generated transforms, formulas, and automation logic.
+- **AI-generated code**: run LLM-generated transforms, formulas, and automation logic behind explicit data and capability boundaries, with dedicated Worker isolation for compute-only programs.
 - **User plugins**: execute user-defined extensions without exposing the host environment directly.
 - **Rules and formulas**: power validators, pricing logic, workflows, and spreadsheet-like expressions.
 - **Code playgrounds**: run interactive user code in a constrained browser environment.
@@ -27,41 +40,21 @@ sablejs AOT-compiles untrusted JavaScript into direct host JavaScript while limi
 modern JS -> ES5.1 -> sablejs AOT -> Worker -> application
 ```
 
-## Install and build
+## Install
 
-Install the published v2 beta from npm (currently `2.0.0-beta.4`; the v2
-series is in beta, and `latest` still points at the v1 line until 2.0.0
-goes stable):
+Install the published v2 beta from npm. The v2 series is currently under the
+`beta` tag; `latest` remains on the v1 line until v2 goes stable.
 
 ```sh
 npm install sablejs@beta
 ```
-
-For the ES6+ downlevel and bundling step you also want `@babel/core`, `@babel/preset-env`, and `esbuild` as devDependencies.
-
-### Build from source
-
-```sh
-git clone git@github.com:ErosZy/sablejs.git
-cd sablejs
-npm ci
-npm run build
-```
-
-`npm run build` bundles the publishable single-file artifacts into `dist/`:
-
-| artifact | description |
-| --- | --- |
-| `dist/runtime.js` | standalone runtime only (no compiler), for Worker and browser use |
-| `dist/compiler.js` | full package bundle (compiler + runtime + worker helpers) |
-
-`npm publish` runs the build automatically via `prepublishOnly`.
 
 ## Quick start
 
 Compile an ES5.1 program — a script with no imports that returns its result as the final expression — then create an instance and run it:
 
 ```js
+// build.cjs
 const fs = require("node:fs");
 const { compile } = require("sablejs");
 const generated = compile("({ total: input.price * 1.2 });");
@@ -69,20 +62,39 @@ fs.writeFileSync("program.cjs", generated.code);
 ```
 
 ```js
+// run.cjs
 const program = require("./program.cjs");
 const instance = program.createInstance({
   globals: { input: { price: 100 } },
 });
 
 try {
-   // { total: 120 } — synchronous, returns the value
+  // { total: 120 } — synchronous, returns the value
   console.log(instance.run());
 } finally {
   instance.dispose();
 }
 ```
 
+```sh
+node build.cjs && node run.cjs
+```
+
 The default `security: "sandbox"` mode recursively copies plain `globals` data, so guest mutations do not reach the host object graph. One `instance.run()` call executes the program; instances are single-run and meant to be disposed.
+
+## Examples
+
+- [Node quick start, errors, and guest functions](examples/node/)
+- [Browser bundle with inline source maps](examples/browser/)
+- [Worker isolation and timeouts](examples/worker/)
+- [Build-time precompilation](examples/precompile/)
+- [Compiled-artifact caching](examples/caching/)
+- [Deno](examples/deno/) and [Bun](examples/bun/)
+- [All examples and expected output](examples/README.md)
+
+Modern JavaScript should be downleveled with Babel or SWC before compilation.
+Browser artifacts can then be bundled with tools such as esbuild; the browser
+and Worker examples show the complete pipeline.
 
 ## TypeScript
 
@@ -112,14 +124,6 @@ an opaque `CapabilityToken` type. The worker client (`sablejs/worker`) is
 typed over a structural `SandboxWorker`, which the browser `Worker` satisfies
 directly and Node's `worker_threads.Worker` satisfies through a small adapter
 (see `examples/worker/host.cjs`).
-
-## Examples
-
-Runnable examples for every runtime live in `examples/` (see
-[examples/README.md](examples/README.md)): Node quick start, error handling,
-and guest function calls; trusted-mode direct `globalThis` access; build-time
-precompilation; a compiled-artifact cache; Worker isolation; a browser
-bundle; Deno; and Bun.
 
 ## Calling program functions
 
@@ -271,6 +275,10 @@ await sandbox.run({ price: 100 }); // { total: 120 }
 await sandbox.evaluate(artifactCode, { price: 100 });
 ```
 
+`evaluate()` accepts compiler-produced artifacts, not arbitrary guest source.
+The default loader uses `new Function` at Worker privilege, so only evaluate
+artifacts the host trusts.
+
 `run` and `evaluate` return promises (a message round-trip), unlike the in-process `instance.run()` above, which is synchronous. Per-run timeouts terminate the Worker, responses are validated, and each message runs a fresh instance — the worker survives many calls. The message channel carries plain data only, so functions cannot cross it: capabilities are an in-process feature, and the Worker is for compute-only programs (see [Worker isolation](docs/worker-isolation.md) for injecting capabilities worker-side). The full build pipeline (Babel downlevel, esbuild bundling) and size budgets are in [Worker isolation](docs/worker-isolation.md). Do not place secrets in client-side bundles.
 
 ## Sandbox semantics
@@ -309,7 +317,10 @@ The conformance gate's corpus policy — which Test262 tests are eligible, which
 
 ## Performance
 
-Three-run medians on the Linux x64 reference machine (methodology, exclusions, and variance: [Performance](docs/performance.md)):
+Results from the Linux x64 reference machine are shown below. V8 Benchmark
+Suite 7 and SunSpider use three-run medians; Octane and Kraken are single
+measured runs. See [Performance](docs/performance.md) for methodology,
+exclusions, and variance.
 
 | Backend | V8 Benchmark Suite 7 score | vs sandbox |
 | --- | ---: | ---: |
@@ -331,15 +342,39 @@ An internal boundary audit completed on 2026-08-22 found no known usable escape 
 
 ## Documentation
 
-- [Architecture](docs/architecture.md) 
-- [Compatibility](docs/compatibility.md) 
-- [Fuel budgets](docs/fuel-budget.md) 
-- [Performance](docs/performance.md) 
-- [Security](docs/security.md) 
-- [Worker isolation](docs/worker-isolation.md) 
+- [Architecture](docs/architecture.md)
+- [Choosing an execution model](docs/comparison.md)
+- [Compatibility](docs/compatibility.md)
+- [Fuel budgets — research design, not implemented](docs/fuel-budget.md)
+- [Migrating from v1 to v2](docs/migration-v2.md)
+- [Performance](docs/performance.md)
+- [Security](docs/security.md)
+- [Source maps](docs/source-maps.md)
+- [Worker isolation](docs/worker-isolation.md)
 - [Roadmap](docs/roadmap.md)
+- [Changelog](CHANGELOG.md)
 
 ## Development
+
+### Build from source
+
+```sh
+git clone https://github.com/ErosZy/sablejs.git
+cd sablejs
+npm ci
+npm run build
+```
+
+`npm run build` creates the publishable single-file artifacts in `dist/`:
+
+| artifact | description |
+| --- | --- |
+| `dist/runtime.js` | standalone runtime only, for Worker and browser use |
+| `dist/compiler.js` | compiler, runtime, and Worker helpers |
+
+`npm publish` runs the build automatically via `prepublishOnly`.
+
+### Verification
 
 ```sh
 npm ci
@@ -359,7 +394,8 @@ Semantic changes must also pass the pinned Test262 gate, and performance changes
 Bump the version in `package.json` (sync `package-lock.json` too), push to master, and wait for Ubuntu CI to go green. Then tag the release and push the tag:
 
 ```sh
-git tag v2.0.0-beta.4 && git push origin v2.0.0-beta.4
+version=$(node -p '"v" + require("./package.json").version')
+git tag "$version" && git push origin "$version"
 ```
 
 The `release.yml` workflow requires the tag commit to be contained in

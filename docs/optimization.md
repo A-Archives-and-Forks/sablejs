@@ -1,5 +1,7 @@
 # Backend Optimization
 
+[README](../README.md) · [Get started](../README.md#quick-start) · [Migration](migration-v2.md) · [Security](security.md) · [Performance](performance.md)
+
 Record of the 2026-08-23/24 backend optimization batch: each item section holds its mechanism, soundness argument, kill switch, measurement tables, and the bugs the gates caught. Items are ordered by expected throughput impact; the ordering section at the end defines the implementation sequence and the evidence gate that each item passed.
 
 **Loop status (2026-08-24): complete.** Items 1–18 shipped and measured (item 16 was a negative result and was rolled back); item 19 closed the loop — a refreshed real-speed decomposition found the remaining top costs intrinsic (interp dispatch plus guest-function/property sandbox mediation). The compact per-item summary lives in [Performance](performance.md) (Optimization batch) and [Roadmap](roadmap.md) (P1 — Sandbox tax).

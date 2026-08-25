@@ -1,5 +1,7 @@
 # Generated-code source maps
 
+[README](../README.md) · [Get started](../README.md#quick-start) · [Migration](migration-v2.md) · [Security](security.md) · [Performance](performance.md)
+
 Status: **Slices 1-3 implemented (2026-08-25), review fixes applied
 (2026-08-25).** This document covers source
 maps for the CommonJS artifact returned by `compile()`. It deliberately

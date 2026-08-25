@@ -1,12 +1,14 @@
 # Worker isolation
 
+[README](../README.md) · [Get started](../README.md#quick-start) · [Migration](migration-v2.md) · [Security](security.md) · [Performance](performance.md)
+
 The language boundary controls what guest code can reach. It deliberately does not control how long guest code runs or how much memory it uses. A dedicated Worker gives the host a separately terminable execution agent; `sablejs/worker` enforces a wall-clock timeout. Browser Workers do not expose a portable hard memory quota, so combine termination with source/input/output limits and host-specific memory controls where available. Never reuse a terminated Worker.
 
 `sablejs/worker` provides the two small pieces that make this workflow reliable: a host-side client with per-run timeouts and response validation, and a worker-side message handler that creates and disposes an instance per request.
 
 ## Compiling at build time
 
-Install sablejs (v2 beta, currently `2.0.0-beta.4`), Babel, and esbuild:
+Install the sablejs v2 beta, Babel, and esbuild:
 
 ```sh
 npm install sablejs@beta

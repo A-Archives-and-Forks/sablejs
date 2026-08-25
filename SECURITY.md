@@ -1,5 +1,7 @@
 # Security policy
 
+[README](README.md) · [Threat model](docs/security.md) · [Worker isolation](docs/worker-isolation.md) · [Migration](docs/migration-v2.md)
+
 sablejs treats sandbox escapes, host-object access, capability-boundary
 bypasses, host-information disclosure, and Worker protocol vulnerabilities as
 security issues.

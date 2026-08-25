@@ -1,9 +1,23 @@
 # sablejs examples
 
-Runnable examples for every documented way to use sablejs. Each directory is
-self-contained; run them from the repository root. They `require("sablejs")`
-through the package's own `exports` map (Node-style self-reference), so no
-install beyond `npm install` at the repository root is needed.
+[README](../README.md) · [Get started](../README.md#quick-start) · [Migration](../docs/migration-v2.md) · [Security](../docs/security.md) · [Worker isolation](../docs/worker-isolation.md)
+
+Choose the example closest to the application you are building:
+
+| Goal | Start here |
+| --- | --- |
+| Evaluate a rule or transform in Node | [`node/basic.cjs`](node/basic.cjs) |
+| Precompile once and ship only the runtime artifact | [`precompile/`](precompile/) |
+| Enforce a wall-clock timeout | [`worker/`](worker/) |
+| Build a browser or playground integration | [`browser/`](browser/) |
+| Compile many short or AI-generated programs | [`caching/`](caching/) and the Worker document's `evaluate()` pattern |
+| Expose narrow host operations | [`node/functions.cjs`](node/functions.cjs) |
+
+The commands below are intended for a repository checkout. Application users
+can copy the relevant pattern after installing `sablejs@beta`; the examples
+also ship in the npm package for offline reference. Inside this repository,
+each directory is self-contained and uses the package's own `exports` map, so
+no install beyond `npm install` at the repository root is needed.
 
 CI keeps every example working: `npm run check:examples` spawns each one
 exactly as the table below says and asserts on its documented output (Deno

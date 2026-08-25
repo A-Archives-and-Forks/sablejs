@@ -1,5 +1,7 @@
 # Roadmap
 
+[README](../README.md) · [Get started](../README.md#quick-start) · [Migration](migration-v2.md) · [Security](security.md) · [Performance](performance.md)
+
 Status markers: ✅ Done · ◐ Partial · ⬜ Not started.
 Priority principle: **security correctness > semantic correctness > real-world evidence > DX > performance > benchmark scores**.
 
@@ -20,18 +22,18 @@ The 2026-08-22 top-10 priorities are all done:
 9. ✅ README positioning (versus eval/iframe/QuickJS, ES5.1 core strategy)
 10. ✅ ES5.1 strategy documented (README + [Security](security.md))
 
-## Current snapshot (2026-08-24)
+## Current snapshot (2026-08-25)
 
 - **Security**: a full boundary audit ([Security](security.md), Historical audit record) found no usable escape; the zero-skipped adversarial regression battery lives in `test/unit/security.test.js`, now including the boundary-internals sweep, the clone-shape sweep (P0-S1–S4), the provenance-v2 write fast-path pins, the arity-specialized dispatch pins, and the object-literal folding pins. Vulnerability disclosure is defined in the repository `SECURITY.md`.
 - **Performance**: V8 Benchmark Suite 7 sandbox 2,202, trusted 2,783 (three-run medians, [Performance](performance.md)); the sandbox beats QuickJS-WASM on 7 of the 8 real-world workloads (mini-parser at parity). The 2026-08-23/24 optimization batch (items 1–19, fully recorded in the [Optimization history](optimization.md)) shipped guest-provenance v2, arity-specialized call/NEW dispatch, literal folding, local promotion, slot-provenance write stamps, the inline guest-stamp write path, the literal-init fast path and its inlined/deep-folded successors, the sandbox-only host-intrinsic call inlines, frame-stack sync simplification, and branch-test round-trip elimination; item 16 measured flat and was rolled back. Cumulative Octane A/B vs the pre-items HEAD: **+37% geomean** across 8 suites (Splay 2.25×, EarleyBoyer 2.14×, RayTrace 1.67×, NavierStokes 1.48×; Richards −12% unattributable). The loop exited at item 19 — a refreshed real-speed decomposition found the remaining costs intrinsic (interp dispatch + guest-function/property sandbox mediation). **Measurement protocol: all in-session A/Bs are pinned to one core (`taskset -c 11`) — the machine runs other projects' benchmark jobs, so unpinned numbers are unreliable.**
 - **Semantics**: the pinned Test262 gate passes 14,293/14,293 variants with zero host failures. Native A/B failures are no longer automatic waivers: an exact, reviewed host-failure policy is required and is currently empty.
+- **Debuggability**: opt-in Source Map v3 output is implemented for all optimization levels, including inline/external maps, Node and browser integration evidence, and virtual sources for static `eval`/`Function` bodies.
 
 ## Next priorities
 
-1. ✅ **Local-safe IR distinction** (v1 shipped 2026-08-22) — the guest-object provenance pass proves which GETLOCAL outputs are guest-created (literals, closures, phi joins) and sandbox property writes to them skip `writeTarget` via the slim `$setGuest` helper, keeping `secureValue` + strict/sloppy dispatch. Security tests pin that unmarked writes (intrinsics, capability tokens, globals, parameters) stay on the guarded path byte-for-byte.
-2. ✅ **Backend optimization batch** (2026-08-23/24) — guest-provenance v2, strict-parameter propagation, arity-specialized call/construct dispatch, literal folding, local promotion, intrinsic call inlines, and the measured follow-ups shipped with security and differential gates. Full evidence is in [Optimization history](optimization.md).
-3. ◐ **Facet fuzzing** — semantics and sandbox-boundary facets plus generated-code syntax validation are in CI; parser/capability-serializer expansion and a nightly campaign remain.
-4. **Benchmark reporting automation** — automatically generate the performance markdown and archive benchmark JSON with environment info.
+1. ◐ **Facet fuzzing** — semantics and sandbox-boundary facets plus generated-code syntax validation are in CI; parser/capability-serializer expansion and a nightly campaign remain.
+2. ⬜ **Benchmark reporting automation** — automatically generate the performance markdown and archive benchmark JSON with environment info.
+3. ⬜ **Fuel-budget prototype** — implement and measure the research design before committing to a public API.
 
 ## Open work by priority
 
@@ -48,9 +50,9 @@ The 2026-08-22 top-10 priorities are all done:
 
 - ✅ Worker helper, timeouts, message validation, force termination: `sablejs/worker` + [Worker isolation](worker-isolation.md).
 - ✅ Source-size / input-size / output-size budget examples ([Worker isolation](worker-isolation.md), Budgets beyond time).
-- ✅ Research done (see entry below; implementation pending).
+- ◐ Fuel-budget research and design are complete; implementation is pending.
 - ✅ Protection for long-blocking or infinite async capabilities: timeout-wrapper pattern documented ([Worker isolation](worker-isolation.md), Timeout-wrapping long or never-ending capabilities) — `Promise.race` wrapper for async capabilities (guest-visible sanitized timeout error, AbortSignal for real cancellation, wrapper timeout below worker `timeoutMs`), and the explicit rule that sync-blocking capabilities can only be enforced by the Worker timeout.
-- ✅ Compile-time loop instrumentation and instruction/fuel budgets researched — design doc [fuel-budget.md](fuel-budget.md): `FUELCHECK` ops on natural-loop headers (from `cfg.loops`) + call sites, `host` classification so no pass can eliminate them, zero default-path cost, and the catch-retry hole with the uncatchable-sentinel fix in the `TRY`/`ENDTRY` catch lowering. Implementation pending (prototype + measurement first).
+- ◐ Compile-time loop instrumentation and instruction/fuel budgets are designed but not implemented — see [fuel-budget.md](fuel-budget.md): `FUELCHECK` ops on natural-loop headers (from `cfg.loops`) + call sites, `host` classification so no pass can eliminate them, zero default-path cost, and the catch-retry hole with the uncatchable-sentinel fix in the `TRY`/`ENDTRY` catch lowering. A prototype and measurement come before any public API commitment.
 
 ### P1 — Semantic correctness
 
@@ -117,7 +119,9 @@ The 2026-08-22 top-10 priorities are all done:
 
 - ✅ `docs/architecture.md`, `docs/performance.md`, `docs/security.md` (with threat model), `docs/worker-isolation.md`.
 - ◐ O0/O1/O2/Os design goals (brief version in [Architecture](architecture.md); expand).
-- ✅ Dedicated compatibility contract. Separate capabilities, migration, and limitations documents remain optional if the current README/security/Worker material outgrows its sections.
+- ✅ Dedicated compatibility contract with a user-facing support summary.
+- ✅ V1-to-v2 migration guide and execution-model comparison.
+- ◐ A separate capabilities reference remains optional if the current README/security/Worker material outgrows its sections.
 
 ### P3 — ES version strategy
 

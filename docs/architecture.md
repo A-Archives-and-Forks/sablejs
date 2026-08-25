@@ -1,5 +1,7 @@
 # Architecture
 
+[README](../README.md) · [Get started](../README.md#quick-start) · [Migration](migration-v2.md) · [Security](security.md) · [Performance](performance.md)
+
 sablejs compiles ES5.1 source into CommonJS ahead-of-time modules. The generated code uses native JavaScript values and objects; it does not ship an opcode dispatcher or evaluate source at runtime.
 
 ## Layers

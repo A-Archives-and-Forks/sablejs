@@ -1,4 +1,26 @@
-# Compatibility: the ES5.1 conformance contract
+# Compatibility
+
+[README](../README.md) · [Get started](../README.md#quick-start) · [Migration](migration-v2.md) · [Security](security.md) · [Performance](performance.md)
+
+## At a glance
+
+| Surface | v2 beta contract |
+| --- | --- |
+| Guest source | ES5.1 script with no imports; return a result as the final completion value |
+| Modern syntax | Downlevel with Babel or SWC before `compile()`; no automatic polyfills |
+| Generated output | CommonJS artifact; bundle with esbuild or another tool for browsers and other module formats |
+| Execution modes | `sandbox` by default; explicit `trusted` pass-through mode for fully trusted programs |
+| Dynamic code | Literal static `eval`/`Function` inputs can be AOT-compiled; runtime-generated source is unavailable |
+| Debugging | Optional inline or external Source Map v3 plus generated-code, HIR, and MIR inspection |
+| Resource control | Dedicated Worker timeout and host-enforced size limits; no portable browser hard-memory quota |
+| Release-tested hosts | Node 24, Deno 2, Bun, Chromium, Firefox, and WebKit |
+| Language evidence | Release-gated, pinned Test262 tests carrying the ES5-era `es5id` marker |
+
+Newer built-ins such as typed arrays, `Map`, `Set`, `Promise`, `Symbol`,
+`BigInt`, `Reflect`, `Proxy`, `Atomics`, `WeakRef`, and `Intl` follow host
+availability. They do not expand the ES5.1 syntax accepted by the compiler.
+
+## ES5.1 conformance methodology
 
 The pinned Test262 gate is the executable form of sablejs's ES5.1 contract:
 every run compiles each eligible test, executes it in a trusted-mode instance,

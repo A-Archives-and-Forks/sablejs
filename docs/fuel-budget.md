@@ -1,5 +1,7 @@
 # Fuel budgets: compile-time loop instrumentation (research design)
 
+[README](../README.md) · [Get started](../README.md#quick-start) · [Migration](migration-v2.md) · [Security](security.md) · [Performance](performance.md)
+
 Status: **research + design, not implemented.** The Worker timeout remains the
 wall-clock enforcement mechanism. This design is an optional, opt-in,
 never-the-default resource-control layer that bounds *productive work*

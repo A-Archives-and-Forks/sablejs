@@ -1,6 +1,8 @@
 # Security model and threat model
 
-sablejs compiles ES5.1 source ahead of time into direct JavaScript. The security goal is **controlled execution**: untrusted, user-authored, or AI-generated code must be able to compute with copied data through a narrow, explicit API — and must not reach host objects, host globals, or host code paths.
+[README](../README.md) · [Get started](../README.md#quick-start) · [Migration](migration-v2.md) · [Worker isolation](worker-isolation.md) · [Security policy](../SECURITY.md)
+
+sablejs compiles ES5.1 source ahead of time into direct JavaScript. The security goal is **controlled execution**: untrusted, user-authored, or AI-generated code must be able to compute with copied data through a narrow, explicit API—and must not reach host objects, host globals, or host code except through capabilities the host deliberately grants.
 
 ## Threat model
 

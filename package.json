@@ -1,7 +1,7 @@
 {
   "name": "sablejs",
   "version": "2.0.0-beta.5",
-  "description": "ES5.1 native-object ahead-of-time compiler and runtime",
+  "description": "Fast, debuggable AOT execution for user-authored and AI-generated JavaScript",
   "main": "src/index.js",
   "types": "types/index.d.ts",
   "exports": {
@@ -29,6 +29,7 @@
     "!examples/**/dist/",
     "!examples/**/out/",
     "README.md",
+    "CHANGELOG.md",
     "LICENSE",
     "SECURITY.md",
     "THIRD_PARTY_NOTICES",
@@ -37,6 +38,18 @@
   "directories": {
     "test": "test"
   },
+  "keywords": [
+    "javascript",
+    "sandbox",
+    "aot",
+    "compiler",
+    "untrusted-code",
+    "ai-generated-code",
+    "plugin",
+    "source-map",
+    "web-worker",
+    "ecmascript"
+  ],
   "scripts": {
     "test": "node --test test/unit/*.test.js",
     "test:differential": "node test/differential/fuzz.js --seed=1 --cases=2000 --quiet",
