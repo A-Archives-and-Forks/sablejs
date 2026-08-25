@@ -2,22 +2,31 @@
   <img src="./logo.jpg" alt="sablejs" width="720">
 </h1>
 
-**A fast, debuggable AOT execution layer for user-authored and AI-generated JavaScript—without an embedded JavaScript VM.**
+<p align="center">
+  <strong>Fast, debuggable execution for user-authored and AI-generated JavaScript.</strong><br>
+  AOT-compiled to host JavaScript, with no embedded JavaScript VM.
+</p>
 
-[![Ubuntu CI](https://github.com/ErosZy/sablejs/actions/workflows/ci.yml/badge.svg)](https://github.com/ErosZy/sablejs/actions/workflows/ci.yml)
-[![npm beta](https://img.shields.io/npm/v/sablejs/beta?label=npm%20beta)](https://www.npmjs.com/package/sablejs)
-[![License](https://img.shields.io/github/license/ErosZy/sablejs)](LICENSE)
-[![Release](https://img.shields.io/github/v/release/ErosZy/sablejs)](https://github.com/ErosZy/sablejs/releases)
+<p align="center">
+  <a href="https://github.com/ErosZy/sablejs/actions/workflows/ci.yml"><img alt="Ubuntu CI" src="https://github.com/ErosZy/sablejs/actions/workflows/ci.yml/badge.svg"></a>
+  <a href="https://www.npmjs.com/package/sablejs"><img alt="npm beta" src="https://img.shields.io/npm/v/sablejs/beta?label=npm%20beta"></a>
+  <a href="LICENSE"><img alt="License" src="https://img.shields.io/github/license/ErosZy/sablejs"></a>
+  <a href="https://github.com/ErosZy/sablejs/releases"><img alt="Release" src="https://img.shields.io/github/v/release/ErosZy/sablejs"></a>
+</p>
 
-> sablejs was inspired by Figma's [journey to a WebAssembly-based plugin sandbox](https://www.figma.com/blog/how-we-built-the-figma-plugin-system/) and its later use of the [QuickJS runtime](https://www.figma.com/plugin-docs/updates/2020/07/07/version-1-update-16/). As AI reshapes how software is built, sablejs is evolving around three goals:
->
-> 1. **Fast by design.** AOT-compile guest code into host JavaScript instead of interpreting it inside an embedded VM.
-> 2. **Built to be debugged.** Emit Source Map v3 mappings and expose generated code, HIR, and MIR for inspection.
-> 3. **Built for AI-generated code.** Make generated programs easier to constrain, integrate, inspect, and test.
+> sablejs was inspired by Figma's [journey to a WebAssembly plugin sandbox](https://www.figma.com/blog/how-we-built-the-figma-plugin-system/) and its later use of the [QuickJS runtime](https://www.figma.com/plugin-docs/updates/2020/07/07/version-1-update-16/). Its current focus is fast, debuggable execution for user-authored and AI-generated code.
 
-sablejs compiles ES5.1 guest programs into direct host JavaScript. In the default `sandbox` mode, guest code receives standard ECMAScript objects, copied data, and explicit capabilities—not ambient access to the host object graph or platform APIs. Modern syntax can be downleveled before compilation, and generated artifacts run in browsers, Workers, Node, Deno, and Bun.
+1. **Fast by design** — AOT-compiled host JavaScript, without an embedded VM.
+2. **Debuggable** — Source Map v3, generated code, and HIR/MIR inspection.
+3. **Built for generated code** — explicit boundaries and repeatable compilation make programs easier to integrate, inspect, and test.
 
-[Get started](#quick-start) · [npm](https://www.npmjs.com/package/sablejs) · [Migrate from v1](docs/migration-v2.md) · [Compare approaches](docs/comparison.md) · [Browser example](examples/browser/) · [Worker example](examples/worker/) · [Performance](docs/performance.md) · [Security](docs/security.md)
+sablejs compiles ES5.1 guest programs into direct host JavaScript. Modern syntax can be downleveled before compilation, and generated artifacts run in browsers, Workers, Node, Deno, and Bun.
+
+In the default `sandbox` mode, guest code receives standard ECMAScript objects, copied data, and explicit capabilities—not ambient access to the host object graph or platform APIs.
+
+**Start:** [Quick start](#quick-start) · [npm](https://www.npmjs.com/package/sablejs) · [Browser example](examples/browser/) · [Worker example](examples/worker/)
+
+**Learn:** [Migrate from v1](docs/migration-v2.md) · [Compare approaches](docs/comparison.md) · [Performance](docs/performance.md) · [Security](docs/security.md)
 
 ## Why sablejs
 
