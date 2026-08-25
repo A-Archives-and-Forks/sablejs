@@ -50,6 +50,10 @@ jobs:
         run: npm ci
       - name: Run unit and adversarial tests
         run: npm test
+      - name: Type-check declarations (CJS and ESM consumers)
+        run: npm run check:types
+      - name: Run every example and assert its output
+        run: npm run check:examples
       - name: Run and archive the pinned Test262 gate
         run: |
           npm run upstream:fetch -- test262

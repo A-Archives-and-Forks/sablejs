@@ -64,9 +64,15 @@ const save = capability((plainRecord) => ({ saved: true }));
 
 `compile` returns generated CommonJS code, metadata, and deterministic pass/codegen statistics. Load the module, call `createInstance`, then call `run` and `dispose`.
 
+TypeScript declarations for the whole surface (compile options, capability and source-map settings, the artifact's `CompiledProgram`/`RuntimeInstance` shapes, the worker client) ship in `types/` and are wired through the `exports` map; `npm run check:types` type-checks CJS and ESM fixtures against them. Runnable examples for Node, browser, Worker, Deno, Bun, build-time precompilation, artifact caching, and error handling live in `examples/`.
+
+Compile options include the optimization level, security mode, inspection options (`dumpDir`, `includeHIR`, `dumpIR`), and the opt-in `sourceMap` option. Source maps are built from the `LOC` operations the frontend already places at each statement start: in map mode the optimizer retains them (via the shared `retainSourceLocations` flag it also uses for `preserveSourceLocations`), codegen lowers them to private markers stripped by a final pass that simultaneously builds the v3 map, and the Os candidate size model measures marker-free bytes so candidate selection is unchanged. Statement-level mappings at all four optimization levels, deterministic output, inline/external forms, `dumpDir` integration, the Node engine and browser integration evidence, and the virtual-source handling for static eval/Function bodies (runtime-dynamic eval stays unmapped) are covered in [source-maps.md](source-maps.md). With `sourceMap` unset, generated code and statistics are byte-for-byte identical to the pre-map build.
+
 ## Verification
 
 - Unit tests: `npm test`
+- Type declaration gate: `npm run check:types`
+- Runnable examples gate: `npm run check:examples` — spawns every example in `examples/` exactly as `examples/README.md` documents (Node unconditionally; Deno and Bun when installed) and asserts on their documented output, so the corpus stays working in CI
 - Pinned Test262 ES5.1 gate: `npm run upstream:fetch -- test262 && npm run test262`
 - Performance smoke test: `npm run benchmark:smoke`
 - Multi-suite comparison backends: `npm run benchmark:sunspider -- --backend=quickjs` and `npm run benchmark:kraken -- --backend=sablejs-sandbox`

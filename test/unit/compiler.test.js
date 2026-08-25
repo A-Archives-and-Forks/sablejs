@@ -130,6 +130,26 @@ describe("sablejs OpSpec and AOT backend", function() {
     assert(result.stats.codegen.stackToLocal.helpersAvoided > 0);
   });
 
+  it("keeps stackToLocal:false on the explicit-stack fallback at O2/Os", function() {
+    // Promotion plans build $l locals that only exist on the lowered path;
+    // with stackToLocal disabled the emitter falls back to the explicit
+    // stack, so plans must not be built (the drift guard would otherwise
+    // fail a legal compile — regression: "$r.getVar" leak).
+    for (const optimization of ["O2", "Os"]) {
+      for (const security of ["sandbox", "trusted"]) {
+        const source = "var x=1; function f(a){ return a+x; } f(4);";
+        const { result, value } = run(source, undefined, { optimization, security, stackToLocal: false });
+        assert.equal(value, 5, `${optimization} ${security} semantics`);
+        assert.equal(result.stats.codegen.stackToLocal.enabled, false, `${optimization} ${security} stats`);
+        assert.equal(result.stats.codegen.localPromotion.promotedSlots, 0, `${optimization} ${security} plans`);
+        // The fallback resolves variables through the runtime helpers rather
+        // than lowering them into JIT-friendly locals.
+        assert(result.code.includes("$r.getVar($f"), `${optimization} ${security} fallback lookup`);
+        assert(!result.code.includes("const $v"), `${optimization} ${security} no lowered locals`);
+      }
+    }
+  });
+
   it("supports direct control-flow block calls", function() {
     const source = "var i = 0; while (i < 5) { i++; } if (i === 5) { i + 10; } else { 0; }";
     assert.equal(run(source).value, 15);

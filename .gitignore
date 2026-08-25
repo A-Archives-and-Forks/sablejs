@@ -3,6 +3,7 @@ node_modules
 dist
 .vscode
 .cache
+out
 .DS_Store
 benchmark/suite.aot*.cjs
 test-results

@@ -3,15 +3,31 @@
   "version": "2.0.0-beta.4",
   "description": "ES5.1 native-object ahead-of-time compiler and runtime",
   "main": "src/index.js",
+  "types": "types/index.d.ts",
   "exports": {
-    ".": "./src/index.js",
-    "./runtime": "./src/runtime/index.js",
-    "./worker": "./src/worker.js"
+    ".": {
+      "types": "./types/index.d.ts",
+      "default": "./src/index.js"
+    },
+    "./runtime": {
+      "types": "./types/runtime.d.ts",
+      "default": "./src/runtime/index.js"
+    },
+    "./worker": {
+      "types": "./types/worker.d.ts",
+      "default": "./src/worker.js"
+    }
   },
   "files": [
     "src/",
     "dist/",
     "docs/",
+    "types/",
+    "!types/typecheck/",
+    "examples/",
+    "!examples/.cache/",
+    "!examples/**/dist/",
+    "!examples/**/out/",
     "README.md",
     "LICENSE",
     "SECURITY.md",
@@ -28,6 +44,8 @@
     "test:unit": "node --test test/unit/*.test.js",
     "test262": "node --expose-gc test/conformance/test262.js",
     "test:e2e:build": "node test/e2e/build.js",
+    "check:types": "tsc -p types/typecheck/tsconfig.json",
+    "check:examples": "node --test test/examples/*.test.js",
     "test:e2e:node": "node .cache/e2e/program.js",
     "test:e2e:deno": "deno run .cache/e2e/program.js",
     "test:e2e:bun": "bun .cache/e2e/program.js",
@@ -61,14 +79,18 @@
   "devDependencies": {
     "@babel/core": "7.29.7",
     "@babel/preset-env": "7.29.7",
+    "@jridgewell/trace-mapping": "^0.3.31",
     "@playwright/test": "1.62.1",
+    "@types/node": "^26.3.0",
     "esbuild": "0.28.2",
     "prettier": "2.8.8",
     "quickjs-emscripten": "^0.32.0",
+    "typescript": "5.9.3",
     "uglify-js": "3.19.3",
     "yaml": "2.9.0"
   },
   "dependencies": {
+    "@jridgewell/gen-mapping": "^0.3.13",
     "acorn": "8.18.0",
     "chalk": "4.1.2"
   }

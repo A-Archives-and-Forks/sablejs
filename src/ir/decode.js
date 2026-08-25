@@ -66,6 +66,11 @@ function decodeProgram(rootScope) {
         cases: (region.cases || []).map((caseRegion) => ({ ...caseRegion })),
       })),
       syntheticRanges: (scope.syntheticRanges || []).map((range) => ({ ...range })),
+      // Frontend-attached descriptor for synthetic eval/Function sources
+      // (see src/frontend/compiler.js): { text, lines, columns } mapping the
+      // parsed synthetic text to the guest-recognizable source. Absent for
+      // ordinary root/lexical scopes.
+      syntheticSource: scope.syntheticSource || null,
       instructions: [],
       codeLength: scope.opcode.length,
     };

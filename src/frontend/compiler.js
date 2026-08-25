@@ -983,11 +983,21 @@ class Compiler {
       if (evalstr === -1) {
         this.emitter.emit(scope, scope.et.push(evalstr) - 1);
       } else {
-        evalstr = scope.strict ? `'use strict';${evalstr}` : evalstr;
+        // Source maps expose the eval body as a virtual source
+        // (`<root>#eval-N`). The parsed text may carry a `'use strict';`
+        // prefix injected here, so record the geometry that maps parsed
+        // positions back to the eval string exactly as the guest wrote it.
+        const strictPrefix = scope.strict ? "'use strict';" : "";
+        const parsed = `${strictPrefix}${evalstr}`;
         const compiler = new Compiler({
           structuredMetadata: this.structuredMetadata,
         });
-        const evalScope = compiler.compile(evalstr, scope.strict);
+        const evalScope = compiler.compile(parsed, scope.strict);
+        evalScope.syntheticSource = {
+          text: evalstr,
+          lines: 0,
+          columns: strictPrefix.length,
+        };
         this.emitter.emit(scope, scope.et.push(evalScope) - 1);
       }
     } catch (e) {
@@ -1022,12 +1032,28 @@ class Compiler {
       }
 
       const funcName = `_dynamic_${DYNAMIC_COMPILE_INDEX++}`;
-      const funcStr = `function ${funcName}(${params.join(",")}){ ${body} }`;
+      const prefix = `function ${funcName}(${params.join(",")}){ `;
+      const funcStr = `${prefix}${body} }`;
       const compiler = new Compiler({
         structuredMetadata: this.structuredMetadata,
       });
       const funcScope = compiler.compile(funcStr, false);
-      this.emitter.emitNumber(scope, { value: scope.dft.push(funcScope.ft[0]) - 1 });
+      // Source maps expose the body as a virtual source (`<root>#dynamic-N`).
+      // The descriptor's `lines`/`columns` are the prefix geometry: how many
+      // parsed lines the wrapper occupies and how long its final line is.
+      // Body line 1 starts at the end of the prefix's last line, so its
+      // columns shift by `columns`; later body lines are fresh parsed lines
+      // and map to themselves. The geometry generalizes to multi-line
+      // parameter lists (a param string may contain newlines) — `lines` is
+      // the wrapper's newline count, `columns` the length of its last line.
+      const rootScope = funcScope.ft[0];
+      const prefixLines = prefix.split(/\r\n|\n|\r/);
+      rootScope.syntheticSource = {
+        text: body,
+        lines: prefixLines.length - 1,
+        columns: prefixLines[prefixLines.length - 1].length,
+      };
+      this.emitter.emitNumber(scope, { value: scope.dft.push(rootScope) - 1 });
     } catch (e) {
       throw new SyntaxError(e.message);
     }

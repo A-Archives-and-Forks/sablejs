@@ -227,7 +227,12 @@ function optimizeProgram(program, requestedLevel, options = {}) {
     currentProgram.scopes.forEach((scope) => eliminateUnreachableBlocks(scope, stats));
   });
 
-  if ((level === "O2" || level === "Os") && options.preserveSourceLocations !== true) {
+  // Source-map generation consumes LOC positions at compile time, so it
+  // retains them exactly like preserveSourceLocations does for runtime
+  // frame-location tracking.
+  const retainSourceLocations = options.retainSourceLocations === true ||
+    options.preserveSourceLocations === true;
+  if ((level === "O2" || level === "Os") && !retainSourceLocations) {
     passes.run("strip-source-locations", (currentProgram) => {
       // Elides LOC instructions (debug markers only, no runtime effect).
       currentProgram.scopes.forEach((scope) => stripSourceLocations(scope, stats));

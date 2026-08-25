@@ -12,6 +12,8 @@ const entryPath = path.join(outputDirectory, "entry.cjs");
 const outputPath = path.join(outputDirectory, "program.js");
 const compilerEntryPath = path.join(outputDirectory, "compiler-entry.cjs");
 const compilerOutputPath = path.join(outputDirectory, "compiler-browser.js");
+const mapInlineEntryPath = path.join(outputDirectory, "map-inline-entry.cjs");
+const mapInlineOutputPath = path.join(outputDirectory, "map-inline.js");
 const runtimeModule = path.join(repositoryRoot, "src/runtime");
 
 const source = `
@@ -127,6 +129,57 @@ esbuild.buildSync({
   external: ["fs", "path"],
 });
 
+// Inline source-map evidence: compile a throwing guest program with
+// sourceMap: "inline" inside the browser bundle, run the inline-mapped
+// artifact in-page through a CommonJS shim backed by the bundled runtime,
+// and stash the compile-time map plus the runtime outcome. The data URL
+// exercises the browser base64 path (no Buffer) end to end.
+fs.writeFileSync(mapInlineEntryPath, `
+"use strict";
+
+const { compile } = require(${JSON.stringify(path.join(repositoryRoot, "src"))});
+const source = [
+  "function fail() {",
+  "  throw new Error(\\"guest boom\\");",
+  "}",
+  "fail();",
+].join("\\n");
+const result = compile(source, {
+  optimization: "O2",
+  runtimeModule: "sablejs/runtime",
+  sourceMap: "inline",
+});
+
+const requireShim = (id) => {
+  if (id === "sablejs/runtime") return require("sablejs/runtime");
+  throw new Error("unexpected module: " + id);
+};
+let outcome = null;
+try {
+  const module = { exports: {} };
+  new Function("require", "module", "exports", result.code)(requireShim, module, module.exports);
+  module.exports.createInstance({}).run();
+} catch (error) {
+  outcome = { name: error.name, message: error.message };
+}
+globalThis.__sablejs_map_inline_e2e_result__ = {
+  code: result.code,
+  map: result.map,
+  outcome,
+};
+`);
+
+esbuild.buildSync({
+  entryPoints: [mapInlineEntryPath],
+  outfile: mapInlineOutputPath,
+  bundle: true,
+  format: "iife",
+  platform: "browser",
+  target: ["es2020"],
+  logLevel: "warning",
+  external: ["fs", "path"],
+});
+
 console.log(
   `Built ${path.relative(repositoryRoot, outputPath)} ` +
   `(${(fs.statSync(outputPath).size / 1000).toFixed(1)} KB)`
@@ -134,4 +187,8 @@ console.log(
 console.log(
   `Built ${path.relative(repositoryRoot, compilerOutputPath)} ` +
   `(${(fs.statSync(compilerOutputPath).size / 1000).toFixed(1)} KB)`
+);
+console.log(
+  `Built ${path.relative(repositoryRoot, mapInlineOutputPath)} ` +
+  `(${(fs.statSync(mapInlineOutputPath).size / 1000).toFixed(1)} KB)`
 );

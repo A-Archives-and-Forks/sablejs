@@ -6,9 +6,10 @@ const { verifyProgram } = require("../ir/verify");
 const { lowerToMIR: lowerProgramToMIR, verifyMIR } = require("../ir/mir");
 const { optimizeProgram, normalizeLevel } = require("../backend/optimizer");
 const { generate, normalizeIdentifierProtection } = require("../codegen");
+const { finalizeSourceMap, sourceMapURLComment, stripMarkers } = require("../codegen/source-map");
 const { printProgram, printMIR } = require("../ir/print");
 const { ABI_VERSION } = require("../runtime");
-const { utf8ByteLength } = require("../platform");
+const { base64EncodeUtf8, utf8ByteLength } = require("../platform");
 
 // Inspection-mode file adapter. compile() writes the HIR/MIR/code dumps
 // through this three-method surface, so the browser bundle never executes
@@ -31,6 +32,107 @@ function normalizeSecurity(value) {
   throw new Error(`Unknown sablejs security mode ${value}`);
 }
 
+// Normalizes the sourceMap compile option into the internal settings object
+// consumed by codegen and the map finalizer. Returns null when disabled.
+// Validation failures (unknown modes, empty filenames, non-boolean
+// sourcesContent, newline-containing URLs) surface here, before any code is
+// generated. Logical filenames are never inferred from the caller's cwd.
+function normalizeSourceMapOptions(value) {
+  if (value === undefined || value === false || value === null) return null;
+  if (value === true || value === "external") {
+    return {
+      mode: "external",
+      sourceFile: "<sablejs-input>",
+      generatedFile: "generated.cjs",
+      sourceMapURL: undefined,
+      sourcesContent: false,
+    };
+  }
+  if (value === "inline") {
+    return {
+      mode: "inline",
+      sourceFile: "<sablejs-input>",
+      generatedFile: "generated.cjs",
+      sourceMapURL: undefined,
+      sourcesContent: false,
+    };
+  }
+  if (typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(
+      "Invalid sourceMap option: expected an object, \"external\", \"inline\", or a boolean"
+    );
+  }
+  const mode = value.mode == null ? "external" : value.mode;
+  if (mode !== "external" && mode !== "inline") {
+    throw new Error(`Invalid sourceMap mode ${JSON.stringify(mode)}: expected "external" or "inline"`);
+  }
+  const sourceFile = value.sourceFile == null ? "<sablejs-input>" : value.sourceFile;
+  if (typeof sourceFile !== "string" || sourceFile.length === 0) {
+    throw new Error("Invalid sourceMap sourceFile: expected a non-empty string");
+  }
+  const generatedFile = value.generatedFile == null ? "generated.cjs" : value.generatedFile;
+  if (typeof generatedFile !== "string" || generatedFile.length === 0) {
+    throw new Error("Invalid sourceMap generatedFile: expected a non-empty string");
+  }
+  const sourceMapURL = value.sourceMapURL;
+  if (sourceMapURL != null &&
+      (typeof sourceMapURL !== "string" || sourceMapURL.length === 0 || /[\r\n]/.test(sourceMapURL))) {
+    throw new Error("Invalid sourceMap sourceMapURL: expected a non-empty string without newlines");
+  }
+  if (value.sourcesContent != null && typeof value.sourcesContent !== "boolean") {
+    throw new Error("Invalid sourceMap sourcesContent: expected a boolean");
+  }
+  return { mode, sourceFile, generatedFile, sourceMapURL, sourcesContent: value.sourcesContent === true };
+}
+
+// Walks the optimized HIR in deterministic scope order and collects the
+// synthetic eval/Function scopes that carry a frontend source descriptor.
+// Each entry maps to a virtual source named `<sourceFile>#eval-N` /
+// `#dynamic-N`; markers reference entries by registry position + 1 (identity
+// 0 is the root source). Scopes without a descriptor (runtime-dynamic eval
+// values cannot be statically known) are skipped and stay unmapped.
+function buildSyntheticSources(program, sourceFile) {
+  const sources = [];
+  const seen = new Set();
+  let evalCount = 0;
+  let dynamicCount = 0;
+  program.scopes.forEach((scope) => {
+    scope.instructions.forEach((instruction) => {
+      if (instruction.op === "EVAL" && instruction.args[0] && instruction.args[0] !== -1 &&
+          instruction.args[0].syntheticSource) {
+        const nested = instruction.args[0];
+        if (seen.has(nested.id)) return;
+        seen.add(nested.id);
+        evalCount += 1;
+        const descriptor = nested.syntheticSource;
+        sources.push({
+          scopeId: nested.id,
+          name: `${sourceFile}#eval-${evalCount}`,
+          text: descriptor.text,
+          lines: descriptor.lines,
+          columns: descriptor.columns,
+        });
+      }
+    });
+    scope.dynamicFunctions.forEach((dynamicScope) => {
+      if (dynamicScope !== -1 && dynamicScope.syntheticSource) {
+        if (seen.has(dynamicScope.id)) return;
+        seen.add(dynamicScope.id);
+        dynamicCount += 1;
+        const descriptor = dynamicScope.syntheticSource;
+        sources.push({
+          scopeId: dynamicScope.id,
+          name: `${sourceFile}#dynamic-${dynamicCount}`,
+          text: descriptor.text,
+          lines: descriptor.lines,
+          columns: descriptor.columns,
+        });
+      }
+    });
+  });
+  return sources;
+}
+
 class AOTCompiler {
   lowerToHIR(source, options = {}) {
     const frontendScope = new FrontendCompiler({
@@ -45,8 +147,21 @@ class AOTCompiler {
     const optimization = normalizeLevel(options.optimization == null ? options.optimize : options.optimization);
     const security = normalizeSecurity(options.security);
     const identifierProtection = normalizeIdentifierProtection(options.identifierProtection);
+    const sourceMapSettings = normalizeSourceMapOptions(options.sourceMap);
+    // Source maps consume LOC positions at compile time, so the optimizer
+    // retains them exactly like preserveSourceLocations; codegen also gates
+    // small-function inlining off while either is active.
+    const retainSourceLocations = !!sourceMapSettings || options.preserveSourceLocations === true;
     const hir = this.lowerToHIR(source, options);
-    const stats = optimizeProgram(hir, optimization, options);
+    // Synthetic eval/Function scopes carry a frontend descriptor
+    // ({ text, lines, columns }) that gives them a virtual source identity.
+    // The registry is built once from the optimized HIR and shared by
+    // codegen (marker emission) and the finalizer (sources/sourcesContent),
+    // so source indices are identical across Os candidates by construction.
+    const syntheticSources = sourceMapSettings
+      ? buildSyntheticSources(hir, sourceMapSettings.sourceFile)
+      : null;
+    const stats = optimizeProgram(hir, optimization, { ...options, retainSourceLocations });
     verifyProgram(hir);
     let mir;
     if (options.includeMIR || options.dumpIR === "mir" || options.dumpIR === "all") {
@@ -66,7 +181,8 @@ class AOTCompiler {
       sizeOptimization: null,
       identifierProtection: null,
       stackToLocal: {
-        enabled: optimization === "O2" || optimization === "Os",
+        enabled: (optimization === "O2" || optimization === "Os") &&
+          options.stackToLocal !== false,
         instructions: 0,
         helpersAvoided: 0,
         stackLoads: 0,
@@ -92,18 +208,24 @@ class AOTCompiler {
         security,
         perScopeFactories,
         codegenStats,
+        retainSourceLocations,
+        mapSettings: sourceMapSettings,
+        syntheticSources,
       });
       return {
         code,
         codegenStats,
         perScopeFactories,
-        bytes: utf8ByteLength(code),
+        // Location markers and map comments must not participate in the
+        // candidate size model: measure the marker-free bytes exactly as the
+        // map-off build would.
+        bytes: utf8ByteLength(sourceMapSettings ? stripMarkers(code) : code),
       };
     });
     candidates.sort((left, right) => left.bytes - right.bytes ||
       Number(left.perScopeFactories) - Number(right.perScopeFactories));
     const selected = candidates[0];
-    const { code, codegenStats, perScopeFactories } = selected;
+    const { code: selectedCode, codegenStats, perScopeFactories } = selected;
     codegenStats.sizeOptimization.costModel = {
       objective: "raw-bytes",
       selected: perScopeFactories ? "per-scope-factories" : "shared-factory",
@@ -116,6 +238,24 @@ class AOTCompiler {
       helperImportPruning: true,
     };
     stats.codegen = codegenStats;
+    // Finalize the map only for the selected candidate: markers are stripped
+    // and the v3 map is built against the cleaned output, then the
+    // destination comment (inline data URL, or the caller's external URL) is
+    // appended after the final mapping positions are known.
+    let code = selectedCode;
+    let map;
+    let cleanCode = selectedCode;
+    if (sourceMapSettings) {
+      ({ code: cleanCode, map } = finalizeSourceMap(selectedCode, sourceMapSettings, source, syntheticSources));
+      code = cleanCode;
+      if (sourceMapSettings.mode === "inline") {
+        code = `${cleanCode}\n${sourceMapURLComment(
+          `data:application/json;charset=utf-8;base64,${base64EncodeUtf8(map)}`
+        )}`;
+      } else if (sourceMapSettings.sourceMapURL) {
+        code = `${cleanCode}\n${sourceMapURLComment(sourceMapSettings.sourceMapURL)}`;
+      }
+    }
     stats.codegen.sizeOptimization.outputBytes = utf8ByteLength(code);
     if (options.dumpDir) {
       // Inspection mode: write the optimized HIR, the MIR the backend passes
@@ -130,7 +270,22 @@ class AOTCompiler {
       dumpFs.mkdirSync(options.dumpDir, { recursive: true });
       dumpFs.writeFileSync(dumpFs.join(options.dumpDir, "hir.txt"), printProgram(hir));
       dumpFs.writeFileSync(dumpFs.join(options.dumpDir, "mir.txt"), printMIR(dumpMIR));
-      dumpFs.writeFileSync(dumpFs.join(options.dumpDir, "code.js"), code);
+      // The dumped code.js uses code.js.map as its URL rather than leaking
+      // the absolute dumpDir; the returned artifact continues to use the
+      // caller-provided logical names (inline maps keep their data URL).
+      const dumpCode = map && sourceMapSettings.mode === "external"
+        ? `${cleanCode}\n${sourceMapURLComment("code.js.map")}`
+        : code;
+      dumpFs.writeFileSync(dumpFs.join(options.dumpDir, "code.js"), dumpCode);
+      if (map) {
+        // The dumped artifact is named code.js, so the copied map's `file`
+        // field must match it rather than the caller's generatedFile (which
+        // describes the returned artifact's eventual output path).
+        const dumpMap = sourceMapSettings.mode === "external"
+          ? JSON.stringify({ ...JSON.parse(map), file: "code.js" })
+          : map;
+        dumpFs.writeFileSync(dumpFs.join(options.dumpDir, "code.js.map"), dumpMap);
+      }
     }
     return {
       code,
@@ -139,6 +294,7 @@ class AOTCompiler {
       stats,
       hir: options.dumpIR === "hir" || options.dumpIR === "all" || options.includeHIR ? hir : undefined,
       mir,
+      map,
       metadata: {
         abiVersion: ABI_VERSION,
         format: options.format || "cjs",
@@ -147,6 +303,10 @@ class AOTCompiler {
         optimize: optimization,
         perScopeFactories,
         security,
+        // The key exists only when a map was requested, matching the
+        // declarations (map-off metadata is otherwise byte-identical to the
+        // pre-map build).
+        ...(sourceMapSettings ? { sourceMap: sourceMapSettings } : {}),
       },
     };
   }
@@ -171,4 +331,11 @@ function lowerToMIR(source, options) {
   return new AOTCompiler().lowerToMIR(source, options);
 }
 
-module.exports = { AOTCompiler, compile, lowerToHIR, lowerToMIR, normalizeSecurity };
+module.exports = {
+  AOTCompiler,
+  compile,
+  lowerToHIR,
+  lowerToMIR,
+  normalizeSecurity,
+  normalizeSourceMapOptions,
+};

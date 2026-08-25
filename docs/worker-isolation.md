@@ -212,6 +212,8 @@ self.onmessage = (event) => {
 
 Two caveats. First, in sandbox mode the guest never holds the raw host function: the auto-wrapped capability is a per-instance guest wrapper, so calls stay mediated inside the worker exactly as in-process. Second, `timeoutMs` budgets the whole run — keep it above the longest capability call so legitimate work is not killed (see Timeout-wrapping below for the per-call version).
 
+**Node hosts.** The protocol targets the browser `Worker` shape (`addEventListener`, events with `.data`, `self` on the worker side). Under Node, run the worker script with `worker_threads` and pass the `parentPort` channel to `handleSandboxMessages` (`{ scope: parentPort, postMessage }`), and give the host client an adapter — `worker_threads.Worker` is an EventEmitter whose `"message"` events deliver the value directly rather than a `MessageEvent` with `.data`, so `addEventListener` must rebind `on` and normalize (`listener({ data: value })`). A complete working pair is in `examples/worker/` (`host.cjs` + `sandbox.worker.cjs`).
+
 ## Evaluating other programs
 
 `run` executes the one program the worker was built with. `evaluate` executes any compiled artifact through the same worker — useful for many-short-program workloads such as AI-generated code:

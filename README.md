@@ -84,6 +84,43 @@ try {
 
 The default `security: "sandbox"` mode recursively copies plain `globals` data, so guest mutations do not reach the host object graph. One `instance.run()` call executes the program; instances are single-run and meant to be disposed.
 
+## TypeScript
+
+sablejs ships TypeScript declarations (`types/`), wired through the package
+`exports` map's `types` condition for `sablejs`, `sablejs/runtime`, and
+`sablejs/worker`. All public options — including capability and source-map
+settings — are typed, and the type-check gate (`npm run check:types`) pins
+both CJS and ESM consumers against the declarations:
+
+```ts
+import { compile } from "sablejs";
+import type { CompileOptions, CompileResult, SourceMapSettings } from "sablejs";
+
+const options: CompileOptions = {
+  optimization: "O2",
+  security: "sandbox",
+  sourceMap: { mode: "external", sourceFile: "rules/input.js" },
+};
+const result: CompileResult = compile(source, options);
+```
+
+The generated artifact can be typed with the exported `CompiledProgram`
+shape: `program.createInstance({ globals })` returns a single-run
+`RuntimeInstance`. In sandbox mode, `globals` may carry any host function —
+it becomes a capability automatically — and `capability(fn, options)` returns
+an opaque `CapabilityToken` type. The worker client (`sablejs/worker`) is
+typed over a structural `SandboxWorker`, which the browser `Worker` satisfies
+directly and Node's `worker_threads.Worker` satisfies through a small adapter
+(see `examples/worker/host.cjs`).
+
+## Examples
+
+Runnable examples for every runtime live in `examples/` (see
+[examples/README.md](examples/README.md)): Node quick start, error handling,
+and guest function calls; trusted-mode direct `globalThis` access; build-time
+precompilation; a compiled-artifact cache; Worker isolation; a browser
+bundle; Deno; and Bun.
+
 ## Calling program functions
 
 End the program with a function expression and `run()` returns a callable. Call it with plain data — arguments and the receiver are copied like `globals`, so guest mutations cannot reach host objects:
@@ -120,6 +157,59 @@ instance.run();
 | `fs: { mkdirSync, writeFileSync, join }` | inspection-mode file adapter; defaults to Node's `fs`/`path`, lazily required. Browser bundles can pass an in-memory implementation (e.g. `memfs`) so `dumpDir` works without Node built-ins |
 
 The dump is a side channel — the compile result is unchanged by `dumpDir`.
+
+## Debugging generated code: source maps
+
+`compile()` can emit a deterministic Source Map v3 for the generated CommonJS,
+mapping every statement's generated code back to the original guest source.
+Opt in with `sourceMap`:
+
+| `sourceMap` value | meaning |
+| --- | --- |
+| `true` | external map with logical defaults: `sourceFile: "<sablejs-input>"`, `generatedFile: "generated.cjs"` |
+| `"external"` | same as `true` |
+| `"inline"` | same names, but the map is base64-embedded as a `//# sourceMappingURL=data:...` comment |
+| `{ mode, sourceFile, generatedFile, sourceMapURL, sourcesContent }` | full control (see below) |
+
+```js
+const result = compile(source, {
+  sourceMap: {
+    mode: "external",               // "external" | "inline"
+    sourceFile: "rules/input.js",   // logical path; never inferred from cwd
+    generatedFile: "rules.cjs",     // becomes `file` in the v3 map
+    sourceMapURL: "rules.cjs.map",  // optional; appended only in external mode
+    sourcesContent: false,          // opt in to embedding the guest source
+  },
+});
+// result.map   — serialized Source Map v3 JSON (undefined when disabled)
+// result.code  — inline mode appends the data URL comment
+// result.metadata.sourceMap — the normalized settings
+```
+
+The mapping contract is statement-level at every optimization level: folded
+constants, native literals, and structured-control-flow scaffolding inherit
+the statement containing them. Nested lexical function bodies map to their own
+lines. Static `eval` and `Function("...")` bodies map to virtual sources named
+`<sourceFile>#eval-N` / `#dynamic-N` with their own line/column offsets
+(strict-mode eval prefixes and the `_dynamic_*` wrapper are translated away;
+runtime-dynamic `eval(value)` has no statically knowable source and stays
+unmapped). `names` is empty, no absolute path ever appears, and
+`sourcesContent` is omitted unless requested. With `dumpDir`, inspection also
+writes `code.js.map` and the dumped `code.js` references it by relative URL.
+
+Maps are consumed by the engine or build tool, not by sablejs: written next to
+the artifact and loaded with Node's `--enable-source-maps`, an external map
+remaps uncaught `$exec*` frames back to the guest filename and statement line
+(covered end-to-end in `test/unit/source-map-e2e.test.js`), and the browser
+bundle emits and runs inline-mapped artifacts in-page
+(`test/e2e/browser.test.js`).
+
+Source maps are invisible to the default build: with `sourceMap` unset (or
+`false`), generated code, statistics, and runtime behavior are byte-for-byte
+unchanged, and the marker-free size model keeps Os candidate selection
+identical. Maps are for debugging and build-tool integration — sablejs does
+not rewrite stacks, and sandbox-boundary errors keep their stacks deleted
+regardless. Full design in [docs/source-maps.md](docs/source-maps.md).
 
 ## Exposing host operations: capabilities
 
@@ -254,6 +344,8 @@ An internal boundary audit completed on 2026-08-22 found no known usable escape 
 ```sh
 npm ci
 npm test # unit + adversarial battery
+npm run check:types # TypeScript declarations, CJS and ESM consumers
+npm run check:examples # every example runs and produces its documented output
 npm run test:e2e:build && npm run test:e2e:node
 npm run benchmark:smoke
 npm run benchmark:size # artifact sizes; --check enforces the CI budgets

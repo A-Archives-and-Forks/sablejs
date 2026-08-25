@@ -3,7 +3,7 @@
 Status markers: ✅ Done · ◐ Partial · ⬜ Not started.
 Priority principle: **security correctness > semantic correctness > real-world evidence > DX > performance > benchmark scores**.
 
-Last updated 2026-08-24.
+Last updated 2026-08-25.
 
 ## Status summary
 
@@ -110,7 +110,8 @@ The 2026-08-22 top-10 priorities are all done:
 ### P2 — API / DX
 
 - ✅ Minimal `compile → createInstance → run → dispose` example, capability example, Worker helper + [Worker isolation](worker-isolation.md).
-- ⬜ TypeScript declarations (including capability types), browser/Worker/Node/Bun/Deno examples, error handling, precompile-at-build-time, compiled artifact cache examples.
+- ✅ [Source map support](source-maps.md) for generated code (2026-08-25): statement-level v3 maps at all four optimization levels, inline/external modes, logical filenames, `sourcesContent` opt-in, `dumpDir` integration, byte-for-byte map-off stability, Node engine remapping evidence (`node --enable-source-maps`, both security modes, caught and uncaught), browser in-page inline-map evidence (Playwright, chromium/firefox/webkit), and virtual sources for static eval/Function bodies (`<sourceFile>#eval-N` / `#dynamic-N` with offset translation; runtime-dynamic eval unmapped); `test/unit/source-map.test.js` (22 tests) + `test/unit/source-map-e2e.test.js` (3 tests) + `test/e2e/browser.test.js`. Expression-level columns and host-facing `guestLocation` on stackless sandbox errors stay explicitly deferred (decision record in [source-maps.md](source-maps.md)).
+- ✅ TypeScript declarations (including capability types), browser/Worker/Node/Bun/Deno examples, error handling, precompile-at-build-time, compiled artifact cache examples (2026-08-25): `types/index.d.ts` + `sablejs/runtime` + `sablejs/worker` declarations with `types/typecheck/` usage fixtures (CJS and ESM contexts) gated by `check:types`; examples under `examples/` for Node, Browser (esbuild bundle + inline map), Worker, Deno, Bun, trusted mode, precompile-at-build-time, and the artifact cache — all verified by the `examples` CI job; error handling docs in README; `check:examples` gates releases.
 
 ### P2 — Docs
 

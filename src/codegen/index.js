@@ -2,6 +2,7 @@
 
 const OpSpec = require("../ir/op-spec");
 const { ABI_VERSION } = require("../runtime");
+const { locMarker, resetMarker, translateSynthetic } = require("./source-map");
 
 // These operations lower to JavaScript control flow rather than to a Runtime
 // helper call. Every other OpSpec entry must name one concrete helper. This is
@@ -362,12 +363,89 @@ function metadata(scope, fastFrame = false, aliases = null, leafFrame = false, u
   };
 }
 
+// Lifts a LOC position into a private marker for source-map mode. Root
+// scopes map directly to identity 0; synthetic eval/Function scopes with a
+// frontend descriptor translate through their virtual source; synthetic
+// scopes without one (runtime-dynamic eval values) lower to a reset so
+// their bodies stay unmapped.
+function markerForLocation(locationContext, line, column) {
+  if (locationContext.syntheticSource) {
+    const translated = translateSynthetic(line, column, locationContext.syntheticSource);
+    if (translated) {
+      return locMarker(locationContext.syntheticSource.index, translated.line, translated.column);
+    }
+    return resetMarker();
+  }
+  return locationContext.syntheticScope ? resetMarker() : locMarker(0, line, column);
+}
+
+// Returns the nearest synthetic-scope state for a scope, walking the parent
+// chain: { kind: "source", entry } when the scope or an ancestor is a static
+// eval / dynamic-Function scope with a frontend source descriptor;
+// { kind: "reset" } when the nearest synthetic ancestor is a runtime-dynamic
+// eval (its body is unknowable, so descendants stay unmapped too); and
+// { kind: "root" } when no synthetic ancestor exists. Lexical descendants of
+// a static eval (a function declared inside the eval body) keep LOC offsets
+// relative to the same parsed text, so the descriptor's translation applies
+// unchanged.
+function inheritSynthetic(scope, options) {
+  for (let current = scope; current;) {
+    if (options.syntheticSources) {
+      const entry = options.syntheticSources.get(current.id);
+      if (entry) return { kind: "source", entry };
+    }
+    if ((options.evalScopeIds && options.evalScopeIds.has(current.id)) ||
+        (options.dynamicFunctionScopeIds && options.dynamicFunctionScopeIds.has(current.id))) {
+      return { kind: "reset" };
+    }
+    current = current.parentId == null ? null : options.scopesById.get(current.parentId);
+  }
+  return { kind: "root" };
+}
+
+// Maps a scope's factory header line (`function $execN(...) {`) to the
+// scope's first LOC, so a devtools breakpoint on a guest function
+// declaration lands on the generated factory line instead of falling through
+// to the first body statement's mapping. Falls back to a reset when the
+// scope has no LOC (fully optimized empty bodies); the module-level $make
+// wrappers stay unmapped.
+function entryMarkerForScope(scope, context) {
+  if (!context || !context.sourceMap) return "";
+  let loc = null;
+  for (const instruction of scope.instructions) {
+    if (instruction.op === "LOC" && (loc === null || instruction.offset < loc.offset)) loc = instruction;
+  }
+  return loc ? markerForLocation(context, loc.args[0], loc.args[1]) : resetMarker();
+}
+
+function factoryLines(scope, context) {
+  const entry = entryMarkerForScope(scope, context);
+  return entry ? [entry, `function $exec${scope.id}($r, $f) {`] : [`function $exec${scope.id}($r, $f) {`];
+}
+
 function callForInstruction(instruction, context = null) {
   if (instruction.optimized && instruction.optimized.kind === "duplicate") {
     return "$r.dup($f);";
   }
   if (instruction.optimized && instruction.optimized.kind === "drop-inputs") {
     return Array.from({ length: instruction.optimized.count }, () => "$r.pop($f);").join(" ");
+  }
+  if (instruction.op === "LOC") {
+    // The fallback path lowers LOC to $r.location($f, line, column) for
+    // runtime frame-location tracking. Source-map mode consumes the position
+    // at compile time instead: lower to a private marker (virtual-source for
+    // synthetic eval/Function bodies, reset otherwise). When both modes are
+    // requested the runtime write is emitted alongside the marker, matching
+    // the direct lowering path; without context.sourceMap this falls through
+    // to the generic helper below, so the O0/O1 runtime contract is
+    // byte-for-byte unchanged.
+    if (context && context.sourceMap) {
+      const marker = markerForLocation(context, instruction.args[0], instruction.args[1]);
+      if (context.preserveSourceLocations) {
+        return `${marker}\n$f.line = ${jsLiteral(instruction.args[0])}; $f.column = ${jsLiteral(instruction.args[1])};`;
+      }
+      return marker;
+    }
   }
   if (instruction.optimized && instruction.optimized.kind === "literal") {
     return `$r.pushLiteral($f, ${jsLiteral(instruction.optimized.value)});`;
@@ -648,7 +726,7 @@ function createInlineExpressionPlan(scope, budget) {
 
 function createInlinePlans(program, options, codegenStats) {
   const enabled = options.inlineSmallFunctions !== false && options.optimization === "O2" &&
-    options.preserveSourceLocations !== true;
+    options.retainSourceLocations !== true;
   const rawBudget = options.inlineBudget == null ? 12 : Number(options.inlineBudget);
   if (!Number.isInteger(rawBudget) || rawBudget < 0) {
     throw new Error(`Invalid inline budget ${options.inlineBudget}`);
@@ -674,6 +752,7 @@ function createInlinePlans(program, options, codegenStats) {
 }
 
 function createCodegenContext(scope, options, codegenStats) {
+  const synthetic = inheritSynthetic(scope, options);
   const enabled = options.stackToLocal !== false &&
     (options.optimization === "O2" || options.optimization === "Os");
   const denseSwitch = options.denseSwitch !== false;
@@ -749,6 +828,18 @@ function createCodegenContext(scope, options, codegenStats) {
     },
     perScopeFactories: options.perScopeFactories !== false,
     security: options.security || "sandbox",
+    sourceMap: !!options.mapSettings,
+    preserveSourceLocations: options.preserveSourceLocations === true,
+    // Synthetic-source scopes (static eval bodies, dynamic Function
+    // factories) carry LOC ops against their own text, not the root file.
+    // Lexical descendants inherit the nearest synthetic ancestor's state via
+    // inheritSynthetic: in source-map mode their LOC ops lower to a
+    // virtual-source marker when a source descriptor exists, or to a reset
+    // marker when the source is unknowable (runtime-dynamic eval) — never to
+    // a plausible but incorrect root location. Their invocation sites remain
+    // mapped to the caller's scope.
+    syntheticScope: synthetic.kind === "reset",
+    syntheticSource: synthetic.kind === "source" ? synthetic.entry : null,
     variableKind,
     writeProperty: scope.strict ? "$writeStrict" : "$writeSloppy",
     localKind,
@@ -1240,9 +1331,19 @@ function emitStackToLocalRange(lines, scope, instructions, indent, context) {
       case "NEWREGEXP":
         stack.push(temporary(`new RegExp(${jsLiteral(instruction.args[0])}, ${jsLiteral(instruction.args[1])})`, instruction, { kind: "guest-object" }));
         return true;
-      case "LOC":
-        lines.push(`${indent}$f.line = ${jsLiteral(instruction.args[0])}; $f.column = ${jsLiteral(instruction.args[1])};`);
+      case "LOC": {
+        // Source-map mode lowers LOC to a private marker; the position is
+        // consumed by the finalizer at compile time, so no runtime write is
+        // emitted unless preserveSourceLocations was also requested.
+        const [sourceLine, sourceColumn] = instruction.args;
+        if (context.sourceMap) {
+          lines.push(markerForLocation(context, sourceLine, sourceColumn));
+        }
+        if (context.preserveSourceLocations) {
+          lines.push(`${indent}$f.line = ${jsLiteral(sourceLine)}; $f.column = ${jsLiteral(sourceColumn)};`);
+        }
         return true;
+      }
       case "DEBUGGER":
         lines.push(`${indent}debugger;`);
         return true;
@@ -1958,7 +2059,7 @@ function emitLoopCondition(lines, scope, region, indent, context) {
 }
 
 function generateSimpleStructuredScope(scope, region, context) {
-  const lines = [`function $exec${scope.id}($r, $f) {`];
+const lines = factoryLines(scope, context);
   emitScopePrologue(lines, context);
   emitStraightRange(lines, scope, 0, region.start, "  ", context);
 
@@ -2000,7 +2101,7 @@ function generateSimpleStructuredScope(scope, region, context) {
 }
 
 function generateSimpleStructuredIf(scope, region, context) {
-  const lines = [`function $exec${scope.id}($r, $f) {`];
+const lines = factoryLines(scope, context);
   emitScopePrologue(lines, context);
   emitStraightRange(lines, scope, 0, region.testStart, "  ", context);
   context.expectBranchTest = region.branch;
@@ -2165,7 +2266,7 @@ function structuredScopePlan(scope) {
 }
 
 function generateStructuredScope(scope, plan, context) {
-  const lines = [`function $exec${scope.id}($r, $f) {`];
+const lines = factoryLines(scope, context);
   emitScopePrologue(lines, context);
   const instructionsByOffset = new Map(scope.instructions.map((instruction) => [instruction.offset, instruction]));
 
@@ -2537,7 +2638,7 @@ function isStraightScope(scope) {
 }
 
 function generateStraightScope(scope, context) {
-  const lines = [`function $exec${scope.id}($r, $f) {`];
+const lines = factoryLines(scope, context);
   emitScopePrologue(lines, context);
   emitStraightRange(lines, scope, 0, scope.codeLength, "  ", context);
   lines.push("}");
@@ -2569,7 +2670,9 @@ function generateScope(scope, options, codegenStats) {
   }
   if (context.sizeOptimized && context.sizeTemporarySlots.size) {
     const declaration = `  let ${Array.from(context.sizeTemporarySlots).join(", ")};`;
-    code = code.replace("\n", `\n${declaration}\n`);
+    // Insert after the factory header's `{` — never after the first newline,
+    // which is the entry location marker's line when source maps are on.
+    code = code.replace("{\n", `{\n${declaration}\n`);
     codegenStats.sizeOptimization.temporarySlots += context.sizeTemporarySlots.size;
   }
   if (context.provenanceSlots && context.provenanceSlots.tracked.size) {
@@ -2583,7 +2686,7 @@ function generateScope(scope, options, codegenStats) {
     // −6.9% with it, recovered on removal). The mapped-arguments guard still
     // gates staleness for sloppy parameter slots either way.
     const declaration = `  let ${Array.from(context.provenanceSlots.tracked).map((index) => provenanceFlag(context, index)).join(", ")};`;
-    code = code.replace("\n", `\n${declaration}\n`);
+    code = code.replace("{\n", `{\n${declaration}\n`);
   }
   return { code, usesThisWrites: context.usesThisWrites };
 }
@@ -2900,7 +3003,8 @@ function generate(program, options = {}) {
     sizeOptimization: null,
     identifierProtection: null,
     stackToLocal: {
-      enabled: options.optimization === "O2" || options.optimization === "Os",
+      enabled: (options.optimization === "O2" || options.optimization === "Os") &&
+        options.stackToLocal !== false,
       instructions: 0,
       helpersAvoided: 0,
       stackLoads: 0,
@@ -2922,7 +3026,11 @@ function generate(program, options = {}) {
     outputBytes: 0,
     decisions: {
       perScopeFactories: options.perScopeFactories !== false,
-      smallFunctionInlining: options.optimization === "O2" && options.inlineSmallFunctions !== false,
+      // Mirrors the actual enablement in createInlinePlans: source maps (and
+      // preserveSourceLocations) retain LOC, which disables expression
+      // inlining — report the decision as made, not as configured.
+      smallFunctionInlining: options.optimization === "O2" && options.inlineSmallFunctions !== false &&
+        options.retainSourceLocations !== true,
       globalValueNumbering: options.optimization === "O2",
       loopInvariantCodeMotion: options.optimization === "O2",
     },
@@ -2932,6 +3040,13 @@ function generate(program, options = {}) {
     if (instruction.op === "EVAL" && instruction.args[0] && instruction.args[0] !== -1) {
       evalScopeIds.add(instruction.args[0].id);
     }
+  }));
+  // Dynamic Function("...") scopes parse synthetic text; their LOC ops refer
+  // to that text, never the root file. The decoded scopes are members of the
+  // host scope's dynamicFunctions table.
+  const dynamicFunctionScopeIds = new Set();
+  program.scopes.forEach((scope) => scope.dynamicFunctions.forEach((dynamicScope) => {
+    if (dynamicScope !== -1) dynamicFunctionScopeIds.add(dynamicScope.id);
   }));
   const scopesById = new Map(program.scopes.map((scope) => [scope.id, scope]));
   const inlinePlans = createInlinePlans(program, options, codegenStats);
@@ -3025,7 +3140,12 @@ function generate(program, options = {}) {
   // the eval caller, which carries the excluded EVAL op). Phase 1's
   // "trusted only" gate was a staging decision, not a soundness boundary.
   const promotedLocalPlans = new Map();
-  if (options.optimization === "O2" || options.optimization === "Os") {
+  // stackToLocal:false switches the emitter to the explicit-stack fallback
+  // path; promotion plans must not be built for it (their $l locals do not
+  // exist there, and the drift guard would fail the compile). The
+  // provenance gate below mirrors this check.
+  if ((options.optimization === "O2" || options.optimization === "Os") &&
+      options.stackToLocal !== false) {
     program.scopes.forEach((scope) => {
       if (scope.script || !directVariableScopeIds.has(scope.id) ||
           scope.dynamicFunctions.length) return;
@@ -3052,9 +3172,19 @@ function generate(program, options = {}) {
   const provenanceSlotPlans = new Map();
   const entryScope = scopesById.get(program.entry);
   const globalNames = new Set(entryScope && entryScope.script ? entryScope.variables : []);
+  // The compile pipeline builds the ordered synthetic-source registry (see
+  // buildSyntheticSources in src/compiler/index.js); markers reference it by
+  // registry position + 1, so codegen looks entries up by scope id.
+  const syntheticSources = new Map(
+    (options.syntheticSources || []).map((entry, index) =>
+      [entry.scopeId, { ...entry, index: index + 1 }]
+    )
+  );
   const codegenOptions = {
     ...options,
     evalScopeIds,
+    dynamicFunctionScopeIds,
+    syntheticSources,
     directVariableScopeIds,
     globalNames,
     identifierAliases,
@@ -3272,7 +3402,21 @@ function generate(program, options = {}) {
       hasWithEvalAncestor(scope)
     ))};`)
   );
-  generatedScopes.forEach(({ code }) => lines.push(code));
+  // Source-map mode wraps every $exec body in reset markers: they end the
+  // previous scope's active location so its last statement never maps module
+  // metadata, factories, or the next scope's prologue. The finalizer strips
+  // them along with the LOC markers; with maps disabled they are never
+  // emitted, so generated bytes stay byte-for-byte unchanged.
+  const scopeReset = options.mapSettings ? resetMarker() : null;
+  generatedScopes.forEach(({ code }) => {
+    if (scopeReset) {
+      lines.push(scopeReset);
+      lines.push(code);
+      lines.push(scopeReset);
+    } else {
+      lines.push(code);
+    }
+  });
   generatedFactories.forEach((code) => lines.push(code));
   lines.push(
     `const $scopeTable = { ${program.scopes.map((scope) => `${scope.id}: { execute: $exec${scope.id}, metadata: $meta${scope.id}${scope.script || options.perScopeFactories === false ? "" : `, factory: $make${scope.id}`} }`).join(", ")} };`
