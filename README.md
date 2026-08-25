@@ -3,8 +3,7 @@
 </h1>
 
 <p align="center">
-  <strong>Fast, debuggable execution for user-authored and AI-generated JavaScript.</strong><br>
-  AOT-compiled to host JavaScript, with no embedded JavaScript VM.
+  <strong>Fast, debuggable execution for user-authored and AI-generated JavaScript.</strong>
 </p>
 
 <p align="center">
@@ -14,51 +13,22 @@
   <a href="https://github.com/ErosZy/sablejs/releases"><img alt="Release" src="https://img.shields.io/github/v/release/ErosZy/sablejs"></a>
 </p>
 
-> sablejs was inspired by Figma's [journey to a WebAssembly plugin sandbox](https://www.figma.com/blog/how-we-built-the-figma-plugin-system/) and its later use of the [QuickJS runtime](https://www.figma.com/plugin-docs/updates/2020/07/07/version-1-update-16/). Its current focus is fast, debuggable execution for user-authored and AI-generated code.
+> Inspired by Figma's [WebAssembly plugin sandbox](https://www.figma.com/blog/how-we-built-the-figma-plugin-system/) and its [QuickJS runtime](https://www.figma.com/plugin-docs/updates/2020/07/07/version-1-update-16/).
 
-1. **Fast by design** — AOT-compiled host JavaScript, without an embedded VM.
-2. **Debuggable** — Source Map v3, generated code, and HIR/MIR inspection.
-3. **Built for generated code** — explicit boundaries and repeatable compilation make programs easier to integrate, inspect, and test.
+1. **Fast** — AOT to host JavaScript; no embedded VM.
+2. **Debuggable** — source maps and inspectable compiler IR.
+3. **Built for generated code** — copied data and explicit capabilities.
 
-sablejs compiles ES5.1 guest programs into direct host JavaScript. Modern syntax can be downleveled before compilation, and generated artifacts run in browsers, Workers, Node, Deno, and Bun.
+V8 Benchmark Suite 7 reference score: **2,202** in sablejs sandbox versus
+**1,181** in QuickJS-WASM 0.32.0. [Methodology and caveats](docs/performance.md).
 
-In the default `sandbox` mode, guest code receives standard ECMAScript objects, copied data, and explicit capabilities—not ambient access to the host object graph or platform APIs.
+## Quick start
 
-**Start:** [Quick start](#quick-start) · [npm](https://www.npmjs.com/package/sablejs) · [Browser example](examples/browser/) · [Worker example](examples/worker/)
-
-**Learn:** [Migrate from v1](docs/migration-v2.md) · [Compare approaches](docs/comparison.md) · [Performance](docs/performance.md) · [Security](docs/security.md)
-
-## Why sablejs
-
-- **Host-engine execution.** Precompiled programs run as direct JavaScript on the host engine; the normal `run()` path does not evaluate guest source at runtime.
-- **No embedded JavaScript VM.** There is no interpreter binary to initialize or another VM layer to debug.
-- **Explicit boundaries.** Sandbox globals are copied, host functions become revocable capabilities, and ambient platform APIs remain unavailable unless deliberately exposed.
-- **Practical debugging.** Source maps, generated code, HIR, and MIR connect runtime failures back to guest programs.
-- **Operational isolation.** Dedicated Worker support lets hosts enforce wall-clock timeouts around compute-only programs.
-
-On the reference V8 Benchmark Suite 7 run, sablejs O2 sandbox scores **2,202**, compared with **1,181** for QuickJS-WASM 0.32.0. These are harness-specific results, not a universal performance claim; see the [methodology and full results](docs/performance.md).
-
-## Use cases
-
-- **AI-generated code**: run LLM-generated transforms, formulas, and automation logic behind explicit data and capability boundaries, with dedicated Worker isolation for compute-only programs.
-- **User plugins**: execute user-defined extensions without exposing the host environment directly.
-- **Rules and formulas**: power validators, pricing logic, workflows, and spreadsheet-like expressions.
-- **Code playgrounds**: run interactive user code in a constrained browser environment.
-
-```text
-modern JS -> ES5.1 -> sablejs AOT -> Worker -> application
-```
-
-## Install
-
-Install the published v2 beta from npm. The v2 series is currently under the
-`beta` tag; `latest` remains on the v1 line until v2 goes stable.
+Install the v2 beta (`latest` remains on v1 until v2 is stable):
 
 ```sh
 npm install sablejs@beta
 ```
-
-## Quick start
 
 Compile an ES5.1 program — a script with no imports that returns its result as the final expression — then create an instance and run it:
 
