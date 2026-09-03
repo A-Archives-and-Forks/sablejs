@@ -1190,10 +1190,13 @@ describe("sablejs OpSpec and AOT backend", function() {
     });
     assert.deepStrictEqual(first.hir, second.hir);
     assert(first.stats.constantsFolded > 0);
-    assert.equal(first.stats.mir.builds, 4);
+    assert.equal(first.stats.mir.builds, 5);
     assert.equal(first.stats.analysis.generation, first.stats.passes.length);
     assert(first.stats.analysis.rebuilds.some(
       (entry) => entry.reason === "post-sccp-control-flow"
+    ));
+    assert(first.stats.analysis.rebuilds.some(
+      (entry) => entry.reason === "post-copy-guest-provenance"
     ));
     assert(first.stats.passes.every((pass) =>
       Number.isInteger(pass.generation) &&
