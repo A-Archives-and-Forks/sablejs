@@ -27,7 +27,8 @@ the exact commit list and downloadable artifacts.
 - Added retained literal/SCCP branch facts with independent MIR constant
   checking, plus an independent guest-origin analysis covering slots, Phi
   meets, and return-safe constructors; invalid provenance candidates retain the
-  fully guarded sandbox write path.
+  fully guarded sandbox write path. Guest-origin proofs are produced only after
+  the final copy/CFG rewrites against freshly rebuilt MIR.
 - Moved MIR lowering categories into the canonical exhaustive operation
   contract and verified the sole `NEXTITER`/conditional emission relation
   before MIR construction.

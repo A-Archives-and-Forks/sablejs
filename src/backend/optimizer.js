@@ -25,9 +25,9 @@ const OPTIONAL_REBUILD_MIR = Object.freeze({
   failureMode: "rollback",
   bailoutReason: "candidate-mir-invalid",
 });
-const OPTIONAL_PRESERVE_MIR = Object.freeze({
+const OPTIONAL_GUEST_PROVENANCE_MIR = Object.freeze({
   preserves: ["mir"],
-  invalidates: [],
+  invalidates: ["mir"],
   failureMode: "rollback",
   bailoutReason: "guest-provenance-proof-invalid",
 });
@@ -384,21 +384,6 @@ function optimizeProgram(program, requestedLevel, options = {}) {
     rebuildMIR(currentProgram, stats, passes, "post-dce-use-def");
   }, OPTIONAL_REBUILD_MIR);
 
-  if (level === "O2" || level === "Os") {
-    passes.run("guest-object-provenance", (currentProgram) => {
-      // SECURITY-SENSITIVE. Proves GETLOCAL outputs and NEW results are
-      // guest-created and marks them `guestObjectOutput` — the fast-path
-      // ticket for sandbox property writes. The mark seeds exclusively at
-      // allocate ops (NEWARRAY/NEWOBJECT/NEWREGEXP/CLOSURE), flows only
-      // through slots and phi joins (AND meet), and is written after the
-      // last pass that can move or eliminate values, so the mark cannot go
-      // stale. NEW outputs additionally require a constructor pinned to one
-      // return-safe closure scope. Nothing unmarked ever takes the fast
-      // path; see guest-provenance.js.
-      runGuestProvenance(currentProgram, stats, passes.getAnalysis("mir"));
-    }, OPTIONAL_PRESERVE_MIR);
-  }
-
   passes.run("copy-folding", (currentProgram) => {
     // Peephole re-runs after the SSA passes: SSA passes rewrite the
     // instruction stream (elisions, replaced operands), so the offset-based
@@ -416,6 +401,26 @@ function optimizeProgram(program, requestedLevel, options = {}) {
   passes.run("copy-unreachable-code", (currentProgram) => {
     currentProgram.scopes.forEach((scope) => eliminateUnreachableBlocks(scope, stats));
   }, INVALIDATE_MIR);
+
+  if (level === "O2" || level === "Os") {
+    passes.run("guest-object-provenance", (currentProgram) => {
+      // SECURITY-SENSITIVE. Proves GETLOCAL outputs and NEW results are
+      // guest-created and marks them `guestObjectOutput` — the fast-path
+      // ticket for sandbox property writes. This deliberately runs after
+      // every copy/CFG rewrite and rebuilds MIR from the final HIR, so no
+      // later pass can invalidate the proof. The mark seeds exclusively at
+      // allocate ops (NEWARRAY/NEWOBJECT/NEWREGEXP/CLOSURE), flows only
+      // through slots and phi joins (AND meet), and NEW outputs additionally
+      // require a constructor pinned to one return-safe closure scope.
+      const mir = rebuildMIR(
+        currentProgram,
+        stats,
+        passes,
+        "post-copy-guest-provenance"
+      );
+      runGuestProvenance(currentProgram, stats, mir);
+    }, OPTIONAL_GUEST_PROVENANCE_MIR);
+  }
   stats.nodesAfter = liveInstructionCount(program);
   return stats;
 }

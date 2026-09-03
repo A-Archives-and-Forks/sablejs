@@ -78,7 +78,7 @@ Local evidence observed on 2026-09-03 after the verifier/lifecycle hardening:
 - `npm run check:types`: passed;
 - `npm run test:optimizer:semantic-cfg`: 5/5 passed;
 - `npm run test:optimizer:verify-mutations`: 10/10 passed;
-- `npm run test:optimizer:corpus`: 4/4 saved shapes passed;
+- `npm run test:optimizer:corpus`: 5/5 saved shapes passed;
 - `npm run test:optimizer:metamorphic`: 6/6 shape families passed;
 - `npm run test:optimizer:deep-cfg`: 12/12 passed, including the 1–1,024
   boundary family;
@@ -123,6 +123,13 @@ the later copy-branch phase repeats the refresh. All 111 saved failed
 level/security arms and the full 2,000-case differential command now pass. The
 minimal adjacent logical/conditional case is permanent corpus
 `sccp-proof-rebind.js`.
+
+The first four-shard directed CI run found seed 3960, where guest-object marks
+were valid when produced but a later copy/CFG rewrite changed the final graph.
+The independent verifier correctly rejected the stale security proof. Guest
+provenance now runs after every mutating pass against freshly rebuilt final MIR;
+the seed is permanent corpus `guest-proof-after-copy.js` and passes at all four
+levels in trusted and sandbox modes.
 
 ## Decision this plan implements
 

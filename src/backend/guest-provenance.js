@@ -23,9 +23,9 @@
 // target as producer, any optimized producer) forfeits the mark entirely.
 //
 // Marked-value stability: allocate ops are never folded, never DCE'd, and
-// never copy-propagated, and NEW results are never rewritten either, so the
-// mark cannot go stale. The pass runs after the last SSA pass
-// (ssa-dead-code-elimination) and before the literal-only peepholes.
+// never copy-propagated, and NEW results are never rewritten either. The pass
+// runs after the final literal and CFG peepholes against freshly rebuilt MIR,
+// so no later transform can stale a mark.
 //
 // Deliberately NOT marked: `new Array(...)` and friends. Standard intrinsic
 // names are imported as globals through OBJECT_DEFINE_PROPERTY at instance
