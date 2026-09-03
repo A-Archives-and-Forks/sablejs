@@ -23,12 +23,26 @@ function median(values) {
 async function runSuite(options) {
   const backend = argument("backend", "sablejs-sandbox");
   const samples = Number(argument("samples", "3"));
+  const optimization = argument("optimization", "O1");
   const requested = argument("suite", "");
   const selection = requested ? new Set(requested.split(",").filter(Boolean)) : null;
-  const tests = options.list
-    .filter((name) => !selection || selection.has(name))
-    .filter((name) => options.hasTest(name));
-  const summary = { suite: options.suiteName, backend, samples, results: {}, skipped: {}, totals: [] };
+  if (selection) {
+    const unknown = Array.from(selection).filter((name) => !options.list.includes(name));
+    if (unknown.length) throw new Error(`Unknown ${options.suiteName} tests: ${unknown.join(", ")}`);
+  }
+  const tests = options.list.filter((name) => !selection || selection.has(name));
+  const missing = tests.filter((name) => !options.hasTest(name));
+  if (missing.length) throw new Error(`Missing ${options.suiteName} tests: ${missing.join(", ")}`);
+  const summary = {
+    suite: options.suiteName,
+    backend,
+    optimization: backend === "quickjs" ? null : optimization,
+    samples,
+    expectedCount: tests.length,
+    results: {},
+    skipped: {},
+    totals: [],
+  };
 
   const measure = (fn) => {
     const startedAt = performance.now();
@@ -39,11 +53,15 @@ async function runSuite(options) {
   if (backend === "quickjs") {
     const lines = [];
     const runner = await createQuickJSRunner((value) => lines.push(value));
+    const prepared = new Map();
+    for (const name of tests) {
+      prepared.set(name, runner.prepare(options.source(name), `${name}.js`));
+    }
     for (let sample = 0; sample < samples; sample += 1) {
       let total = 0;
       for (const name of tests) {
         try {
-          const ms = measure(() => runner.evaluate(options.source(name), `${name}.js`));
+          const ms = measure(() => prepared.get(name)());
           summary.results[name] = (summary.results[name] || []).concat(ms);
           total += ms;
           console.log(`[${sample + 1}/${samples}] ${name}: ${ms.toFixed(1)} ms`);
@@ -63,7 +81,7 @@ async function runSuite(options) {
       try {
         const compileStartedAt = performance.now();
         const compiled = compile(options.source(name), {
-          optimization: "O2",
+          optimization,
           security,
           runtimeModule: options.runtimeModule,
         });
@@ -112,12 +130,21 @@ async function runSuite(options) {
     );
   }
   const skipped = tests.filter((name) => !summary.results[name]);
+  const incomplete = tests.filter((name) =>
+    !summary.results[name] || summary.results[name].length !== samples
+  );
   const total = summary.totals.length ? median(summary.totals) : 0;
   console.log(
     `RESULT ${options.suiteName} ${backend}: total=${total.toFixed(1)} ms, ` +
     `ran=${tests.length - skipped.length}/${tests.length}, ` +
     `skipped=[${skipped.join(", ") || "none"}]`
   );
+  if (incomplete.length || Object.keys(summary.skipped).length) {
+    throw new Error(
+      `${options.suiteName} incomplete: expected ${tests.length} tests x ${samples} samples; ` +
+      `incomplete=[${incomplete.join(", ") || "none"}]`
+    );
+  }
   return { summary, total, skipped };
 }
 

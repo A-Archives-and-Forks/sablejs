@@ -13,7 +13,7 @@ jobs:
   quality:
     name: Unit, Test262, and performance smoke
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
@@ -26,6 +26,15 @@ jobs:
         run: npm test
       - name: Type-check declarations (CJS and ESM consumers)
         run: npm run check:types
+      - name: Check benchmark isolation and corpus manifest
+        run: npm run check:benchmark-leakage && npm run benchmark:check
+      - name: Run optimizer hardening suites
+        run: |
+          npm run test:optimizer:deep-cfg
+          npm run test:optimizer:completion
+          npm run test:optimizer:verify-mutations
+          npm run test:optimizer:corpus
+          npm run test:optimizer:metamorphic
       - name: Fetch pinned Test262 revision
         run: npm run upstream:fetch -- test262
       - name: Run ES5.1 Test262 gate
@@ -35,11 +44,35 @@ jobs:
       - name: Run differential sandbox-boundary smoke
         run: npm run test:differential:boundary
       - name: Run performance smoke test
-        run: npm run benchmark:smoke
+        run: |
+          npm run benchmark:smoke
+          npm run benchmark:correctness -- --workload=mini-parser --output=.cache/benchmark-correctness-smoke.json
+          npm run benchmark:check -- --artifact=.cache/benchmark-correctness-smoke.json
       - name: Check compiled bundle-size budget
         run: npm run benchmark:size -- --check
       - name: Build publishable artifacts and verify third-party notices
         run: npm run build && npm run check:compliance
+
+  optimizer-directed:
+    name: Directed optimizer shard ${{ matrix.shard }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 24.x
+          cache: npm
+      - name: Install locked dependencies
+        run: npm ci
+      - name: Run 1,250 cross-level cases
+        env:
+          SHARD: ${{ matrix.shard }}
+        run: node test/differential/fuzz.js --seed=$((1 + SHARD * 1250)) --cases=1250 --quiet
 
   runtimes:
     name: Node, Deno, and Bun E2E

@@ -135,15 +135,132 @@ function analyzeScope(scope) {
   return { values, executableBlocks, executableEdges };
 }
 
+// Independent, deliberately less powerful branch-proof analysis: every Phi
+// input participates, including SCCP-inexecutible edges. SCCP may discover
+// more constants, but a control-flow rewrite is emitted only when this
+// path-insensitive must-proof agrees. Lost folds are a safe product bailout.
+function conservativeConstantFacts(scope) {
+  const values = new Map(scope.values.map((value) => [
+    value.id,
+    Object.prototype.hasOwnProperty.call(value, "constant") ? constant(value.constant) : UNKNOWN,
+  ]));
+  function update(id, next) {
+    const current = values.get(id);
+    const merged = join(current, next);
+    if (sameLattice(current, merged)) return false;
+    values.set(id, merged);
+    return true;
+  }
+  let changed = true;
+  let iterations = 0;
+  while (changed) {
+    changed = false;
+    if (iterations++ > Math.max(100, scope.blocks.length * scope.values.length * 2)) {
+      throw new Error(`SCCP branch proof did not converge in scope ${scope.id}`);
+    }
+    scope.blocks.forEach((block) => {
+      block.phis.forEach((phi) => {
+        const result = phi.inputs.reduce(
+          (current, input) => join(current, values.get(input.value)),
+          UNKNOWN
+        );
+        if (update(phi.id, result)) changed = true;
+      });
+      block.operations.forEach((operation) => {
+        if (!operation.outputs.length || operation.outputs.every((output) =>
+          values.get(output).kind === "Constant"
+        )) return;
+        const inputs = operation.inputs.map((input) => values.get(input));
+        const folder = operationFolder(operation);
+        if (folder && inputs.every((input) => input.kind === "Constant")) {
+          try {
+            if (update(operation.outputs[0], constant(
+              folder(...inputs.map((input) => input.value))
+            ))) changed = true;
+          } catch (_) {
+            operation.outputs.forEach((output) => {
+              if (update(output, OVERDEFINED)) changed = true;
+            });
+          }
+        } else if (!folder || inputs.some((input) => input.kind === "Overdefined")) {
+          operation.outputs.forEach((output) => {
+            if (update(output, OVERDEFINED)) changed = true;
+          });
+        }
+      });
+    });
+  }
+  return values;
+}
+
+// Branch annotations themselves change CFG predecessor sets and can therefore
+// canonicalize a later branch input from a Phi ID to its sole producer ID.
+// Rebind every retained proof against the post-annotation MIR. If the current
+// all-predecessor facts no longer prove the same successor, discard that
+// candidate and repeat: removing one branch can expand a later Phi again.
+function refreshBranchProofs(hirProgram) {
+  const retained = hirProgram.scopes.reduce((total, scope) => total +
+    scope.instructions.filter((instruction) => instruction.optimizedBranchProof &&
+      instruction.optimizedBranchProof.kind === "sccp").length, 0);
+  if (retained === 0) return 0;
+  let removed = 0;
+  let changed = true;
+  let iterations = 0;
+  while (changed) {
+    changed = false;
+    if (iterations++ > hirProgram.scopes.reduce((total, scope) =>
+      total + scope.instructions.length, 0
+    )) {
+      throw new Error("SCCP branch proof refresh did not converge");
+    }
+    const mir = lowerToMIR(hirProgram);
+    verifyMIR(mir, hirProgram);
+    mir.scopes.forEach((scope) => {
+      const facts = conservativeConstantFacts(scope);
+      const operations = new Map(scope.blocks.flatMap((block) => block.operations)
+        .map((operation) => [operation.offset, operation]));
+      const hirScope = hirProgram.scopes.find((candidate) => candidate.id === scope.id);
+      hirScope.instructions.forEach((instruction) => {
+        if (!instruction.optimizedBranchProof || instruction.optimizedBranchProof.kind !== "sccp") return;
+        const operation = operations.get(instruction.offset);
+        const inputs = operation && operation.inputs.map((input) => facts.get(input));
+        const proved = operation && operation.op === instruction.op &&
+          inputs.length === (operation.op === "JCASE" ? 2 : 1) &&
+          inputs.every((input) => input && input.kind === "Constant");
+        let expected = null;
+        if (proved) {
+          const taken = operation.op === "JCASE"
+            ? inputs[0].value === inputs[1].value
+            : (operation.op === "JTRUE" ? Boolean(inputs[0].value) : !Boolean(inputs[0].value));
+          expected = taken ? operation.args[0] : operation.end;
+        }
+        if (!proved || expected !== instruction.optimizedBranchTarget) {
+          delete instruction.optimizedBranchTarget;
+          delete instruction.optimizedBranchProof;
+          removed += 1;
+          changed = true;
+          return;
+        }
+        instruction.optimizedBranchProof.inputs = operation.inputs.map((input, index) => ({
+          valueId: input,
+          value: inputs[index].value,
+        }));
+      });
+    });
+  }
+  return removed;
+}
+
 function runSCCP(hirProgram, stats, existingMIR) {
   const mir = existingMIR || lowerToMIR(hirProgram);
   if (!existingMIR && stats.mir) stats.mir.builds += 1;
-  verifyMIR(mir);
+  verifyMIR(mir, hirProgram);
   let propagated = 0;
   let branches = 0;
   let executableBlocks = 0;
   mir.scopes.forEach((scope) => {
     const result = analyzeScope(scope);
+    const retainedFacts = conservativeConstantFacts(scope);
     executableBlocks += result.executableBlocks.size;
     const valueById = new Map(scope.values.map((value) => [value.id, value]));
     result.values.forEach((lattice, id) => {
@@ -159,15 +276,29 @@ function runSCCP(hirProgram, stats, existingMIR) {
       if (!terminator || !["JTRUE", "JFALSE", "JCASE"].includes(terminator.op)) return;
       const outgoing = block.successors.filter((target) => result.executableEdges.has(`${block.start}->${target}`));
       if (outgoing.length !== 1 || block.successors.length <= 1) return;
+      if (!terminator.inputs.every((input) => {
+        const retained = retainedFacts.get(input);
+        const sccp = result.values.get(input);
+        return retained && sccp && retained.kind === "Constant" && sccp.kind === "Constant" &&
+          Object.is(retained.value, sccp.value);
+      })) return;
       const instruction = hirScope.instructions.find((candidate) => candidate.offset === terminator.offset);
       if (instruction && instruction.optimizedBranchTarget === undefined) {
         instruction.optimizedBranchTarget = outgoing[0];
+        instruction.optimizedBranchProof = {
+          kind: "sccp",
+          inputs: terminator.inputs.map((input) => ({
+            valueId: input,
+            value: result.values.get(input).value,
+          })),
+        };
         branches += 1;
       }
     });
   });
+  if (branches > 0) branches -= refreshBranchProofs(hirProgram);
   stats.sccp = { constantsPropagated: propagated, branchesFolded: branches, executableBlocks };
   return mir;
 }
 
-module.exports = { analyzeScope, runSCCP };
+module.exports = { analyzeScope, conservativeConstantFacts, refreshBranchProofs, runSCCP };

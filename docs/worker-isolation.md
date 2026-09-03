@@ -53,7 +53,7 @@ async function build() {
   }).code;
 
   const generated = compile(es5, {
-    optimization: "O2",
+    optimization: "O1",
     runtimeModule: "sablejs/runtime",
   });
 

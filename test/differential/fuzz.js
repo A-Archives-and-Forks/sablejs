@@ -14,10 +14,13 @@
 const fs = require("fs");
 const path = require("path");
 const { performance } = require("perf_hooks");
+const UglifyJS = require("uglify-js");
 const { compile } = require("../../src/compiler");
 
 const runtimeModule = path.resolve(__dirname, "../../src/runtime");
 const failureDirectory = path.resolve(__dirname, "../../.cache/differential-failures");
+const LEVELS = ["O0", "O1", "O2", "Os"];
+const GENERATOR_VERSION = 2;
 
 function argument(name, fallback) {
   const prefix = `--${name}=`;
@@ -174,9 +177,9 @@ function runNative(source) {
   }
 }
 
-function runSableJS(source) {
+function runSableJS(source, optimization = "O2", security = "trusted") {
   try {
-    const compiled = compile(source, { optimization: "O2", security: "trusted", runtimeModule });
+    const compiled = compile(source, { optimization, security, runtimeModule });
     const generatedModule = { exports: {} };
     new Function("require", "module", "exports", compiled.code)(require, generatedModule, generatedModule.exports);
     const instance = generatedModule.exports.createInstance({});
@@ -233,27 +236,81 @@ function same(left, right) {
   return left.ok === right.ok && (left.ok ? left.value === right.value : left.error === right.error);
 }
 
-function minimize(source, seed) {
-  // Statement-level delta debugging over the main() body: keep dropping
-  // non-controversial statement chunks while the mismatch persists.
-  const chunks = source.split(";");
+function minimize(source, seed, optimization = "O2", security = "trusted") {
+  // AST-aware delta debugging removes complete statements from Program and
+  // block bodies. It never slices tokens, so loops/branches/functions stay
+  // syntactically structured while the original mismatch predicate is kept.
+  let ast;
+  try {
+    ast = UglifyJS.parse(source);
+  } catch (_) {
+    return source;
+  }
+  function statementLists(node, output = [], seen = new Set()) {
+    if (!node || typeof node !== "object" || seen.has(node)) return output;
+    seen.add(node);
+    Object.keys(node).forEach((key) => {
+      const value = node[key];
+      if (Array.isArray(value)) {
+        if (value.length && value.every((entry) => entry instanceof UglifyJS.AST_Statement)) {
+          output.push(value);
+        }
+        value.forEach((entry) => statementLists(entry, output, seen));
+      } else if (value instanceof UglifyJS.AST_Node) {
+        statementLists(value, output, seen);
+      }
+    });
+    return output;
+  }
+  function mismatches(candidateSource) {
+    return !same(
+      runNative(candidateSource),
+      runSableJS(candidateSource, optimization, security)
+    );
+  }
   let changed = true;
   while (changed) {
     changed = false;
-    const stride = Math.max(1, Math.floor(chunks.length / 2));
-    for (let start = 0; start < chunks.length; start += stride) {
-      const candidate = chunks.slice(0, start).concat(chunks.slice(start + stride));
-      const candidateSource = candidate.join(";");
-      const native = runNative(candidateSource);
-      const sable = runSableJS(candidateSource);
-      if (native.ok && sable.ok && native.value !== sable.value) {
-        chunks.splice(start, stride);
-        changed = true;
-        break;
+    const lists = statementLists(ast);
+    for (const list of lists) {
+      for (let index = 0; index < list.length; index += 1) {
+        const removed = list.splice(index, 1)[0];
+        const candidateSource = ast.print_to_string({ beautify: true });
+        if (mismatches(candidateSource)) {
+          changed = true;
+          break;
+        }
+        list.splice(index, 0, removed);
       }
+      if (changed) break;
     }
   }
-  return chunks.join(";");
+  return ast.print_to_string({ beautify: true });
+}
+
+function saveFailureEvidence({ seed, source, security, failedLevels, minimizedSource = null }) {
+  const directory = path.join(failureDirectory, `seed-${seed}`);
+  fs.mkdirSync(directory, { recursive: true });
+  fs.writeFileSync(path.join(directory, "source.js"), source);
+  if (minimizedSource) fs.writeFileSync(path.join(directory, "minimized.js"), minimizedSource);
+  const metadata = {
+    generator: "general",
+    generatorVersion: GENERATOR_VERSION,
+    seed,
+    security,
+    levels: LEVELS,
+    failedLevels,
+  };
+  fs.writeFileSync(path.join(directory, "metadata.json"), `${JSON.stringify(metadata, null, 2)}\n`);
+  failedLevels.forEach((optimization) => {
+    const dumpDir = path.join(directory, `${optimization}-${security}`);
+    try {
+      compile(source, { optimization, security, runtimeModule, dumpDir });
+    } catch (error) {
+      fs.mkdirSync(dumpDir, { recursive: true });
+      fs.writeFileSync(path.join(dumpDir, "error.txt"), String(error && error.stack || error));
+    }
+  });
 }
 
 async function main() {
@@ -270,19 +327,33 @@ async function main() {
     const caseSeed = seed + index;
     const source = new Generator(caseSeed).program();
     const native = runNative(source);
-    const sable = runSableJS(source);
+    // Rotate the security profile across cases, but compare every optimizer
+    // level for each generated program. This keeps the matrix affordable
+    // while making cross-level disagreement directly attributable.
+    const security = caseSeed % 2 === 0 ? "sandbox" : "trusted";
+    const sableByLevel = Object.fromEntries(LEVELS.map((optimization) => [
+      optimization,
+      runSableJS(source, optimization, security),
+    ]));
     const quick = await quickjs.run(source);
 
-    if (!same(native, sable)) {
-      mismatches.push({ seed: caseSeed, source, native, sable, quick });
+    const failedLevels = LEVELS.filter((optimization) =>
+      !same(native, sableByLevel[optimization])
+    );
+    if (failedLevels.length) {
+      mismatches.push({ seed: caseSeed, source, security, failedLevels, native, sableByLevel, quick });
       const suffix = shouldMinimize ? ".min.js" : ".js";
       fs.writeFileSync(path.join(failureDirectory, `seed-${caseSeed}${suffix}`), source);
+      let minimized = null;
       if (shouldMinimize) {
-        const minimized = minimize(source, caseSeed);
+        minimized = minimize(source, caseSeed, failedLevels[0], security);
         fs.writeFileSync(path.join(failureDirectory, `seed-${caseSeed}.min.js`), minimized);
       }
+      saveFailureEvidence({
+        seed: caseSeed, source, security, failedLevels, minimizedSource: minimized,
+      });
       if (!quiet) {
-        console.log(`MISMATCH seed=${caseSeed}: native=${JSON.stringify(native)} sablejs=${JSON.stringify(sable)} quickjs=${JSON.stringify(quick)}`);
+        console.log(`MISMATCH seed=${caseSeed} security=${security} levels=${failedLevels.join(",")}: native=${JSON.stringify(native)} sablejs=${JSON.stringify(sableByLevel)} quickjs=${JSON.stringify(quick)}`);
       }
     }
     if (!quiet && (index + 1) % 500 === 0) {
@@ -296,12 +367,32 @@ async function main() {
     cases,
     mismatches: mismatches.length,
     elapsedMs: Math.round(elapsedMs),
-    failures: mismatches.slice(0, 10).map((m) => ({ seed: m.seed, native: m.native, sablejs: m.sable, quickjs: m.quick })),
+    levels: LEVELS,
+    securityMode: "rotating",
+    failures: mismatches.slice(0, 10).map((m) => ({
+      seed: m.seed,
+      security: m.security,
+      failedLevels: m.failedLevels,
+      native: m.native,
+      sablejs: m.sableByLevel,
+      quickjs: m.quick,
+    })),
   }, null, 2));
   if (mismatches.length) process.exitCode = 1;
 }
 
-module.exports = { Generator, argument, createQuickJS, minimize, mulberry32, pick, runNative, runSableJS, same };
+module.exports = {
+  GENERATOR_VERSION,
+  Generator,
+  argument,
+  createQuickJS,
+  minimize,
+  mulberry32,
+  pick,
+  runNative,
+  runSableJS,
+  same,
+};
 
 if (require.main === module) {
   main().catch((error) => {

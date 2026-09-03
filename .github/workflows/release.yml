@@ -15,7 +15,7 @@ jobs:
   verify:
     name: Verify and package release
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 120
     permissions:
       contents: read
     steps:
@@ -52,6 +52,15 @@ jobs:
         run: npm test
       - name: Type-check declarations (CJS and ESM consumers)
         run: npm run check:types
+      - name: Check benchmark isolation and corpus manifest
+        run: npm run check:benchmark-leakage && npm run benchmark:check
+      - name: Run optimizer hardening suites
+        run: |
+          npm run test:optimizer:deep-cfg
+          npm run test:optimizer:completion
+          npm run test:optimizer:verify-mutations
+          npm run test:optimizer:corpus
+          npm run test:optimizer:metamorphic
       - name: Run every example and assert its output
         run: npm run check:examples
       - name: Run and archive the pinned Test262 gate
@@ -66,6 +75,8 @@ jobs:
       - name: Run performance and size gates
         run: |
           npm run benchmark:smoke
+          npm run benchmark:correctness -- --output=.cache/benchmark-correctness.json
+          npm run benchmark:check -- --artifact=.cache/benchmark-correctness.json
           npm run benchmark:size -- --check
       - name: Build and verify publishable artifacts
         run: |
@@ -84,9 +95,11 @@ jobs:
         run: npm run test:e2e:browsers
       - name: Assemble release bundle
         run: |
-          mkdir -p release-bundle/dist release-bundle/test262
+          mkdir -p release-bundle/dist release-bundle/test262 release-bundle/evidence
           cp dist/* release-bundle/dist/
           cp archives/test262/* release-bundle/test262/
+          cp .cache/benchmark-correctness.json release-bundle/evidence/
+          cp benchmark/corpus-manifest.json release-bundle/evidence/
           cp LICENSE SECURITY.md THIRD_PARTY_NOTICES release-bundle/
           npm pack --pack-destination release-bundle
       - name: Upload verified release bundle
@@ -161,4 +174,5 @@ jobs:
             release-bundle/THIRD_PARTY_NOTICES
             release-bundle/dist/*
             release-bundle/test262/*
+            release-bundle/evidence/*
           generate_release_notes: true

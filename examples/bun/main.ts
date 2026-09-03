@@ -12,7 +12,7 @@ import { compile } from "sablejs";
 // 1. Compile the guest program.
 const { code, metadata } = compile(
   "function total(input) { var line = 0; for (var i = 0; i < input.length; i++) { line += input[i]; } return line; } total(input);",
-  { optimization: "O2", security: "sandbox" }
+  { optimization: "O1", security: "sandbox" }
 );
 console.log("compiled:", metadata.optimize, "·", metadata.security, "·", code.length, "bytes");
 

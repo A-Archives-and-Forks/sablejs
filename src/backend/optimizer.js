@@ -1,6 +1,7 @@
 "use strict";
 
-const { buildCFG, verifyCFG } = require("../ir/cfg");
+const { buildNormalCFG, buildSemanticCFG, verifyCFG } = require("../ir/cfg");
+const { lowerToMIR, verifyMIR } = require("../ir/mir");
 const { PassManager, liveInstructionCount } = require("./pass-manager");
 const {
   runCopyPropagation,
@@ -10,10 +11,26 @@ const {
   runLocalCSE,
   runLoopInvariantCodeMotion,
 } = require("./mir-optimizations");
-const { runSCCP } = require("./sccp");
+const { refreshBranchProofs, runSCCP } = require("./sccp");
 const { runGuestProvenance } = require("./guest-provenance");
 
 const LEVELS = new Set(["O0", "O1", "O2", "Os"]);
+const OPTIMIZER_PIPELINE_VERSION = 2;
+const INVALIDATE_MIR = Object.freeze({ preserves: [], invalidates: ["mir"] });
+const PRESERVE_MIR = Object.freeze({ preserves: ["mir"], invalidates: [] });
+const REBUILD_MIR = Object.freeze({ preserves: ["mir"], invalidates: ["mir"] });
+const OPTIONAL_REBUILD_MIR = Object.freeze({
+  preserves: ["mir"],
+  invalidates: ["mir"],
+  failureMode: "rollback",
+  bailoutReason: "candidate-mir-invalid",
+});
+const OPTIONAL_PRESERVE_MIR = Object.freeze({
+  preserves: ["mir"],
+  invalidates: [],
+  failureMode: "rollback",
+  bailoutReason: "guest-provenance-proof-invalid",
+});
 const BINARY_FOLDERS = {
   MUL: (left, right) => left * right,
   DIV: (left, right) => left / right,
@@ -39,7 +56,7 @@ const UNARY_FOLDERS = {
 
 function normalizeLevel(level) {
   const aliases = { "0": "O0", "1": "O1", "2": "O2", s: "Os", S: "Os" };
-  const raw = String(level == null ? "O2" : level).replace(/^-/, "");
+  const raw = String(level == null ? "O1" : level).replace(/^-/, "");
   const normalized = aliases[raw] || (raw[0] === "o" ? `O${raw.slice(1)}` : raw);
   if (!LEVELS.has(normalized)) throw new Error(`Unknown optimization level ${level}`);
   return normalized;
@@ -67,6 +84,10 @@ function jumpTargets(scope) {
   scope.instructions.forEach((instruction) => {
     if (["JUMP", "JTRUE", "JFALSE", "JCASE", "TRY"].includes(instruction.op)) {
       targets.add(instruction.args[0]);
+    }
+    if (instruction.optimized &&
+        (instruction.optimized.kind === "reuse" || instruction.optimized.kind === "licm")) {
+      targets.add(instruction.optimized.sourceOffset);
     }
   });
   return targets;
@@ -143,26 +164,49 @@ function foldConstantBranches(scope, stats) {
 
     const taken = branch.op === "JTRUE" ? Boolean(literal.value) : !Boolean(literal.value);
     branch.optimizedBranchTarget = taken ? branch.args[0] : branch.end;
+    branch.optimizedBranchProof = {
+      kind: "literal",
+      sourceOffset: condition.offset,
+      value: literal.value,
+    };
     stats.constantBranchesFolded += 1;
   }
 }
 
 function eliminateUnreachableBlocks(scope, stats) {
-  const cfg = buildCFG(scope);
-  verifyCFG(cfg);
-  const structuredFinalizerRanges = (scope.controlRegions || [])
-    .filter((region) => region.kind === "TryFinally")
-    .map((region) => ({ start: region.finalizerStart, end: region.finalizerEnd }));
-  const isCanonicalFinalizerInstruction = (instruction) => structuredFinalizerRanges.some((range) =>
-    range.start <= instruction.offset && instruction.offset < range.end
-  );
-  stats.cfg.blocks += cfg.blocks.length;
-  stats.cfg.edges += cfg.blocks.reduce((count, block) => count + block.edges.length, 0);
-  stats.cfg.loops += cfg.loops.length;
-  cfg.blocks.forEach((block) => {
-    if (cfg.reachable.has(block.start)) return;
+  const normalCFG = buildNormalCFG(scope);
+  verifyCFG(normalCFG, scope);
+  const needsCompletionReachability = (scope.controlRegions || []).some((region) =>
+    region.kind === "TryCatch" || region.kind === "TryFinally"
+  ) || (scope.syntheticRanges || []).some((range) => range.kind === "AbruptFinally");
+  let reachable = normalCFG.reachable;
+  if (needsCompletionReachability) {
+    // Reachability needs only labelled successors. Avoid dominator
+    // construction on the finer mayThrow-split graph; GVN and proof consumers
+    // request the fully analyzed form separately. Scopes without an internal
+    // handler/finalizer cannot gain an internal target from a completion edge.
+    const semanticCFG = buildSemanticCFG(scope, { analyze: false });
+    verifyCFG(semanticCFG, scope);
+    // Normal reachability retains lowering scaffolding whose exception-stack
+    // values MIR still consumes. Semantic reachability retains real finalizer
+    // paths. A block is removable only when neither contract needs it.
+    reachable = new Set(normalCFG.reachable);
+    const semanticRanges = semanticCFG.blocks.filter((block) =>
+      semanticCFG.reachable.has(block.start)
+    );
+    normalCFG.blocks.forEach((block) => {
+      if (semanticRanges.some((range) => range.start < block.end && block.start < range.end)) {
+        reachable.add(block.start);
+      }
+    });
+  }
+  stats.cfg.blocks += normalCFG.blocks.length;
+  stats.cfg.edges += normalCFG.blocks.reduce((count, block) => count + block.edges.length, 0);
+  stats.cfg.loops += normalCFG.loops.length;
+  normalCFG.blocks.forEach((block) => {
+    if (reachable.has(block.start)) return;
     const newlyUnreachable = block.instructions.filter((instruction) =>
-      !instruction.unreachable && !isCanonicalFinalizerInstruction(instruction)
+      !instruction.unreachable
     );
     if (!newlyUnreachable.length) return;
     stats.unreachableBlocksRemoved += 1;
@@ -173,11 +217,21 @@ function eliminateUnreachableBlocks(scope, stats) {
   });
 }
 
+function rebuildMIR(program, stats, passes, reason) {
+  const mir = lowerToMIR(program);
+  stats.mir.builds += 1;
+  verifyMIR(mir, program);
+  passes.setAnalysis("mir", mir, reason);
+  return mir;
+}
+
 function optimizeProgram(program, requestedLevel, options = {}) {
   const level = normalizeLevel(requestedLevel);
   const stats = {
     level,
+    pipelineVersion: OPTIMIZER_PIPELINE_VERSION,
     passes: [],
+    disabledPasses: [],
     constantsFolded: 0,
     constantBranchesFolded: 0,
     deadOperationsRemoved: 0,
@@ -210,7 +264,7 @@ function optimizeProgram(program, requestedLevel, options = {}) {
     // peephole guards), never folds allocate ops (NEW*/CLOSURE are not
     // literals), and preserves the instruction stream's offset layout.
     currentProgram.scopes.forEach((scope) => foldConstants(scope, stats));
-  });
+  }, INVALIDATE_MIR);
 
   passes.run("constant-branches", (currentProgram) => {
     // Rewrites JTRUE/JFALSE on known literal conditions to a direct
@@ -218,14 +272,14 @@ function optimizeProgram(program, requestedLevel, options = {}) {
     // condition instruction stays live; CFG reachability is resolved by the
     // next pass from the rewritten target.
     currentProgram.scopes.forEach((scope) => foldConstantBranches(scope, stats));
-  });
+  }, INVALIDATE_MIR);
 
   passes.run("cfg-unreachable-code", (currentProgram) => {
-    // Marks blocks unreachable from entry as `unreachable` (CFG reachability);
-    // canonical TryFinally finalizer bodies are always kept reachable so
-    // structured unwinds cannot lose their cleanup path.
+    // Removes a block only when neither semantic execution nor the current
+    // normal-lowering/MIR scaffolding can reach it. Finalizers are retained by
+    // explicit completion edges instead of a byte-range exception.
     currentProgram.scopes.forEach((scope) => eliminateUnreachableBlocks(scope, stats));
-  });
+  }, INVALIDATE_MIR);
 
   // Source-map generation consumes LOC positions at compile time, so it
   // retains them exactly like preserveSourceLocations does for runtime
@@ -236,25 +290,34 @@ function optimizeProgram(program, requestedLevel, options = {}) {
     passes.run("strip-source-locations", (currentProgram) => {
       // Elides LOC instructions (debug markers only, no runtime effect).
       currentProgram.scopes.forEach((scope) => stripSourceLocations(scope, stats));
-    });
+    }, INVALIDATE_MIR);
   }
 
-  let analysisMIR;
   passes.run("ssa-sccp", (currentProgram) => {
     // Sparse conditional constant propagation over the MIR value graph.
     // Constants flow only through SSA values, never across the sandbox
-    // boundary; produces the shared `analysisMIR` consumed by the later SSA
-    // passes (rebuilt once, verified, reused).
-    analysisMIR = runSCCP(currentProgram, stats);
-  });
+    // boundary. The pass replaces its input generation with a freshly lowered,
+    // verified MIR; later mutating passes do the same before another consumer
+    // can observe their changed use-def or control-flow facts.
+    if (options.sparseConditionalConstantPropagation === false) {
+      stats.disabledPasses.push("ssa-sccp");
+    } else {
+      runSCCP(currentProgram, stats);
+    }
+    rebuildMIR(currentProgram, stats, passes, "post-sccp-control-flow");
+  }, REBUILD_MIR);
 
   passes.run("ssa-copy-propagation", (currentProgram) => {
     // Propagates known literals into private lightweight locals (intra-block;
     // parameters excluded — sloppy arguments can alias them). Kills on any
     // unknown store. Literals only, so guest-allocated values never get
     // aliased into slots the provenance pass would misjudge.
-    runCopyPropagation(currentProgram, stats, analysisMIR);
-  });
+    if (options.copyPropagation === false) {
+      stats.disabledPasses.push("ssa-copy-propagation");
+      return;
+    }
+    runCopyPropagation(currentProgram, stats, passes.getAnalysis("mir"));
+  }, PRESERVE_MIR);
 
   if (level === "O2") {
     passes.run("loop-invariant-code-motion", (currentProgram) => {
@@ -263,22 +326,31 @@ function optimizeProgram(program, requestedLevel, options = {}) {
       // with/eval/closures can mutate the slot; a loop-local write is a hard
       // kill. Trusted-mode slots that codegen will promote (Item 6) are
       // skipped: their hoist would be a pure alias of a register read.
-      runLoopInvariantCodeMotion(currentProgram, stats, analysisMIR, options);
-    });
+      if (options.loopInvariantCodeMotion === false) {
+        stats.disabledPasses.push("loop-invariant-code-motion");
+        return;
+      }
+      runLoopInvariantCodeMotion(currentProgram, stats, passes.getAnalysis("mir"), options);
+    }, PRESERVE_MIR);
 
     passes.run("global-value-numbering", (currentProgram) => {
       // Memory-aware cross-block CSE for private locals (O2 only): a load is
-      // available across a block only when every predecessor carries the
-      // same dominating load and no path writes that local.
-      runGlobalValueNumbering(currentProgram, stats, analysisMIR);
-    });
+      // available across a semantic-CFG block only when every reachable
+      // predecessor carries the same dominating load and no path writes that
+      // local. Real catch/with/eval scopes retain a fail-closed bailout.
+      if (options.globalValueNumbering === false) {
+        stats.disabledPasses.push("global-value-numbering");
+        return;
+      }
+      runGlobalValueNumbering(currentProgram, stats, passes.getAnalysis("mir"));
+    }, PRESERVE_MIR);
   }
 
   if (level === "O2" || level === "Os") {
     passes.run("local-cse", (currentProgram) => {
       // Same-block CSE (O2/Os).
-      runLocalCSE(currentProgram, stats, analysisMIR);
-    });
+      runLocalCSE(currentProgram, stats, passes.getAnalysis("mir"));
+    }, PRESERVE_MIR);
 
     passes.run("dead-store-elimination", (currentProgram) => {
       // Elides SETLOCALs whose value is never read on any path before the
@@ -291,17 +363,26 @@ function optimizeProgram(program, requestedLevel, options = {}) {
       // leaves the stack untouched (no drop-inputs needed, unlike DCE's POP
       // chains). Runs after every value-moving pass and before the final
       // DCE, so the provenance mark written later cannot go stale.
-      if (options.deadStoreElimination === false) return;
-      runDeadStoreElimination(currentProgram, stats, analysisMIR);
-    });
+      if (options.deadStoreElimination === false) {
+        stats.disabledPasses.push("dead-store-elimination");
+        return;
+      }
+      runDeadStoreElimination(currentProgram, stats, passes.getAnalysis("mir"), options);
+      rebuildMIR(currentProgram, stats, passes, "post-dse-use-def");
+    }, REBUILD_MIR);
   }
 
   passes.run("ssa-dead-code-elimination", (currentProgram) => {
     // Removes Pure-effect operations whose single output is consumed by POP.
     // Pure-only: nothing with observable effects or multiple uses is touched.
     // The last SSA pass — later passes see the final MIR shape.
-    runDeadCodeElimination(currentProgram, stats, analysisMIR);
-  });
+    if (options.deadCodeElimination === false) {
+      stats.disabledPasses.push("ssa-dead-code-elimination");
+      return;
+    }
+    runDeadCodeElimination(currentProgram, stats, passes.getAnalysis("mir"));
+    rebuildMIR(currentProgram, stats, passes, "post-dce-use-def");
+  }, OPTIONAL_REBUILD_MIR);
 
   if (level === "O2" || level === "Os") {
     passes.run("guest-object-provenance", (currentProgram) => {
@@ -314,8 +395,8 @@ function optimizeProgram(program, requestedLevel, options = {}) {
       // stale. NEW outputs additionally require a constructor pinned to one
       // return-safe closure scope. Nothing unmarked ever takes the fast
       // path; see guest-provenance.js.
-      runGuestProvenance(currentProgram, stats, analysisMIR);
-    });
+      runGuestProvenance(currentProgram, stats, passes.getAnalysis("mir"));
+    }, OPTIONAL_PRESERVE_MIR);
   }
 
   passes.run("copy-folding", (currentProgram) => {
@@ -324,17 +405,24 @@ function optimizeProgram(program, requestedLevel, options = {}) {
     // peepholes are re-applied to the final HIR to keep their decisions
     // consistent with what codegen will emit.
     currentProgram.scopes.forEach((scope) => foldConstants(scope, stats));
-  });
+  }, INVALIDATE_MIR);
 
   passes.run("copy-constant-branches", (currentProgram) => {
     currentProgram.scopes.forEach((scope) => foldConstantBranches(scope, stats));
-  });
+    const removed = refreshBranchProofs(currentProgram);
+    if (stats.sccp) stats.sccp.branchesFolded -= removed;
+  }, INVALIDATE_MIR);
 
   passes.run("copy-unreachable-code", (currentProgram) => {
     currentProgram.scopes.forEach((scope) => eliminateUnreachableBlocks(scope, stats));
-  });
+  }, INVALIDATE_MIR);
   stats.nodesAfter = liveInstructionCount(program);
   return stats;
 }
 
-module.exports = { LEVELS, normalizeLevel, optimizeProgram };
+module.exports = {
+  LEVELS,
+  OPTIMIZER_PIPELINE_VERSION,
+  normalizeLevel,
+  optimizeProgram,
+};

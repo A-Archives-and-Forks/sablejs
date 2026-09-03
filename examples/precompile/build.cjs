@@ -23,7 +23,7 @@ const source = fs.readFileSync(guestPath, "utf8");
 // The compile options are part of the artifact's identity: the cache example
 // keys on source + options together.
 const compileOptions = {
-  optimization: "O2",
+  optimization: "O1",
   security: "sandbox",
   sourceMap: {
     mode: "external",

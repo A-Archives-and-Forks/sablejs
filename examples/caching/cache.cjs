@@ -18,12 +18,14 @@ const fs = require("node:fs");
 const path = require("node:path");
 const crypto = require("node:crypto");
 const { compile } = require("sablejs");
+const compilerVersion = require("../../package.json").version;
+const CACHE_SCHEMA_VERSION = 2;
+const DEFAULT_OPTIMIZATION = "O1";
 
 const guestPath = path.join(__dirname, "..", "precompile", "guest.js");
 const cacheDir = path.join(__dirname, "..", ".cache", "caching");
 
 const compileOptions = {
-  optimization: "O2",
   security: "sandbox",
   sourceMap: { mode: "external", sourceFile: "guest.js", generatedFile: "program.cjs" },
 };
@@ -34,7 +36,11 @@ function keyFor(source, options) {
   // dynamically (e.g. sort keys recursively).
   return crypto.createHash("sha256")
     .update(source)
-    .update(JSON.stringify(options))
+    .update(JSON.stringify({
+      cacheSchema: CACHE_SCHEMA_VERSION,
+      compilerVersion,
+      options: { optimization: DEFAULT_OPTIMIZATION, ...options },
+    }))
     .digest("hex");
 }
 
@@ -53,6 +59,9 @@ function loadArtifact(key) {
 function compileIntoCache(key, source) {
   const dir = path.join(cacheDir, key);
   const result = compile(source, compileOptions);
+  if (result.optimization !== DEFAULT_OPTIMIZATION) {
+    throw new Error(`cache default mismatch: expected ${DEFAULT_OPTIMIZATION}, got ${result.optimization}`);
+  }
   fs.mkdirSync(dir, { recursive: true });
   fs.writeFileSync(path.join(dir, "program.cjs"), result.code);
   if (result.map) fs.writeFileSync(path.join(dir, "program.cjs.map"), result.map);

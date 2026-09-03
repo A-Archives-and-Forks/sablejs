@@ -282,8 +282,9 @@ const DISPATCH_STACK_POPS = {
 // EMPTY is pushed via $r.pushEmpty, which flushes the model stack, so a hole
 // init never has all three operands pending), the __proto__ key check (the
 // key is a static literal — excluded below when it spells __proto__), the
-// prototypeSetterUnsafe flag check (kept live via the $prototypesHaveSetters
-// module import — the generated $r is the runtime instance, not the module),
+// inherited-property safety flag check (kept live through the historical
+// $prototypesHaveSetters module import — the generated $r is the runtime
+// instance, not the module),
 // and the function-value securing (preserved via the typeof probe, skipped
 // when the value's static op proves primitive). The fallback branch
 // re-materializes the full unpopped operand stack so $r.initProperty($f)
@@ -1014,7 +1015,8 @@ function emitStackToLocalRange(lines, scope, instructions, indent, context) {
   // $prototypesHaveSetters() guard call + typeof probe + keyed store).
   //
   // Safety: a native literal defines own data properties (DefineOwnProperty
-  // semantics), so it can never trigger Object.prototype setters — the fold
+  // semantics), so inherited accessors or non-writable data properties cannot
+  // affect it — the fold
   // is strictly more correct than the guard path, which is why no guard is
   // emitted for folded properties. The folded values are fresh unobserved
   // temps (write-once model-stack discipline), so the sandbox loses only
@@ -1098,12 +1100,15 @@ function emitStackToLocalRange(lines, scope, instructions, indent, context) {
     function resolveLiteralChain(instructions, offset, depth) {
       const instruction = instructions[offset];
       if (!instruction || instruction.elided || instruction.unreachable) return null;
+      // Proof sources must execute as named producers. Folding a currently
+      // literal-valued source into an enclosing aggregate would leave its
+      // later GVN/LICM consumer without the required temporary.
+      if (foldExcluded.has(instruction.offset) ||
+          context.globalValueProducerOffsets.has(instruction.offset)) return null;
       if (isFoldableLiteralValue(instruction)) {
         return { source: literalOperand(instruction), endCursor: offset };
       }
       if (depth >= 8 || (instruction.op !== "NEWOBJECT" && instruction.op !== "NEWARRAY")) return null;
-      if (foldExcluded.has(instruction.offset) ||
-          context.globalValueProducerOffsets.has(instruction.offset)) return null;
       const cursor = offset + 1;
       if (instruction.op === "NEWARRAY") {
         const elements = [];
@@ -1258,7 +1263,11 @@ function emitStackToLocalRange(lines, scope, instructions, indent, context) {
 
     if (instruction.optimized && instruction.optimized.kind === "reuse") {
       const source = context.instructionTemporaries.get(instruction.optimized.sourceOffset);
-      if (!source) return false;
+      if (!source) {
+        throw new Error(
+          `Invalid reuse source ${instruction.optimized.sourceOffset} at ${instruction.offset} in scope ${scope.id}`
+        );
+      }
       // Reuse pairs are dominance-guaranteed by the optimizer, so the
       // producing temporary is always lexically visible; only the inline
       // guard below needs the cross-block visibility check.
@@ -2682,8 +2691,9 @@ function generateScope(scope, options, codegenStats) {
     // of parameter slots is deliberately omitted — it would run once per call
     // even when the function's write sites never execute (early returns), and
     // the lazy fallback classifies the identical initial value at the first
-    // write, so a prologue classification saves nothing (measured: DeltaBlue
-    // −6.9% with it, recovered on removal). The mapped-arguments guard still
+    // write, so a prologue classification saves nothing (it measured −6.9%
+    // on a constraint-solving workload and recovered on removal). The
+    // mapped-arguments guard still
     // gates staleness for sloppy parameter slots either way.
     const declaration = `  let ${Array.from(context.provenanceSlots.tracked).map((index) => provenanceFlag(context, index)).join(", ")};`;
     code = code.replace("{\n", `{\n${declaration}\n`);

@@ -34,15 +34,16 @@
 // write path.
 
 const { lowerToMIR, verifyMIR } = require("../ir/mir");
+const { hasDynamicChain, hasProtectedControlFlow } = require("./scope-effects");
 
 function analysisMIR(hirProgram, stats, existingMIR) {
   if (existingMIR) {
-    verifyMIR(existingMIR);
+    verifyMIR(existingMIR, hirProgram);
     return existingMIR;
   }
   const mir = lowerToMIR(hirProgram);
   if (stats.mir) stats.mir.builds += 1;
-  verifyMIR(mir);
+  verifyMIR(mir, hirProgram);
   return mir;
 }
 
@@ -282,15 +283,23 @@ function returnSafeAnalysis(hirScope) {
 
 function runGuestProvenance(hirProgram, stats, existingMIR) {
   const mir = analysisMIR(hirProgram, stats, existingMIR);
+  const scopesById = new Map(hirProgram.scopes.map((scope) => [scope.id, scope]));
+  const dynamicChainMemo = new Map();
   const returnSafeByScopeId = new Map();
   hirProgram.scopes.forEach((scope) => {
     returnSafeByScopeId.set(scope.id, returnSafeAnalysis(scope));
   });
   let markedLoads = 0;
   let markedNews = 0;
+  let scopesSkipped = 0;
   mir.scopes.forEach((mirScope) => {
     const hirScope = hirProgram.scopes.find((scope) => scope.id === mirScope.id);
     if (!hirScope) return;
+    if (hasDynamicChain(hirScope, scopesById, dynamicChainMemo) ||
+        hasProtectedControlFlow(hirScope)) {
+      scopesSkipped += 1;
+      return;
+    }
     const instructions = new Map(
       hirScope.instructions.map((instruction) => [instruction.offset, instruction])
     );
@@ -310,7 +319,7 @@ function runGuestProvenance(hirProgram, stats, existingMIR) {
       }
     });
   });
-  stats.guestProvenance = { markedLoads, markedNews };
+  stats.guestProvenance = { markedLoads, markedNews, scopesSkipped };
   return mir;
 }
 

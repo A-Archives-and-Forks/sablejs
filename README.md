@@ -19,8 +19,10 @@
 2. **Debuggable** — source maps and inspectable compiler IR.
 3. **Built for generated code** — copied data and explicit capabilities.
 
-V8 Benchmark Suite 7 reference score: **2,202** in sablejs sandbox versus
-**1,181** in QuickJS-WASM 0.32.0. [Methodology and caveats](docs/performance.md).
+Historical V8 Benchmark Suite 7 reference score (2026-08-24): **2,202** in
+sablejs O2 sandbox versus **1,181** in QuickJS-WASM 0.32.0. This is not a
+production recommendation or a CFG/SSA-only result; O2 has open correctness and
+harness-methodology work. [Methodology and status](docs/performance.md).
 
 ## Quick start
 
@@ -36,7 +38,9 @@ Compile an ES5.1 program — a script with no imports that returns its result as
 // build.cjs
 const fs = require("node:fs");
 const { compile } = require("sablejs");
-const generated = compile("({ total: input.price * 1.2 });");
+const generated = compile("({ total: input.price * 1.2 });", {
+  optimization: "O1", // temporary containment while O2/Os are hardened
+});
 fs.writeFileSync("program.cjs", generated.code);
 ```
 
@@ -60,6 +64,11 @@ node build.cjs && node run.cjs
 ```
 
 The default `security: "sandbox"` mode recursively copies plain `globals` data, so guest mutations do not reach the host object graph. One `instance.run()` call executes the program; instances are single-run and meant to be disposed.
+
+The compiler now defaults to O1 when `optimization` is omitted. Explicit O2
+and Os remain available for development and compatibility testing, but are
+experimental until the [CFG/SSA hardening gates](docs/cfg-ssa-hardening.md)
+are complete. O1 is containment, not a full correctness certificate.
 
 ## Examples
 
@@ -88,7 +97,7 @@ import { compile } from "sablejs";
 import type { CompileOptions, CompileResult, SourceMapSettings } from "sablejs";
 
 const options: CompileOptions = {
-  optimization: "O2",
+  optimization: "O1",
   security: "sandbox",
   sourceMap: { mode: "external", sourceFile: "rules/input.js" },
 };
@@ -134,9 +143,9 @@ instance.run();
 
 | option | effect |
 | --- | --- |
-| `dumpDir: "/path"` | writes `hir.txt` (optimized HIR, with pass annotations), `mir.txt` (SSA MIR: blocks, phis, operations), and `code.js` (generated CJS) into the directory |
-| `includeHIR` / `includeMIR` | attach the HIR / MIR graph objects to the compile result |
-| `dumpIR: "hir" \| "mir" \| "all"` | same, graph for the named forms only |
+| `dumpDir: "/path"` | writes `hir.txt`, completion-labelled `cfg.txt`, SSA `mir.txt`, and generated `code.js` into the directory |
+| `includeHIR` / `includeCFG` / `includeMIR` | attach the HIR / semantic CFG / MIR graph objects to the compile result |
+| `dumpIR: "hir" \| "cfg" \| "mir" \| "all"` | same, graph for the named forms only |
 | `fs: { mkdirSync, writeFileSync, join }` | inspection-mode file adapter; defaults to Node's `fs`/`path`, lazily required. Browser bundles can pass an in-memory implementation (e.g. `memfs`) so `dumpDir` works without Node built-ins |
 
 The dump is a side channel — the compile result is unchanged by `dumpDir`.
@@ -296,10 +305,10 @@ The conformance gate's corpus policy — which Test262 tests are eligible, which
 
 ## Performance
 
-Results from the Linux x64 reference machine are shown below. V8 Benchmark
+Historical results from the Linux x64 reference machine are shown below. V8 Benchmark
 Suite 7 and SunSpider use three-run medians; Octane and Kraken are single
 measured runs. See [Performance](docs/performance.md) for methodology,
-exclusions, and variance.
+exclusions, variance, and the current correctness/methodology warning.
 
 | Backend | V8 Benchmark Suite 7 score | vs sandbox |
 | --- | ---: | ---: |
@@ -313,7 +322,7 @@ exclusions, and variance.
 | SunSpider 1.0 total, 23 tests (ms, lower is better) | 396.1 | 515.5 | 597.7 |
 | Kraken 1.1 total, 14 tests (ms, lower is better) | 5,370.9 | 15,935.3 | 27,081.9 |
 
-Sandbox retains 79.1% of trusted throughput on V8 Benchmark Suite 7 under this harness, and beats QuickJS-WASM on seven of the eight real-world workloads (mini-parser sits at parity). On SunSpider and Kraken the sandbox totals are also faster than the QuickJS-WASM reference (1.16x and 1.70x) — the sandbox tax shows as a reduction *relative to the fully trusted sablejs backend*, not as a loss to QuickJS. These numbers characterize this benchmark and harness, not universal application performance. A 137 KB benchmark source compiles to a 657 KB minified sandbox bundle (87.5 KB gzipped; the size-optimized `Os` level: 386 KB / 60.7 KB). Compiled bundle sizes are gated in CI — `npm run benchmark:size -- --check` fails any artifact that exceeds its recorded budget by 5%.
+On that historical harness, sandbox retained 79.1% of trusted throughput on V8 Benchmark Suite 7 and measured above QuickJS-WASM on seven of eight fixed-input workloads. Those ratios are not current product claims: the workloads were visible during tuning, embed deterministic input into source, and the recorded QuickJS lifecycle was asymmetric with precompiled sablejs. The harness now separates prepare/run and fails incomplete suites, but has not been rerun for these tables. A 137 KB benchmark source compiled to a 657 KB minified sandbox bundle (87.5 KB gzipped; the size-optimized `Os` level: 386 KB / 60.7 KB). Compiled bundle sizes are gated in CI, but a size ceiling is not a correctness or generalization gate. See the [hardening plan](docs/cfg-ssa-hardening.md).
 
 ## Security
 
@@ -324,6 +333,7 @@ An internal boundary audit completed on 2026-08-22 found no known usable escape 
 - [Architecture](docs/architecture.md)
 - [Choosing an execution model](docs/comparison.md)
 - [Compatibility](docs/compatibility.md)
+- [CFG and SSA hardening plan](docs/cfg-ssa-hardening.md)
 - [Fuel budgets — research design, not implemented](docs/fuel-budget.md)
 - [Migrating from v1 to v2](docs/migration-v2.md)
 - [Performance](docs/performance.md)

@@ -12,10 +12,12 @@ const rawPath = path.resolve(__dirname, "v8-suite.aot.cjs");
 const minPath = path.resolve(__dirname, "v8-suite.aot.min.cjs");
 const formattedPath = path.resolve(__dirname, "v8-suite.aot.formatted.cjs");
 const source = fs.readFileSync(sourcePath, "utf8");
+const optimizationArgument = process.argv.find((entry) => entry.startsWith("--optimization="));
+const optimization = optimizationArgument ? optimizationArgument.slice("--optimization=".length) : "O1";
 
 const startedAt = performance.now();
 const compiled = compile(source, {
-  optimization: "O2",
+  optimization,
   identifierProtection: "alias",
   runtimeModule: "../src/runtime",
   security: "trusted",

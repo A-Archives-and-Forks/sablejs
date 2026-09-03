@@ -344,7 +344,7 @@ describe("sablejs OpSpec and AOT backend", function() {
   it("builds CFG predecessors, dominators, and natural loop backedges", function() {
     const hir = lowerToHIR("var i = 0; while (i < 2) { i++; } i;");
     const cfg = buildCFG(hir.scopes[0]);
-    assert.equal(verifyCFG(cfg), true);
+    assert.equal(verifyCFG(cfg, hir.scopes[0]), true);
     assert(cfg.blocks.length > 2);
     assert(cfg.loops.length > 0);
     const loop = cfg.loops[0];
@@ -1049,18 +1049,26 @@ describe("sablejs OpSpec and AOT backend", function() {
       assert.equal(o2.result.stats.deadStoreElimination.storesEliminated, 2);
     });
 
-    it("keeps stores feeding a reuse whose source later elides", function() {
-      // GVN marks the loop read of x as `reuse` of the earlier `!x` load; the
-      // copy-folding peephole then elides that source load, so codegen falls
-      // back to a real slot read. DSE must not have elided the stores that
-      // read needs — the reuse mark is a hint whose honor is conditional.
+    it("keeps reuse producers live through later peephole passes", function() {
+      // GVN marks the loop read of x as `reuse` of the earlier `!x` load.
+      // Later peepholes must retain that producer: codegen now rejects a
+      // missing reuse source instead of silently changing the annotation to
+      // a slot read. DSE must also retain the store feeding the producer.
       const source = "function f() { var x = \"ab\"; var y = !x; " +
         "while (3) { x = x[1]; break; } return y; } f();";
       const o0 = run(source, undefined, { optimization: "O0" });
-      const o2 = run(source, undefined, { optimization: "O2" });
+      const o2 = run(source, undefined, { optimization: "O2", includeHIR: true });
       assert.equal(o2.value, o0.value);
       assert.equal(o2.value, false);
-      // Entry store of x stays live (the reuse read consumes); only the
+      const functionScope = o2.result.hir.scopes[1];
+      const reuse = functionScope.instructions.find((instruction) =>
+        instruction.optimized && instruction.optimized.kind === "reuse"
+      );
+      const producer = functionScope.instructions.find((instruction) =>
+        instruction.offset === reuse.optimized.sourceOffset
+      );
+      assert.equal(producer.elided, undefined);
+      // Entry store of x stays live; only the
       // self-binding prologue and the loop's own dead x store are elided.
       assert.equal(o2.result.stats.deadStoreElimination.storesEliminated, 2);
     });
@@ -1182,12 +1190,24 @@ describe("sablejs OpSpec and AOT backend", function() {
     });
     assert.deepStrictEqual(first.hir, second.hir);
     assert(first.stats.constantsFolded > 0);
-    assert.equal(first.stats.mir.builds, 1);
+    assert.equal(first.stats.mir.builds, 4);
+    assert.equal(first.stats.analysis.generation, first.stats.passes.length);
+    assert(first.stats.analysis.rebuilds.some(
+      (entry) => entry.reason === "post-sccp-control-flow"
+    ));
+    assert(first.stats.passes.every((pass) =>
+      Number.isInteger(pass.generation) &&
+      Array.isArray(pass.preserves) && Array.isArray(pass.invalidates)
+    ));
     assert(first.stats.nodesAfter < first.stats.nodesBefore);
     assert(first.stats.passes.every((pass) => Number.isFinite(pass.durationMs)));
     assert.deepStrictEqual(traced, withTrace.stats.passes.map((pass) => pass.name));
     assert.equal(first.metadata.abiVersion, ABI_VERSION);
     assert.equal(first.metadata.inputLanguage, "es5.1");
+    assert.equal(
+      first.metadata.optimizerAnalysisGeneration,
+      first.stats.analysis.generation
+    );
     assert.equal(compile("1;", { runtimeModule, optimization: "O0" }).stats.mir.builds, 0);
   });
 
@@ -2357,7 +2377,7 @@ describe("sablejs generated-code inspection mode (dumpDir)", function() {
     return fs.mkdtempSync(path.join(os.tmpdir(), "sablejs-dump-test-"));
   }
 
-  it("writes hir.txt, mir.txt, and code.js for O2", function() {
+  it("writes hir.txt, semantic cfg.txt, mir.txt, and code.js for O2", function() {
     const dir = tempDumpDir();
     try {
       const result = compile(
@@ -2367,9 +2387,10 @@ describe("sablejs generated-code inspection mode (dumpDir)", function() {
       // The dump is a side channel; the result object is unchanged unless the
       // graph-returning options are requested.
       assert.equal(result.hir, undefined);
+      assert.equal(result.cfg, undefined);
       assert.equal(result.mir, undefined);
       const files = fs.readdirSync(dir).sort();
-      assert.deepStrictEqual(files, ["code.js", "hir.txt", "mir.txt"]);
+      assert.deepStrictEqual(files, ["cfg.txt", "code.js", "hir.txt", "mir.txt"]);
 
       const hir = fs.readFileSync(path.join(dir, "hir.txt"), "utf8");
       assert.match(hir, /^ProgramHIR version=1 entry=#0 scopes=2\n/);
@@ -2381,6 +2402,10 @@ describe("sablejs generated-code inspection mode (dumpDir)", function() {
       assert.doesNotMatch(hir, /\{"kind":"FunctionHIR"/);
       // The provenance mark is visible in the dump.
       assert.match(hir, /GETLOCAL 1\s+; guest/);
+
+      const cfg = fs.readFileSync(path.join(dir, "cfg.txt"), "utf8");
+      assert.match(cfg, /^CFG edgeModel=semantic scopes=2\n/);
+      assert.match(cfg, /class=normal/);
 
       const mir = fs.readFileSync(path.join(dir, "mir.txt"), "utf8");
       assert.match(mir, /^MIR scopes=2\n/);
@@ -2422,6 +2447,7 @@ describe("sablejs generated-code inspection mode (dumpDir)", function() {
         dumpIR: "all",
       });
       assert.ok(result.hir);
+      assert.ok(result.cfg);
       assert.ok(result.mir);
       const mir = fs.readFileSync(path.join(dir, "mir.txt"), "utf8");
       assert.match(mir, /mir scope #0 /);
@@ -2448,13 +2474,15 @@ describe("sablejs generated-code inspection mode (dumpDir)", function() {
     });
     // The dump is a side channel; the result object is unchanged.
     assert.equal(result.hir, undefined);
-    assert.equal(calls.length, 4);
+    assert.equal(calls.length, 5);
     assert.deepStrictEqual(calls[0], ["mkdir", "/virtual/dump"]);
     assert.deepStrictEqual(calls.slice(1).map((call) => call[1]), [
       "/virtual/dump/hir.txt",
+      "/virtual/dump/cfg.txt",
       "/virtual/dump/mir.txt",
       "/virtual/dump/code.js",
     ]);
-    assert.match(calls[2][2], /^MIR scopes=1\n/);
+    assert.match(calls[2][2], /^CFG edgeModel=semantic scopes=1\n/);
+    assert.match(calls[3][2], /^MIR scopes=1\n/);
   });
 });

@@ -89,7 +89,7 @@ const sourceParts = [read("base.js")];
 selectedNames.forEach((name) => SUITES[name].forEach((filename) => sourceParts.push(read(filename))));
 sourceParts.push(footer);
 let source = sourceParts.join("\n");
-const optimization = argument("optimization", "O2");
+const optimization = argument("optimization", "O1");
 const security = argument("security", "trusted");
 const backend = argument("backend", "");
 const useQuickJS = backend === "quickjs";

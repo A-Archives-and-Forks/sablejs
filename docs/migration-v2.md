@@ -47,7 +47,7 @@ const { compile } = require("sablejs");
 
 const source = fs.readFileSync("guest.js", "utf8");
 const result = compile(source, {
-  optimization: "O2",
+  optimization: "O1",
   security: "sandbox",
   sourceMap: {
     mode: "external",

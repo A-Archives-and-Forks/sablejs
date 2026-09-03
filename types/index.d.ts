@@ -8,7 +8,7 @@
  * ```ts
  * import { compile } from "sablejs";
  * const { code } = compile("({ total: input.price * 1.2 });", {
- *   optimization: "O2",
+ *   optimization: "O1",
  *   security: "sandbox",
  * });
  * // write code to disk, then:
@@ -114,7 +114,8 @@ export interface InspectionFs {
 export interface CompileOptions {
   /**
    * Optimization level. Accepts `"O0"`–`"Os"` and the aliases listed on
-   * {@link OptimizationLevelLike}. Default `"O2"`.
+   * {@link OptimizationLevelLike}. Default `"O1"`. O2/Os are experimental
+   * while the completion-aware CFG hardening gate remains open.
    */
   optimization?: OptimizationLevelLike;
   /** Alias for {@link optimization}, honored when `optimization` is unset. */
@@ -153,13 +154,27 @@ export interface CompileOptions {
    * locals; the fallback path keeps an explicit stack).
    */
   stackToLocal?: boolean;
+  /** Diagnostic A/B switch: disable MIR sparse conditional constant propagation. */
+  sparseConditionalConstantPropagation?: boolean;
+  /** Diagnostic A/B switch: disable MIR literal copy propagation. */
+  copyPropagation?: boolean;
+  /** Diagnostic A/B switch: disable MIR dead-code elimination. */
+  deadCodeElimination?: boolean;
+  /** Diagnostic A/B switch: disable O2 loop-invariant code motion. */
+  loopInvariantCodeMotion?: boolean;
+  /** Diagnostic A/B switch: disable O2 global value numbering. */
+  globalValueNumbering?: boolean;
+  /** Diagnostic A/B switch: disable O2/Os dead-store elimination. */
+  deadStoreElimination?: boolean;
   /** Attach the optimized HIR graph object to the result. */
   includeHIR?: boolean;
   /** Attach the SSA MIR graph object to the result. */
   includeMIR?: boolean;
+  /** Attach the completion-aware semantic CFG graph object to the result. */
+  includeCFG?: boolean;
   /** Attach the named graph object(s) to the result. */
-  dumpIR?: "hir" | "mir" | "all";
-  /** Write `hir.txt` / `mir.txt` / `code.js` (+ `code.js.map`) into a directory. */
+  dumpIR?: "hir" | "mir" | "cfg" | "all";
+  /** Write `hir.txt` / `cfg.txt` / `mir.txt` / `code.js` (+ map) into a directory. */
   dumpDir?: string;
   /** File adapter used by `dumpDir`; defaults to Node's fs/path. */
   fs?: InspectionFs;
@@ -168,6 +183,9 @@ export interface CompileOptions {
 /** One optimizer pass run, as recorded in `OptimizerStats.passes`. */
 export interface OptimizerPassRecord {
   name: string;
+  generation: number;
+  preserves: string[];
+  invalidates: string[];
   durationMs: number;
   nodesBefore: number;
   nodesAfter: number;
@@ -177,13 +195,28 @@ export interface OptimizerPassRecord {
 /** Statistics recorded by the optimizer. */
 export interface OptimizerStats {
   level: OptimizationLevel;
+  /** Version of the optimizer pass/annotation contract used for this build. */
+  pipelineVersion: number;
   passes: OptimizerPassRecord[];
+  /** Passes retained in the pipeline contract but disabled for an A/B build. */
+  disabledPasses: string[];
   constantsFolded: number;
   constantBranchesFolded: number;
   deadOperationsRemoved: number;
   unreachableBlocksRemoved: number;
   cfg: { blocks: number; edges: number; loops: number };
   mir: { builds: number };
+  analysis?: {
+    generation: number;
+    rebuilds: Array<{ name: string; generation: number; reason: string }>;
+    rollbacks: number;
+    bailouts: Array<{
+      pass: string;
+      reason: string;
+      scopeId?: number;
+      diagnosticCode?: string;
+    }>;
+  };
   sourceLocationsRemoved: number;
   nodesBefore: number;
   nodesAfter?: number;
@@ -284,6 +317,23 @@ export interface CompileMetadata {
   inputLanguage: "es5.1";
   identifierProtection: "alias" | "preserve";
   optimize: OptimizationLevel;
+  /** Version of the optimizer pass/annotation contract. */
+  optimizerPipelineVersion: number;
+  /** Exact ordered pass list that ran for this artifact. */
+  optimizerPasses: string[];
+  /** Pipeline passes explicitly disabled by diagnostic A/B options. */
+  optimizerDisabledPasses: string[];
+  /** Final optimized-HIR generation after the recorded pass list. */
+  optimizerAnalysisGeneration: number;
+  /** Fresh analysis publications used to avoid consuming stale graphs. */
+  optimizerAnalysisRebuilds: Array<{ name: string; generation: number; reason: string }>;
+  /** Optional optimizer candidates that were rejected and rolled back. */
+  optimizerBailouts: Array<{
+    pass: string;
+    reason: string;
+    scopeId?: number;
+    diagnosticCode?: string;
+  }>;
   perScopeFactories: boolean;
   security: SecurityMode;
   /** Normalized source-map settings; present only when a map was requested. */
@@ -305,6 +355,8 @@ export interface CompileResult {
    * `includeHIR` / `dumpIR`).
    */
   hir?: any;
+  /** Completion-aware semantic CFG (debugging; present with `includeCFG` / `dumpIR`). */
+  cfg?: any;
   /** The SSA MIR graph object (debugging; present with `includeMIR` / `dumpIR`). */
   mir?: any;
   /** Serialized Source Map v3 JSON; undefined when source maps are disabled. */

@@ -2,12 +2,12 @@
 
 const assert = require("assert");
 const fs = require("fs");
-const os = require("os");
 const path = require("path");
 const { performance } = require("perf_hooks");
 const { compile } = require("../src/compiler");
 const { capability } = require("../src/runtime");
-const { getQuickJS } = require("quickjs-emscripten");
+const { createQuickJSRunner } = require("./quickjs-runner");
+const { environment, loadManifest, writeArtifact } = require("./evidence");
 
 const SUITES = ["Richards", "Crypto", "RayTrace", "NavierStokes", "DeltaBlue"];
 const repositoryRoot = path.resolve(__dirname, "..");
@@ -22,6 +22,18 @@ function argument(name, fallback) {
 
 const samples = Number(argument("samples", "3"));
 const warmup = Number(argument("warmup", "1"));
+const optimization = argument("optimization", "O1");
+const protocol = argument("protocol", "warm");
+const output = argument("output", "");
+const disabledPasses = argument("disable-pass", "").split(",").filter(Boolean);
+const passOptions = {
+  sccp: "sparseConditionalConstantPropagation",
+  "copy-propagation": "copyPropagation",
+  dce: "deadCodeElimination",
+  gvn: "globalValueNumbering",
+  licm: "loopInvariantCodeMotion",
+  dse: "deadStoreElimination",
+};
 const backendArgument = argument("backend", "all");
 const requestedBackends = backendArgument === "all"
   ? ["sablejs-sandbox", "sablejs-trusted", "quickjs"]
@@ -31,6 +43,10 @@ const backends = [...new Set(requestedBackends.map((backend) =>
 ))];
 if (!Number.isInteger(samples) || samples < 3) throw new Error("--samples must be an integer >= 3");
 if (!Number.isInteger(warmup) || warmup < 0) throw new Error("--warmup must be a non-negative integer");
+if (!["cold", "warm"].includes(protocol)) throw new Error("--protocol must be cold or warm");
+disabledPasses.forEach((name) => {
+  if (!passOptions[name]) throw new Error(`Unknown optimizer pass ${name}`);
+});
 backends.forEach((backend) => {
   if (!["sablejs-sandbox", "sablejs-trusted", "quickjs"].includes(backend)) {
     throw new Error(`Unknown backend ${backend}`);
@@ -80,14 +96,24 @@ function captureConsole(run) {
 }
 
 function prepareCompiler(security) {
-  const compiled = compile(source, { optimization: "O2", runtimeModule, security });
+  const optimizerOptions = Object.fromEntries(disabledPasses.map((name) => [passOptions[name], false]));
+  const compiled = compile(source, { optimization, runtimeModule, security, ...optimizerOptions });
   const generatedModule = { exports: {} };
   new Function("require", "module", "exports", compiled.code)(
     require,
     generatedModule,
     generatedModule.exports
   );
-  return { compiled, program: generatedModule.exports, security };
+  return {
+    compiled,
+    program: generatedModule.exports,
+    security,
+    evidence: {
+      metadata: compiled.metadata,
+      optimizer: compiled.stats,
+      generatedBytes: Buffer.byteLength(compiled.code),
+    },
+  };
 }
 
 function runCompiler(prepared) {
@@ -102,90 +128,116 @@ function runCompiler(prepared) {
   });
 }
 
-async function runQuickJS(QuickJS) {
+async function prepareQuickJS() {
   const lines = [];
-  const context = QuickJS.newContext();
-  const print = context.newFunction("print", (value) => {
-    lines.push(String(context.dump(value)));
-  });
-  context.setProp(context.global, "print", print);
-  print.dispose();
-  try {
-    const result = context.evalCode(source, "v8-suite.js");
-    if (result.error) {
-      const error = context.dump(result.error);
-      result.error.dispose();
-      throw new Error(`QuickJS benchmark failed: ${JSON.stringify(error)}`);
-    }
-    result.value.dispose();
-    return parseOutput(lines);
-  } finally {
-    context.dispose();
-  }
+  const runner = await createQuickJSRunner((value) => lines.push(value));
+  const execute = runner.prepare(source, "v8-suite.js");
+  return { lines, execute, dispose: () => runner.dispose() };
+}
+
+async function runQuickJS(prepared) {
+  prepared.lines.length = 0;
+  prepared.execute();
+  return parseOutput(prepared.lines);
 }
 
 async function collect(name, prepare, execute) {
-  const prepared = await prepare();
-  for (let index = 0; index < warmup; index += 1) await execute(prepared);
-  const rounds = [];
-  for (let index = 0; index < samples; index += 1) {
-    if (typeof global.gc === "function") global.gc();
-    const startedAt = performance.now();
-    const result = await execute(prepared);
-    rounds.push({ ...result, elapsedMs: performance.now() - startedAt });
-    console.error(`[release] ${name} ${index + 1}/${samples}: score=${result.total}`);
+  let prepared = null;
+  let preparation = null;
+  async function once(timed) {
+    let candidate = prepared;
+    const startedAt = timed ? performance.now() : 0;
+    if (protocol === "cold") candidate = await prepare();
+    try {
+      const result = await execute(candidate);
+      if (!preparation && candidate && candidate.evidence) preparation = candidate.evidence;
+      return timed ? { ...result, elapsedMs: performance.now() - startedAt } : result;
+    } finally {
+      if (protocol === "cold" && candidate && typeof candidate.dispose === "function") candidate.dispose();
+    }
   }
-  const metrics = {};
-  for (const metric of [...SUITES, "total", "elapsedMs"]) {
-    metrics[metric] = summarize(rounds.map((round) => round[metric]));
+  try {
+    if (protocol === "warm") {
+      prepared = await prepare();
+      preparation = prepared.evidence || null;
+    }
+    for (let index = 0; index < warmup; index += 1) await once(false);
+    const rounds = [];
+    for (let index = 0; index < samples; index += 1) {
+      if (typeof global.gc === "function") global.gc();
+      const result = await once(true);
+      rounds.push(result);
+      console.error(`[release] ${name} ${index + 1}/${samples}: score=${result.total}`);
+    }
+    const metrics = {};
+    for (const metric of [...SUITES, "total", "elapsedMs"]) {
+      metrics[metric] = summarize(rounds.map((round) => round[metric]));
+    }
+    return { rounds, metrics, preparation };
+  } finally {
+    if (prepared && typeof prepared.dispose === "function") prepared.dispose();
   }
-  return { rounds, metrics };
 }
 
 async function main() {
+  const corpus = loadManifest();
   const result = {
-    environment: {
-      node: process.version,
-      v8: process.versions.v8,
-      platform: `${process.platform}/${process.arch}`,
-      cpu: os.cpus()[0] ? os.cpus()[0].model : "unknown",
-      quickjsEmscripten: require("quickjs-emscripten/package.json").version,
+    schemaVersion: 1,
+    environment: environment(),
+    corpus: { path: corpus.path, sha256: corpus.sha256, counts: {
+      tuning: corpus.value.tuning.length,
+      heldout: corpus.value.heldout.length,
+      adversarial: corpus.value.adversarial.length,
+    } },
+    configuration: {
+      samples,
+      warmup,
+      protocol,
+      optimization,
+      disabledPasses,
+      suites: SUITES,
+      expectedSuiteCount: SUITES.length,
+      backends,
     },
-    configuration: { samples, warmup, suites: SUITES },
     backends: {},
+    errors: [],
   };
-  if (backends.includes("sablejs-sandbox")) {
-    result.backends["sablejs-sandbox"] = await collect(
-      "sablejs-sandbox",
-      () => prepareCompiler("sandbox"),
-      runCompiler
-    );
-  }
-  if (backends.includes("sablejs-trusted")) {
-    result.backends["sablejs-trusted"] = await collect(
-      "sablejs-trusted",
-      () => prepareCompiler("trusted"),
-      runCompiler
-    );
-  }
-  if (backends.includes("quickjs")) {
-    const QuickJS = await getQuickJS();
-    result.backends.quickjs = await collect("quickjs", () => QuickJS, runQuickJS);
-  }
-  const sandbox = result.backends["sablejs-sandbox"];
-  const trusted = result.backends["sablejs-trusted"];
-  if (sandbox && trusted) {
-    // Sandbox tax = 1 - sandbox / trusted; the fraction of throughput the
-    // boundary costs on each workload. Lower is better.
-    result.sandboxTax = {};
-    console.error("[release] sandbox tax (1 - sandbox/trusted):");
-    for (const metric of [...SUITES, "total"]) {
-      const tax = 1 - sandbox.metrics[metric].median / trusted.metrics[metric].median;
-      result.sandboxTax[metric] = Number(tax.toFixed(4));
-      console.error(`  ${metric}: ${(tax * 100).toFixed(1)}%`);
+  try {
+    if (backends.includes("sablejs-sandbox")) {
+      result.backends["sablejs-sandbox"] = await collect(
+        "sablejs-sandbox",
+        () => prepareCompiler("sandbox"),
+        runCompiler
+      );
     }
+    if (backends.includes("sablejs-trusted")) {
+      result.backends["sablejs-trusted"] = await collect(
+        "sablejs-trusted",
+        () => prepareCompiler("trusted"),
+        runCompiler
+      );
+    }
+    if (backends.includes("quickjs")) {
+      result.backends.quickjs = await collect("quickjs", prepareQuickJS, runQuickJS);
+    }
+    const sandbox = result.backends["sablejs-sandbox"];
+    const trusted = result.backends["sablejs-trusted"];
+    if (sandbox && trusted) {
+      // Sandbox tax = 1 - sandbox / trusted; the fraction of throughput the
+      // boundary costs on each workload. Lower is better.
+      result.sandboxTax = {};
+      console.error("[release] sandbox tax (1 - sandbox/trusted):");
+      for (const metric of [...SUITES, "total"]) {
+        const tax = 1 - sandbox.metrics[metric].median / trusted.metrics[metric].median;
+        result.sandboxTax[metric] = Number(tax.toFixed(4));
+        console.error(`  ${metric}: ${(tax * 100).toFixed(1)}%`);
+      }
+    }
+  } catch (error) {
+    result.errors.push({ name: error && error.name, message: String(error && error.message || error) });
+    process.exitCode = 1;
   }
-
+  if (output) result.output = writeArtifact(output, result);
   console.log(JSON.stringify(result, null, 2));
 }
 

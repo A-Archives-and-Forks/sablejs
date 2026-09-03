@@ -28,6 +28,8 @@ const { argument, createQuickJS, mulberry32, pick } = require("./fuzz.js");
 
 const runtimeModule = path.resolve(__dirname, "../../src/runtime");
 const failureDirectory = path.resolve(__dirname, "../../.cache/differential-failures-boundary");
+const LEVELS = ["O0", "O1", "O2", "Os"];
+const GENERATOR_VERSION = 2;
 
 // Host functions, single-sourced: the same expression text becomes the
 // native/QuickJS prelude `var fn = ...` and the injected host value.
@@ -260,11 +262,24 @@ class BoundaryGenerator {
     body.forEach((line) => lines.push(`  ${line}`));
     lines.push("  return [argResult, v0, v1, v2, v3];");
     lines.push("}");
-    lines.push("JSON.stringify(main());");
+    lines.push("function snapshotInput(value) {");
+    lines.push("  var keys = Object.keys(value), descriptors = [], i, d, v;");
+    lines.push("  for (i = 0; i < keys.length; i++) {");
+    lines.push("    d = Object.getOwnPropertyDescriptor(value, keys[i]);");
+    lines.push("    v = d && Object.prototype.hasOwnProperty.call(d, 'value') ? d.value : void 0;");
+    lines.push("    descriptors.push([keys[i], !!d.enumerable, !!d.configurable, !!d.writable, typeof v, (v === null || /^(undefined|boolean|number|string)$/.test(typeof v)) ? v : null]);");
+    lines.push("  }");
+    lines.push("  return { keys: keys, descriptors: descriptors, length: typeof value.length === 'number' ? value.length : null, size: typeof value.size === 'number' ? value.size : null };");
+    lines.push("}");
+    lines.push("JSON.stringify({ value: main(), input: snapshotInput(input) });");
 
     const inputPrelude = pick(random, INPUT_PRELUDES);
     const fnPrelude = usesFn ? pick(random, HOST_FUNCTIONS).expression : null;
-    const prelude = fnPrelude ? `${inputPrelude}\nvar fn = ${fnPrelude};` : inputPrelude;
+    const tracePrelude = "var __sableBoundaryTrace = [];";
+    const tracedFunction = fnPrelude
+      ? `var __sableBoundaryRawFn = ${fnPrelude};\nvar fn = function () { var row = [], i, v; for (i = 0; i < arguments.length; i++) { v = arguments[i]; row.push([typeof v, (v === null || /^(undefined|boolean|number|string)$/.test(typeof v)) ? v : null]); } __sableBoundaryTrace.push(row); return __sableBoundaryRawFn.apply(this, arguments); };`
+      : "";
+    const prelude = `${tracePrelude}\n${inputPrelude}${tracedFunction ? `\n${tracedFunction}` : ""}`;
     return { source: lines.join("\n"), prelude, usesFn };
   }
 }
@@ -287,20 +302,29 @@ function runNative(source, prelude) {
   // directive ordering handled by joinProgram. The completion value of
   // the final JSON.stringify(main()) statement is the case result.
   try {
-    return { ok: true, value: globalThis.eval(joinProgram(source, prelude)) };
+    const value = globalThis.eval(joinProgram(source, prelude));
+    const trace = globalThis.__sableBoundaryTrace || [];
+    return { ok: true, value, trace };
   } catch (error) {
-    return { ok: false, error: error && error.name };
+    return {
+      ok: false,
+      error: error && error.name,
+      trace: globalThis.__sableBoundaryTrace || [],
+    };
+  } finally {
+    delete globalThis.__sableBoundaryTrace;
+    delete globalThis.__sableBoundaryRawFn;
   }
 }
 
 // Compiles the source and returns { ok, value } plus generated-code syntax
 // status. `globals` carries the injected input/fn built from the prelude.
-function runSableJS(source, security, globals) {
+function runSableJS(source, security, globals, optimization = "O2", callTrace = []) {
   let compiled;
   try {
-    compiled = compile(source, { optimization: "O2", security, runtimeModule });
+    compiled = compile(source, { optimization, security, runtimeModule });
   } catch (error) {
-    return { ok: false, error: error && error.name, generatedSyntax: true };
+    return { ok: false, error: error && error.name, trace: callTrace.slice(), generatedSyntax: true };
   }
   let syntaxError = null;
   try {
@@ -313,12 +337,24 @@ function runSableJS(source, security, globals) {
     new Function("require", "module", "exports", compiled.code)(require, generatedModule, generatedModule.exports);
     const instance = generatedModule.exports.createInstance({ globals });
     try {
-      return { ok: true, value: instance.run(), generatedSyntax: !syntaxError, syntaxError };
+      return {
+        ok: true,
+        value: instance.run(),
+        trace: callTrace.slice(),
+        generatedSyntax: !syntaxError,
+        syntaxError,
+      };
     } finally {
       instance.dispose();
     }
   } catch (error) {
-    return { ok: false, error: error && error.name, generatedSyntax: !syntaxError, syntaxError };
+    return {
+      ok: false,
+      error: error && error.name,
+      trace: callTrace.slice(),
+      generatedSyntax: !syntaxError,
+      syntaxError,
+    };
   }
 }
 
@@ -326,10 +362,59 @@ function same(left, right) {
   return left.ok === right.ok && (left.ok ? left.value === right.value : left.error === right.error);
 }
 
+function sameTrace(left, right) {
+  return JSON.stringify(left.trace || []) === JSON.stringify(right.trace || []);
+}
+
+function saveFailureEvidence(kind, caseSeed, source, prelude, details) {
+  const directory = path.join(failureDirectory, `seed-${caseSeed}-${kind}`);
+  fs.mkdirSync(directory, { recursive: true });
+  fs.writeFileSync(path.join(directory, "source.js"), source);
+  fs.writeFileSync(path.join(directory, "prelude.js"), prelude);
+  fs.writeFileSync(path.join(directory, "metadata.json"), `${JSON.stringify({
+    generator: "boundary",
+    generatorVersion: GENERATOR_VERSION,
+    seed: caseSeed,
+    kind,
+    levels: LEVELS,
+    securityModes: ["trusted", "sandbox"],
+    ...details,
+  }, null, 2)}\n`);
+  for (const security of ["trusted", "sandbox"]) {
+    for (const optimization of LEVELS) {
+      const dumpDir = path.join(directory, `${optimization}-${security}`);
+      try {
+        compile(source, { optimization, security, runtimeModule, dumpDir });
+      } catch (error) {
+        fs.mkdirSync(dumpDir, { recursive: true });
+        fs.writeFileSync(path.join(dumpDir, "error.txt"), String(error && error.stack || error));
+      }
+    }
+  }
+}
+
 // Builds the exact host values the prelude describes, for globals injection.
 function buildGlobals(prelude, usesFn) {
   const factory = new Function(`${prelude}\nreturn { input: input, fn: typeof fn === "function" ? fn : undefined };`);
   return factory();
+}
+
+function buildRunGlobals(prelude, usesFn, caseSeed) {
+  const hostValues = buildGlobals(prelude, usesFn);
+  const globals = { input: hostValues.input };
+  const callTrace = [];
+  if (usesFn) {
+    const raw = hostValues.fn;
+    const traced = function() {
+      callTrace.push(Array.prototype.map.call(arguments, (value) => [
+        typeof value,
+        value === null || /^(undefined|boolean|number|string)$/.test(typeof value) ? value : null,
+      ]));
+      return raw.apply(this, arguments);
+    };
+    globals.fn = caseSeed % 2 === 0 ? capability(traced, { name: "fn" }) : traced;
+  }
+  return { globals, callTrace };
 }
 
 async function main() {
@@ -348,18 +433,32 @@ async function main() {
   for (let index = 0; index < cases; index += 1) {
     const caseSeed = seed + index;
     const { source, prelude, usesFn } = new BoundaryGenerator(caseSeed).program();
-    const hostValues = buildGlobals(prelude, usesFn);
-    const globals = { input: hostValues.input };
-    if (usesFn) {
-      // Unified DX: the same globals object literal serves both modes.
-      // Sandbox auto-wraps raw host functions; trusted unwraps capability
-      // tokens. Alternate raw and token forms so both paths stay fuzzed.
-      globals.fn = caseSeed % 2 === 0 ? capability(hostValues.fn, { name: "fn" }) : hostValues.fn;
-    }
     const native = runNative(source, prelude);
-    const trusted = runSableJS(source, "trusted", globals);
-    const sandbox = runSableJS(source, "sandbox", globals);
+    // Trusted execution may mutate injected data. Rebuild globals for every
+    // arm so later levels observe the same initial program state.
+    const trustedByLevel = Object.fromEntries(LEVELS.map((optimization) => {
+      const run = buildRunGlobals(prelude, usesFn, caseSeed);
+      return [optimization, runSableJS(
+        source, "trusted", run.globals, optimization, run.callTrace
+      )];
+    }));
+    const sandboxByLevel = Object.fromEntries(LEVELS.map((optimization) => {
+      const run = buildRunGlobals(prelude, usesFn, caseSeed);
+      return [optimization, runSableJS(
+        source, "sandbox", run.globals, optimization, run.callTrace
+      )];
+    }));
     const quick = await quickjs.run(joinProgram(source, prelude));
+    const traceReference = trustedByLevel.O0;
+    const trustedTracesAgree = LEVELS.every((level) =>
+      sameTrace(traceReference, trustedByLevel[level])
+    );
+    const sandboxTraceReference = sandboxByLevel.O0;
+    const sandboxTracesAgree = LEVELS.every((level) =>
+      sameTrace(sandboxTraceReference, sandboxByLevel[level])
+    );
+    const tracesAgree = trustedTracesAgree && sandboxTracesAgree &&
+      sameTrace(traceReference, sandboxTraceReference);
 
     // A guest Proxy crossing into a capability call is out of contract by
     // construction: the sandbox resolves it to the plain data it presents
@@ -378,27 +477,56 @@ async function main() {
       // in-guest, so a healthy exotic program still finishes) or fail with
       // the same error as native — a raw sandbox-only failure or a
       // sandbox-only success is an anomaly.
-      const rawAgrees = same(native, trusted);
-      const sandboxAnomaly = !sandbox.ok && !same(native, sandbox);
-      if (!rawAgrees || sandboxAnomaly) {
-        exoticFailures.push({ seed: caseSeed, source, prelude, native, trusted, sandbox, quick });
+      const rawAgrees = LEVELS.every((level) => same(native, trustedByLevel[level]));
+      const sandboxAnomaly = LEVELS.some((level) =>
+        !sandboxByLevel[level].ok && !same(native, sandboxByLevel[level])
+      );
+      // A sandbox boundary rejection may happen before the host callable is
+      // entered, so its trace may legitimately differ from trusted. Each
+      // security profile must still be invariant across optimization levels.
+      if (!rawAgrees || sandboxAnomaly || !trustedTracesAgree || !sandboxTracesAgree) {
+        exoticFailures.push({
+          seed: caseSeed, source, prelude, native, trustedByLevel, sandboxByLevel, quick,
+        });
         fs.writeFileSync(path.join(failureDirectory, `seed-${caseSeed}.exotic.js`), `${prelude}\n${source}`);
+        saveFailureEvidence("exotic", caseSeed, source, prelude, {
+          native, trustedByLevel, sandboxByLevel, quickjs: quick,
+        });
         if (!quiet) {
-          console.log(`EXOTIC seed=${caseSeed}: native=${JSON.stringify(native)} trusted=${JSON.stringify(trusted)} sandbox=${JSON.stringify(sandbox)} quickjs=${JSON.stringify(quick)}`);
+          console.log(`EXOTIC seed=${caseSeed}: native=${JSON.stringify(native)} trusted=${JSON.stringify(trustedByLevel)} sandbox=${JSON.stringify(sandboxByLevel)} quickjs=${JSON.stringify(quick)}`);
         }
       }
-    } else if (!same(native, trusted) || !same(native, sandbox)) {
-      mismatches.push({ seed: caseSeed, source, prelude, native, trusted, sandbox, quick });
+    } else if (!tracesAgree || LEVELS.some((level) =>
+      !same(native, trustedByLevel[level]) || !same(native, sandboxByLevel[level])
+    )) {
+      mismatches.push({
+        seed: caseSeed, source, prelude, native, trustedByLevel, sandboxByLevel, quick,
+      });
       fs.writeFileSync(path.join(failureDirectory, `seed-${caseSeed}.js`), `${prelude}\n${source}`);
+      saveFailureEvidence("mismatch", caseSeed, source, prelude, {
+        native, trustedByLevel, sandboxByLevel, quickjs: quick,
+      });
       if (!quiet) {
-        console.log(`MISMATCH seed=${caseSeed}: native=${JSON.stringify(native)} trusted=${JSON.stringify(trusted)} sandbox=${JSON.stringify(sandbox)} quickjs=${JSON.stringify(quick)}`);
+        console.log(`MISMATCH seed=${caseSeed}: native=${JSON.stringify(native)} trusted=${JSON.stringify(trustedByLevel)} sandbox=${JSON.stringify(sandboxByLevel)} quickjs=${JSON.stringify(quick)}`);
       }
     }
-    if (validateSyntax && trusted.syntaxError) {
-      syntaxFailures.push({ seed: caseSeed, message: String(trusted.syntaxError.message) });
+    const syntaxFailure = LEVELS.map((level) => ({
+      level,
+      error: trustedByLevel[level].syntaxError || sandboxByLevel[level].syntaxError,
+    })).find((entry) => entry.error);
+    if (validateSyntax && syntaxFailure) {
+      syntaxFailures.push({
+        seed: caseSeed,
+        level: syntaxFailure.level,
+        message: String(syntaxFailure.error.message),
+      });
       fs.writeFileSync(path.join(failureDirectory, `seed-${caseSeed}.syntax.js`), `${prelude}\n${source}`);
+      saveFailureEvidence("syntax", caseSeed, source, prelude, {
+        level: syntaxFailure.level,
+        message: String(syntaxFailure.error.message),
+      });
       if (!quiet) {
-        console.log(`SYNTAX seed=${caseSeed}: ${trusted.syntaxError.message}`);
+        console.log(`SYNTAX seed=${caseSeed}/${syntaxFailure.level}: ${syntaxFailure.error.message}`);
       }
     }
     if (!quiet && (index + 1) % 500 === 0) {
@@ -414,15 +542,26 @@ async function main() {
     exoticFailures: exoticFailures.length,
     exoticTotal: exotic,
     syntaxFailures: syntaxFailures.length,
+    levels: LEVELS,
+    securityModes: ["trusted", "sandbox"],
     elapsedMs: Math.round(elapsedMs),
-    failures: mismatches.slice(0, 10).map((m) => ({ seed: m.seed, native: m.native, trusted: m.trusted, sandbox: m.sandbox, quickjs: m.quick })),
-    exotic: exoticFailures.slice(0, 10).map((m) => ({ seed: m.seed, native: m.native, trusted: m.trusted, sandbox: m.sandbox, quickjs: m.quick })),
+    failures: mismatches.slice(0, 10).map((m) => ({ seed: m.seed, native: m.native, trusted: m.trustedByLevel, sandbox: m.sandboxByLevel, quickjs: m.quick })),
+    exotic: exoticFailures.slice(0, 10).map((m) => ({ seed: m.seed, native: m.native, trusted: m.trustedByLevel, sandbox: m.sandboxByLevel, quickjs: m.quick })),
     syntax: syntaxFailures.slice(0, 10),
   }, null, 2));
   if (mismatches.length || exoticFailures.length || (validateSyntax && syntaxFailures.length)) process.exitCode = 1;
 }
 
-module.exports = { BoundaryGenerator, buildGlobals, runNative, runSableJS, same };
+module.exports = {
+  GENERATOR_VERSION,
+  BoundaryGenerator,
+  buildGlobals,
+  buildRunGlobals,
+  runNative,
+  runSableJS,
+  same,
+  sameTrace,
+};
 
 if (require.main === module) {
   main().catch((error) => {

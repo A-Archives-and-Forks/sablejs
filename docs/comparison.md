@@ -48,12 +48,15 @@ Worker alone does not remove its access to APIs available inside that Worker.
 ## Performance comparisons
 
 Performance depends on workload shape, startup, compilation strategy, host
-engine, and boundary traffic. On the documented Linux x64 reference harness,
-sablejs O2 sandbox reaches 1.86x the QuickJS-WASM V8 Benchmark Suite 7 score,
-completes the 23-test SunSpider subset 1.16x faster, and completes the 14-test
-Kraken subset 1.70x faster. These are harness-specific results, not universal
-application claims. See [Performance](performance.md) for raw data, sampling,
-adaptations, exclusions, artifact sizes, and reproduction commands.
+engine, and boundary traffic. Historical 2026-08-24 measurements reported O2
+sandbox/QuickJS-WASM ratios of 1.86x on V8 Benchmark Suite 7, 1.16x on the
+SunSpider subset, and 1.70x on the Kraken subset. They are not a production
+recommendation: O2 has open correctness findings, and the recorded harness
+timed source evaluation for QuickJS where sablejs was precompiled. The harness
+has been corrected but not rerun. Use the figures only as a record of that
+corpus and lifecycle. See [Performance](performance.md) for the
+raw data and [CFG/SSA hardening](cfg-ssa-hardening.md) for the symmetric
+held-out rerun required before making a current comparison.
 
 ## Security and resource boundaries
 

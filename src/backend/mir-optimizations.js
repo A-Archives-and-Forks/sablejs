@@ -1,6 +1,13 @@
 "use strict";
 
 const { lowerToMIR, verifyMIR } = require("../ir/mir");
+const { solveBackward } = require("./dataflow");
+const { buildNormalCFG, buildSemanticCFG, verifyCFG } = require("../ir/cfg");
+const {
+  hasDynamicChain,
+  hasProtectedControlFlow,
+  hasWithEvalChain,
+} = require("./scope-effects");
 
 function own(object, key) {
   return Object.prototype.hasOwnProperty.call(object, key);
@@ -18,23 +25,6 @@ function instructionMap(scope) {
   return new Map(scope.instructions.map((instruction) => [instruction.offset, instruction]));
 }
 
-const DYNAMIC_LOCAL_OPERATIONS = new Set([
-  "WITH", "ENDWITH", "EVAL", "CATCH", "ENDCATCH",
-]);
-
-// Mirrors codegen's hasDynamicChain: with/eval/catch environments shadow name
-// resolution at runtime, so these scopes get no direct frame layout (no `$l`)
-// and their loads must stay on the stack-machine path.
-function hasDynamicChain(scope, scopesById, memo) {
-  if (memo.has(scope.id)) return memo.get(scope.id);
-  const parent = scope.parentId != null ? scopesById.get(scope.parentId) : null;
-  const dynamic = scope.instructions.some((instruction) =>
-    DYNAMIC_LOCAL_OPERATIONS.has(instruction.op)
-  ) || (parent != null && hasDynamicChain(parent, scopesById, memo));
-  memo.set(scope.id, dynamic);
-  return dynamic;
-}
-
 // Locals in a lightweight function are backed by a private array and cannot be
 // observed by with/eval or captured closures. Parameters are deliberately
 // excluded in sloppy mode because the mapped `arguments` object can alias
@@ -48,12 +38,12 @@ function canPropagateLocal(scope, index) {
 
 function analysisMIR(hirProgram, stats, existingMIR) {
   if (existingMIR) {
-    verifyMIR(existingMIR);
+    verifyMIR(existingMIR, hirProgram);
     return existingMIR;
   }
   const mir = lowerToMIR(hirProgram);
   if (stats.mir) stats.mir.builds += 1;
-  verifyMIR(mir);
+  verifyMIR(mir, hirProgram);
   return mir;
 }
 
@@ -153,8 +143,9 @@ function meetAvailable(predecessors, outgoing) {
   let result = null;
   for (const predecessor of predecessors) {
     const available = outgoing.get(predecessor);
-    // Do not infer availability from a partially processed predecessor set.
-    // In particular, a loop header must wait for its backedge state.
+    // Whole-state null is uninitialized, so cyclic regions wait rather than
+    // expose a provisional producer. This intentionally sacrifices some loop
+    // reuse until a bounded per-slot lattice/worklist replaces it.
     if (available === null) return null;
     if (result === null) {
       result = new Map(available);
@@ -170,7 +161,9 @@ function meetAvailable(predecessors, outgoing) {
 function transferAvailable(block, incoming, hirInstructions, annotate, eligibleLocal) {
   if (incoming === null) return null;
   const available = new Map(incoming);
-  block.operations.forEach((operation) => {
+  const operations = block.operations || block.instructions;
+  operations.forEach((operation) => {
+    if (operation.elided || operation.unreachable) return;
     if (["SETLOCAL", "SETLOCAL2", "DELLOCAL", "DELLOCAL2"].includes(operation.op)) {
       available.delete(operation.args[0]);
       return;
@@ -196,29 +189,59 @@ function runGlobalValueNumbering(hirProgram, stats, existingMIR) {
   const mir = analysisMIR(hirProgram, stats, existingMIR);
   let loadsEliminated = 0;
   let crossBlockLoadsEliminated = 0;
+  let scopesSkipped = 0;
+  let semanticScopes = 0;
+  const scopesById = new Map(hirProgram.scopes.map((scope) => [scope.id, scope]));
+  const withEvalMemo = new Map();
 
   mir.scopes.forEach((mirScope) => {
     const hirScope = hirProgram.scopes.find((scope) => scope.id === mirScope.id);
     if (!hirScope.lightweight || hirScope.script) return;
+    // With/eval can mutate a function binding through name lookup without a
+    // SETLOCAL operation. Real catch bodies likewise use a dynamic binding
+    // environment. A catch-free TryFinally's synthetic empty catch is safe:
+    // semantic CFG edges model its actual try/finally execution directly.
+    const hasRealCatch = (hirScope.controlRegions || []).some((region) =>
+      region.kind === "TryCatch" || (region.kind === "TryFinally" && region.hasCatch)
+    );
+    if (hasWithEvalChain(hirScope, scopesById, withEvalMemo) || hasRealCatch) {
+      scopesSkipped += 1;
+      return;
+    }
+    const needsSemanticCFG = (hirScope.controlRegions || []).some((region) =>
+      region.kind === "TryCatch" || region.kind === "TryFinally"
+    ) || (hirScope.syntheticRanges || []).some((range) => range.kind === "AbruptFinally");
+    // Without an in-scope handler/finalizer, a throwing edge exits the scope
+    // and cannot rejoin a later local load. Normal CFG is therefore the full
+    // proof domain and avoids needlessly splitting large ordinary graphs at
+    // every mayThrow operation.
+    const valueCFG = needsSemanticCFG ? buildSemanticCFG(hirScope) : buildNormalCFG(hirScope);
+    verifyCFG(valueCFG, hirScope);
+    if (needsSemanticCFG) semanticScopes += 1;
+    const reachable = valueCFG.reachable;
     const instructions = instructionMap(hirScope);
     const incoming = new Map();
     const outgoing = new Map();
-    mirScope.blocks.forEach((block) => {
-      incoming.set(block.start, block.start === mirScope.entry ? new Map() : null);
-      outgoing.set(block.start, block.start === mirScope.entry ? new Map() : null);
+    valueCFG.blocks.forEach((block) => {
+      incoming.set(block.start, block.start === valueCFG.entry ? new Map() : null);
+      outgoing.set(block.start, block.start === valueCFG.entry ? new Map() : null);
     });
 
     let changed = true;
     let iterations = 0;
     while (changed) {
       changed = false;
-      if (iterations++ > Math.max(100, mirScope.blocks.length * mirScope.blocks.length * 2)) {
+      if (iterations++ > Math.max(100, valueCFG.blocks.length * valueCFG.blocks.length * 2)) {
         throw new Error(`GVN did not converge in scope ${mirScope.id}`);
       }
-      mirScope.blocks.forEach((block) => {
-        const nextIncoming = block.start === mirScope.entry
+      valueCFG.blocks.forEach((block) => {
+        if (!reachable.has(block.start)) return;
+        const nextIncoming = block.start === valueCFG.entry
           ? new Map()
-          : meetAvailable(block.predecessors, outgoing);
+          : meetAvailable(
+            block.predecessors.filter((predecessor) => reachable.has(predecessor)),
+            outgoing
+          );
         const nextOutgoing = transferAvailable(
           block,
           nextIncoming,
@@ -238,10 +261,11 @@ function runGlobalValueNumbering(hirProgram, stats, existingMIR) {
     }
 
     const blockForOffset = new Map();
-    mirScope.blocks.forEach((block) => block.operations.forEach((operation) => {
+    valueCFG.blocks.forEach((block) => block.instructions.forEach((operation) => {
       blockForOffset.set(operation.offset, block.start);
     }));
-    mirScope.blocks.forEach((block) => {
+    valueCFG.blocks.forEach((block) => {
+      if (!reachable.has(block.start)) return;
       const before = Array.from(instructions.values()).filter((instruction) =>
         instruction.optimized && instruction.optimized.kind === "reuse"
       ).length;
@@ -264,7 +288,12 @@ function runGlobalValueNumbering(hirProgram, stats, existingMIR) {
     });
   });
 
-  stats.globalValueNumbering = { loadsEliminated, crossBlockLoadsEliminated };
+  stats.globalValueNumbering = {
+    loadsEliminated,
+    crossBlockLoadsEliminated,
+    scopesSkipped,
+    semanticScopes,
+  };
   return mir;
 }
 
@@ -319,6 +348,9 @@ function runLoopInvariantCodeMotion(hirProgram, stats, existingMIR, options = {}
   const mir = analysisMIR(hirProgram, stats, existingMIR);
   let loadsHoisted = 0;
   let usesReplaced = 0;
+  let scopesSkipped = 0;
+  const scopesById = new Map(hirProgram.scopes.map((scope) => [scope.id, scope]));
+  const dynamicChainMemo = new Map();
   // Mirrors the codegen plan (which has no security term since Phase 3).
   const promotionEligible = true;
 
@@ -330,9 +362,11 @@ function runLoopInvariantCodeMotion(hirProgram, stats, existingMIR, options = {}
     // layout, and the runtime's stack-based getLocal cannot serve as a
     // hoisted value expression — so their loads must not be hoisted.
     if (!hirScope.lightweight || hirScope.script || !mirScope.loops.length) return;
-    const scopesById = new Map(hirProgram.scopes.map((scope) => [scope.id, scope]));
-    const dynamicChainMemo = new Map();
-    if (hasDynamicChain(hirScope, scopesById, dynamicChainMemo)) return;
+    if (hasDynamicChain(hirScope, scopesById, dynamicChainMemo) ||
+        hasProtectedControlFlow(hirScope)) {
+      scopesSkipped += 1;
+      return;
+    }
     const instructions = instructionMap(hirScope);
     const loopPlans = mirScope.loops.map((loop) => ({
       ...loop,
@@ -387,7 +421,7 @@ function runLoopInvariantCodeMotion(hirProgram, stats, existingMIR, options = {}
     );
   });
 
-  stats.loopInvariantCodeMotion = { loadsHoisted, usesReplaced };
+  stats.loopInvariantCodeMotion = { loadsHoisted, usesReplaced, scopesSkipped };
   return mir;
 }
 
@@ -427,9 +461,16 @@ function runLoopInvariantCodeMotion(hirProgram, stats, existingMIR, options = {}
 // DCE's POP chains; the stored value keeps its original consumer. Elision
 // happens after every value-moving pass (copy-prop, LICM, GVN, local-CSE),
 // so the provenance mark written later cannot go stale.
-function runDeadStoreElimination(hirProgram, stats, existingMIR) {
+function runDeadStoreElimination(hirProgram, stats, existingMIR, options = {}) {
   const mir = analysisMIR(hirProgram, stats, existingMIR);
   let storesEliminated = 0;
+  let slotsAnalyzed = 0;
+  let bailedOutSlots = 0;
+  let blockVisits = 0;
+  const bailouts = [];
+  const maxVisits = options.deadStoreEliminationBudget === undefined
+    ? Infinity
+    : options.deadStoreEliminationBudget;
   // Shared across scopes: hasDynamicChain is a pure function of the scope
   // graph (walking own ops, then the parent chain), so ancestor results are
   // reused instead of recomputed for every nested scope.
@@ -451,7 +492,8 @@ function runDeadStoreElimination(hirProgram, stats, existingMIR) {
     // stores is unobservable. (test262 S12.14_A15: a `result += 2` store
     // inside `try {} finally { break }` was mis-elided because the THROW
     // block has no successors — the finally's `break` path reads the slot.)
-    if (hasDynamicChain(hirScope, scopesById, dynamicChainMemo)) return;
+    if (hasDynamicChain(hirScope, scopesById, dynamicChainMemo) ||
+        hasProtectedControlFlow(hirScope)) return;
     const instructions = instructionMap(hirScope);
     const isRead = (operation) => {
       if (operation.op !== "GETLOCAL" && operation.op !== "GETLOCAL2") return false;
@@ -459,12 +501,10 @@ function runDeadStoreElimination(hirProgram, stats, existingMIR) {
       // Unmarked (or missing) reads consume the slot. `literal`/`duplicate`/
       // `licm` reads were rewritten by copy-prop/local-CSE/LICM and no longer
       // touch it (folded literal, stack-top copy of an adjacent load, or
-      // hoisted-load alias whose own real read DSE sees). `reuse` reads are
-      // NOT safe to elide stores for: the reuse source can lose its temporary
-      // to a later peephole elision, and codegen then falls back to a real
-      // slot read. That costs nothing — no store can sit between a reuse and
-      // its dominating source (any store kills GVN availability), so the
-      // source load's own read already keeps exactly those stores live.
+      // hoisted-load alias whose own real read DSE sees). `reuse` remains a
+      // conservative read here as defense in depth: codegen now requires its
+      // verified live producer and never falls back to a fresh slot read, but
+      // retaining the use cannot authorize an unsafe store deletion.
       if (!instruction || instruction.elided) return false;
       if (instruction.optimized && instruction.optimized.kind !== "reuse") return false;
       return true;
@@ -485,45 +525,39 @@ function runDeadStoreElimination(hirProgram, stats, existingMIR) {
       if (!canPropagateLocal(hirScope, slot)) return;
       // Successors are block START OFFSETS (mirScope.loops headers/backedges
       // are too), so the liveness maps are keyed by block.start.
-      const liveIn = new Map();
-      const liveOut = new Map();
-      mirScope.blocks.forEach((block) => {
-        liveIn.set(block.start, false);
-        liveOut.set(block.start, false);
-      });
-      let changed = true;
-      let iterations = 0;
-      while (changed && iterations < 256) {
-        changed = false;
-        iterations += 1;
-        mirScope.blocks.forEach((block) => {
-          // Backward transfer: live at a position = live after the block
-          // (needed by some successor) plus any read after the position;
-          // a store satisfies earlier needs and kills them. Reads
-          // rewritten by earlier passes (`optimized` marks) neither read
-          // the slot nor kill it — no-ops, liveness flows through them
-          // unchanged. DELLOCAL is also a no-op: deleteLocal pushes false
-          // for lightweight frames without touching the slot, so a later
-          // read still observes the stored value. The access filter gates
-          // on the op FIRST: other ops' first argument (immediates like
-          // NUMBER values, jump targets) can numerically collide with a
-          // slot index and must never touch liveness.
-          let live = liveOut.get(block.start);
-          for (let i = block.operations.length - 1; i >= 0; i -= 1) {
-            const operation = block.operations[i];
-            if (!isSlotAccess(operation) || operation.args[0] !== slot) continue;
-            if (operation.op === "GETLOCAL" || operation.op === "GETLOCAL2") {
-              if (isRead(operation)) live = true;
-            } else if (isStore(operation)) {
-              live = false;
-            }
+      slotsAnalyzed += 1;
+      const transfer = (block, liveOut) => {
+        // Backward transfer: live at a position = live after the block
+        // (needed by some successor) plus any read after the position; a
+        // store satisfies earlier needs and kills them. Optimized reads and
+        // DELLOCAL follow the classification above. The access filter gates
+        // on the op FIRST so numeric immediates cannot collide with a slot.
+        let live = liveOut;
+        for (let i = block.operations.length - 1; i >= 0; i -= 1) {
+          const operation = block.operations[i];
+          if (!isSlotAccess(operation) || operation.args[0] !== slot) continue;
+          if (operation.op === "GETLOCAL" || operation.op === "GETLOCAL2") {
+            if (isRead(operation)) live = true;
+          } else if (isStore(operation)) {
+            live = false;
           }
-          const out = block.successors.reduce((acc, start) => acc || liveIn.get(start), false);
-          if (out !== liveOut.get(block.start) || live !== liveIn.get(block.start)) changed = true;
-          liveOut.set(block.start, out);
-          liveIn.set(block.start, live);
-        });
+        }
+        return live;
+      };
+      const solved = solveBackward({
+        blocks: mirScope.blocks,
+        bottom: () => false,
+        meet: (successors) => successors.some(Boolean),
+        transfer,
+        maxVisits,
+      });
+      blockVisits += solved.visits;
+      if (!solved.converged) {
+        bailedOutSlots += 1;
+        bailouts.push({ scopeId: mirScope.id, slot, reason: "budget-exhausted" });
+        return;
       }
+      const liveOut = solved.outState;
       // Fixpoint is stable: elide every store at a dead position. Same
       // transfer as above — optimized reads and DELLOCAL are no-ops, so a
       // store that a folded read or a no-op delete sits between and a real
@@ -550,7 +584,20 @@ function runDeadStoreElimination(hirProgram, stats, existingMIR) {
     });
   });
 
-  stats.deadStoreElimination = { storesEliminated };
+  stats.deadStoreElimination = {
+    storesEliminated,
+    slotsAnalyzed,
+    bailedOutSlots,
+    blockVisits,
+    scopesSkipped: mir.scopes.filter((mirScope) => {
+      const hirScope = hirProgram.scopes.find((scope) => scope.id === mirScope.id);
+      return hirScope && (
+        hasDynamicChain(hirScope, scopesById, dynamicChainMemo) ||
+        hasProtectedControlFlow(hirScope)
+      );
+    }).length,
+    bailouts,
+  };
   return mir;
 }
 

@@ -1,8 +1,10 @@
 "use strict";
 
 // Real-world workload benchmark. Each workload is a self-contained ES5.1
-// source defining `workload(input)`; the driver embeds a deterministic input
-// literal, runs the workload repeatedly, and reports ops/sec. Backends:
+// source defining `workload(input)`. Dynamic mode (the default) passes a
+// varying JSON payload at runtime; static mode explicitly embeds one input in
+// the compiled source so partial-evaluation results remain separately named.
+// The driver runs the workload repeatedly and reports ops/sec. Backends:
 // sablejs-sandbox, sablejs-trusted, quickjs, and native (plain new Function —
 // the performance ceiling, NOT a security alternative). Results are compared
 // across backends so a divergent backend fails the run.
@@ -111,19 +113,43 @@ const INPUTS = {
   },
 };
 
-function assembleProgram(source, input) {
-  return `var input = ${JSON.stringify(input)};\n${source}\nworkload(input);`;
+function assembleProgram(source, input, inputMode) {
+  if (inputMode === "static") {
+    return `var input = ${JSON.stringify(input)};\n${source}\nworkload(input);`;
+  }
+  return `${source}\nworkload(JSON.parse(inputJSON));`;
 }
 
 function normalize(value) {
   return JSON.stringify(value);
 }
 
-function runSableJS(security, programSource, inlineHostIntrinsics = true) {
-  const compiled = compile(programSource, { optimization: "O2", security, runtimeModule, inlineHostIntrinsics });
+function varyInput(name, input, iteration) {
+  const value = JSON.parse(JSON.stringify(input));
+  const delta = iteration % 17;
+  switch (name) {
+    case "json-transform": value.rows[0].amount += delta; break;
+    case "pricing-rules": value.items[0].base += delta; break;
+    case "form-validator": value.form.age += delta; value.form.username += delta; break;
+    case "spreadsheet-formulas": value.values[0] += delta; break;
+    case "workflow-rules": value.record.amount += delta; value.record.note += delta; break;
+    case "template-logic": value.data.total += delta; value.data.name += delta; break;
+    case "data-aggregation": value.from += delta; break;
+    case "mini-parser": value.expression += ` + ${delta}`; break;
+    default: throw new Error(`No dynamic input variation for ${name}`);
+  }
+  return value;
+}
+
+function inputJSON(name, iteration) {
+  return JSON.stringify(varyInput(name, INPUTS[name], iteration));
+}
+
+function runSableJS(security, programSource, globals = {}, inlineHostIntrinsics = true, optimization = "O1") {
+  const compiled = compile(programSource, { optimization, security, runtimeModule, inlineHostIntrinsics });
   const generatedModule = { exports: {} };
   new Function("require", "module", "exports", compiled.code)(require, generatedModule, generatedModule.exports);
-  const instance = generatedModule.exports.createInstance({});
+  const instance = generatedModule.exports.createInstance({ globals });
   const value = instance.run();
   instance.dispose();
   return value;
@@ -131,44 +157,69 @@ function runSableJS(security, programSource, inlineHostIntrinsics = true) {
 
 async function main() {
   const backend = argument("backend", "sablejs-sandbox");
+  const optimization = argument("optimization", "O1");
+  const inputMode = argument("input-mode", "dynamic");
   const iterations = Number(argument("iterations", "500"));
   const workloadFilter = argument("workload", "");
   const profileBoundary = process.argv.includes("--profile-boundary");
   const names = Object.keys(INPUTS).filter((name) => !workloadFilter || name === workloadFilter);
   const security = backend === "sablejs-sandbox" ? "sandbox" : "trusted";
   const nativeResults = {};
+  if (!["dynamic", "static"].includes(inputMode)) {
+    throw new Error("--input-mode must be dynamic or static");
+  }
+  if (!Number.isInteger(iterations) || iterations < 1) {
+    throw new Error("--iterations must be a positive integer");
+  }
 
   for (const name of names) {
     const source = fs.readFileSync(path.join(workloadDirectory, `${name}.js`), "utf8");
-    const programSource = assembleProgram(source, INPUTS[name]);
+    const programSource = assembleProgram(source, INPUTS[name], inputMode);
+    const nativeProgram = inputMode === "dynamic"
+      ? new Function("inputJSON", `${source}\nreturn workload(JSON.parse(inputJSON));`)
+      : null;
+    const nativeOracle = (iteration) => inputMode === "dynamic"
+      ? nativeProgram(inputJSON(name, iteration))
+      : globalThis.eval(programSource);
 
     let execute;
-    let verify = null;
+    let dispose = null;
     let boundaryTotals = null;
+    let optimizerEvidence = null;
     if (backend === "quickjs") {
       const runner = await createQuickJSRunner(() => {});
-      execute = () => runner.evaluate(programSource, `${name}.js`);
+      const preparedSource = programSource.replace(
+        /\nworkload\((?:input|JSON\.parse\(inputJSON\))\);\s*$/,
+        inputMode === "dynamic"
+          ? "\nreturn workload(JSON.parse(inputJSON));"
+          : "\nreturn workload(input);"
+      );
+      const prepared = runner.prepare(preparedSource, `${name}.js`);
+      execute = (iteration) => {
+        if (inputMode === "dynamic") runner.setGlobal("inputJSON", inputJSON(name, iteration));
+        return prepared();
+      };
+      dispose = () => runner.dispose();
     } else if (backend === "native") {
-      // The Function constructor never returns the body's completion value
-      // (it is not eval), so timing runs a pre-built function while
-      // verification re-evaluates with indirect eval — which does return
-      // the completion value, exactly like the differential fuzzer's
-      // native oracle.
-      execute = new Function(programSource);
-      const nativeEvaluate = globalThis.eval;
-      verify = () => nativeEvaluate(programSource);
+      execute = nativeOracle;
     } else {
       const inlineHostIntrinsics = !process.argv.includes("--no-inline-host-intrinsics");
       const inlineMemberIntrinsics = !process.argv.includes("--no-inline-member-intrinsics");
       const deferBranchTest = !process.argv.includes("--no-branch-test-deferral");
-      const compiled = compile(programSource, { optimization: "O2", security, runtimeModule, inlineHostIntrinsics, inlineMemberIntrinsics, deferBranchTest });
+      const compiled = compile(programSource, { optimization, security, runtimeModule, inlineHostIntrinsics, inlineMemberIntrinsics, deferBranchTest });
+      optimizerEvidence = {
+        metadata: compiled.metadata,
+        optimizer: compiled.stats,
+        generatedBytes: Buffer.byteLength(compiled.code),
+      };
       const generatedModule = { exports: {} };
       new Function("require", "module", "exports", compiled.code)(require, generatedModule, generatedModule.exports);
       if (profileBoundary) {
         // run() is single-run, so accumulate the per-instance counters.
         boundaryTotals = {};
-        execute = () => {
-          const instance = generatedModule.exports.createInstance({ profileBoundary: true });
+        execute = (iteration) => {
+          const globals = inputMode === "dynamic" ? { inputJSON: inputJSON(name, iteration) } : {};
+          const instance = generatedModule.exports.createInstance({ globals, profileBoundary: true });
           try {
             const value = instance.run();
             const stats = instance.boundaryStats();
@@ -177,36 +228,65 @@ async function main() {
           } finally { instance.dispose(); }
         };
       } else {
-        execute = () => {
-          const instance = generatedModule.exports.createInstance({});
+        execute = (iteration) => {
+          const globals = inputMode === "dynamic" ? { inputJSON: inputJSON(name, iteration) } : {};
+          const instance = generatedModule.exports.createInstance({ globals });
           try { return instance.run(); } finally { instance.dispose(); }
         };
       }
     }
 
-    // Warmup plus timed iterations.
-    execute();
+    // Correctness probes use an independent native oracle and include multiple
+    // dynamic payloads before any timing result is accepted.
+    for (const probe of [0, 1, 7]) {
+      const expected = nativeOracle(probe);
+      const actual = execute(probe);
+      if (normalize(actual) !== normalize(expected)) {
+        throw new Error(`[workloads] ${name}/${inputMode}/probe-${probe} diverged from native`);
+      }
+    }
+    execute(0);
     const startedAt = performance.now();
-    for (let index = 0; index < iterations; index += 1) execute();
+    for (let index = 0; index < iterations; index += 1) execute(index);
     const elapsedMs = performance.now() - startedAt;
 
-    const reference = runSableJS("trusted", programSource);
-    const result = verify ? verify() : execute();
+    const finalIteration = iterations + 1;
+    const reference = nativeOracle(finalIteration);
+    const result = execute(finalIteration);
     if (normalize(result) !== normalize(reference)) {
-      console.error(`[workloads] ${name} diverged from the trusted reference`);
+      console.error(`[workloads] ${name} diverged from the native reference`);
       process.exitCode = 1;
     }
     nativeResults[name] = result;
 
-    console.log(`${name}: ${(iterations / (elapsedMs / 1000)).toFixed(0)} ops/sec (${iterations} iterations, ${elapsedMs.toFixed(1)} ms)`);
+    console.log(`${name}: ${(iterations / (elapsedMs / 1000)).toFixed(0)} ops/sec (${inputMode}, ${iterations} iterations, ${elapsedMs.toFixed(1)} ms)`);
+    if (optimizerEvidence) {
+      const optimizer = optimizerEvidence.optimizer;
+      console.log(`  optimizer ${name}: ${JSON.stringify({
+        disabledPasses: optimizer.disabledPasses,
+        bailouts: optimizer.analysis ? optimizer.analysis.bailouts : [],
+        sccp: optimizer.sccp || null,
+        copyPropagation: optimizer.copyPropagation || null,
+        gvn: optimizer.globalValueNumbering || null,
+        licm: optimizer.loopInvariantCodeMotion || null,
+        dse: optimizer.deadStoreElimination || null,
+        inlining: optimizer.codegen.inlining,
+        generatedBytes: optimizerEvidence.generatedBytes,
+      })}`);
+    }
     if (boundaryTotals) {
       console.log(`  boundary ${name}: ${JSON.stringify(boundaryTotals)}`);
     }
+    if (dispose) dispose();
   }
-  console.log(`RESULT workloads ${backend}: ${names.length} workloads verified against trusted reference`);
+  console.log(`RESULT workloads ${backend}/${inputMode}: ${names.length} workloads verified against native reference`);
 }
 
-main().catch((error) => {
-  console.error(error && error.stack || error);
-  process.exitCode = 1;
-});
+module.exports = { INPUTS, assembleProgram, inputJSON, normalize, runSableJS, varyInput };
+
+if (require.main === module) {
+  main().catch((error) => {
+    console.error(error && error.stack || error);
+    process.exitCode = 1;
+  });
+}

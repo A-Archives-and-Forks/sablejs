@@ -29,7 +29,8 @@ function instructionLine(instruction) {
     }
   }
   if (instruction.optimizedBranchTarget !== undefined) {
-    annotations.push(`branch->${instruction.optimizedBranchTarget}`);
+    const proof = instruction.optimizedBranchProof && instruction.optimizedBranchProof.kind;
+    annotations.push(`branch->${instruction.optimizedBranchTarget}${proof ? `:${proof}` : ""}`);
   }
   if (instruction.guestObjectOutput) annotations.push("guest");
   const line = `${String(instruction.offset).padStart(6)}  ${instruction.op}` +
@@ -112,4 +113,30 @@ function printMIR(mir) {
   return `${lines.join("\n")}\n`;
 }
 
-module.exports = { printProgram, printMIR };
+function printCFG(programCFG) {
+  const scopes = programCFG.scopes || [programCFG];
+  const lines = [`CFG edgeModel=${programCFG.edgeModel || "semantic"} scopes=${scopes.length}`];
+  scopes.forEach((cfg) => {
+    lines.push("");
+    lines.push(`cfg scope #${cfg.scopeId} entry=${cfg.entry == null ? "none" : cfg.entry}` +
+      ` blocks=${cfg.blocks.length}`);
+    cfg.blocks.forEach((block) => {
+      lines.push(`  block ${block.start}..${block.end}` +
+        (cfg.reachable.has(block.start) ? " reachable" : " unreachable"));
+      block.edges.forEach((edge) => {
+        const annotations = [
+          `class=${edge.class || "normal"}`,
+          `kind=${edge.kind}`,
+          `completion=${edge.completion || "normal"}`,
+        ];
+        if (edge.ownerRegion != null) annotations.push(`region=${edge.ownerRegion}`);
+        if (edge.resumeTarget != null) annotations.push(`resume=${edge.resumeTarget}`);
+        if (edge.sourceOffset != null) annotations.push(`source=${edge.sourceOffset}`);
+        lines.push(`    -> ${edge.target} ${annotations.join(" ")}`);
+      });
+    });
+  });
+  return `${lines.join("\n")}\n`;
+}
+
+module.exports = { printProgram, printMIR, printCFG };

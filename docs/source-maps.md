@@ -57,7 +57,7 @@ control-flow scaffolding therefore inherit the statement containing them.
 
 ```js
 const result = compile(source, {
-  optimization: "O2",
+  optimization: "O1",
   sourceMap: {
     mode: "external",             // "external" or "inline"
     sourceFile: "rules/input.js", // logical path, never inferred from cwd

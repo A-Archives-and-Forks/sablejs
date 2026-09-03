@@ -1,11 +1,24 @@
 # Performance
 
-[README](../README.md) · [Get started](../README.md#quick-start) · [Migration](migration-v2.md) · [Security](security.md) · [Choosing an execution model](comparison.md)
+[README](../README.md) · [Get started](../README.md#quick-start) · [Migration](migration-v2.md) · [Security](security.md) · [Choosing an execution model](comparison.md) · [CFG/SSA hardening](cfg-ssa-hardening.md)
 
 Each section states whether higher or lower values are better and whether its
 figures are medians or single measured runs. Results were collected on Linux
 x64 with Node.js 24.14.0, V8 13.6, an Intel Core i5-12400F, and
 `quickjs-emscripten` 0.32.0.
+
+> **Correctness and methodology status (2026-09-02):** the O2 figures below
+> are historical measurements of these exact benchmark shapes, not a production
+> recommendation or evidence that CFG/SSA alone produced the gains. O2/Os have
+> have repaired P0 root causes but remain behind the hardening release gate.
+> The recorded QuickJS arms included source
+> evaluation in timed samples where sablejs was precompiled, and failed
+> SunSpider/Kraken cases could be omitted from totals. The current harness now
+> prepares QuickJS source outside the timed call and fails on incomplete suites,
+> but the tables have not been rerun. Treat these ratios as historical until the
+> corrected harness and held-out corpus produce archived replacements. The repair,
+> held-out-corpus, and re-release gates are in the
+> [CFG and SSA Hardening Plan](cfg-ssa-hardening.md).
 
 ## At a glance
 
@@ -15,10 +28,11 @@ x64 with Node.js 24.14.0, V8 13.6, an Intel Core i5-12400F, and
 | SunSpider 1.0, 23 tests (ms; lower is better) | 515.5 | 597.7 | median of 3 |
 | Kraken 1.1, 14 tests (ms; lower is better) | 15,935.3 | 27,081.9 | single run |
 
-On this reference harness, sablejs sandbox reaches 1.86x the QuickJS-WASM V8
-Benchmark Suite score and completes the SunSpider and Kraken subsets 1.16x
-and 1.70x faster. These comparisons characterize this machine, corpus, and
-harness—not universal application performance. The full sections below
+On the historical reference harness, the recorded sablejs/QuickJS-WASM ratios
+were 1.86x for the V8 Benchmark Suite score and 1.16x/1.70x for the SunSpider
+and Kraken subset totals. Because compilation/evaluation lifecycles are not yet
+symmetric, these characterize only that machine, corpus, and harness and should
+not be read as current application-performance ratios. The full sections below
 document adaptations, exclusions, artifact sizes, variance, and reproduction.
 
 ## V8 Benchmark Suite 7
@@ -67,7 +81,7 @@ The counter journey above is the sandbox-tax story; the batch that drove it, ite
 - **Frames and stacks** — local promotion phases 1-3 (item 6: trusted NavierStokes +45%, sandbox +47.6%, 681 promoted slots), dead-store elimination (item 7a: 187 stores, +6.1%/+2.0%), dense-switch lowering (item 7b), leaf-frame pooling (item 7c: DeltaBlue trusted +7.3–8.2%), frame-stack sync simplification (item 12: json-transform 1.97×/2.13×).
 - **Interp round-trips** — branch-test stack round-trip elimination (item 18: data-aggregation 1.686×/1.793×, template-logic 1.312×/1.335×; a boolean-flag first design clobbered a pending test and was caught deterministically by differential fuzz seeds 464/734).
 
-One negative result is recorded: item 16 (constant-key INITPROP render + fast global install) measured flat in interleaved kill-switch A/B and was rolled back. The loop then exited at item 19: a refreshed real-speed decomposition found no addressable top cost — the residual is interp dispatch plus guest-function/property sandbox mediation, structural to a sandboxed interpreter. The plan also records the method lessons: `--prof` trees are distorted by profiler overhead (item 16), every A/B baseline must be `diff -q`-verified against the patch (item 12's clobbered baseline), and only `ulimit -v` bounds V8's code space (item 17's Turbofan resource incident).
+One negative result is recorded: item 16 (constant-key INITPROP render + fast global install) measured flat in interleaved kill-switch A/B and was rolled back. The loop then exited at item 19 because that run found no addressable top cost on the tuning corpus; this was a historical performance-loop decision, not a correctness or held-out generalization result. The plan also records the method lessons: `--prof` trees are distorted by profiler overhead (item 16), every A/B baseline must be `diff -q`-verified against the patch (item 12's clobbered baseline), and only `ulimit -v` bounds V8's code space (item 17's Turbofan resource incident).
 
 
 ## Compiled size by optimization level
@@ -94,7 +108,7 @@ The compiler's size optimizer chooses per-scope vs shared frame factories per le
 | Trusted O2 | 1,141.0 KB | 755.8 KB | per-scope (+51%) |
 | Trusted Os | 973.9 KB | 597.3 KB | shared |
 
-The O2 per-scope premium buys throughput: V8 Benchmark Suite 7 sandbox scores by level (scores are 2026-08-22/23 single runs except O2, which is the 2026-08-24 three-run median; min-IIFE sizes are the 2026-08-24 measurement):
+Historical V8 Benchmark Suite 7 sandbox scores by level are below (scores are 2026-08-22/23 single runs except O2, which is the 2026-08-24 three-run median; min-IIFE sizes are the 2026-08-24 measurement):
 
 | Level | Sandbox score | Sandbox min IIFE |
 | --- | ---: | ---: |
@@ -103,7 +117,9 @@ The O2 per-scope premium buys throughput: V8 Benchmark Suite 7 sandbox scores by
 | O2 | 2,202 (median) | 657.1 KB |
 | Os | 884 | 385.7 KB |
 
-The per-scope choice at O2 is the right trade: the same suite with shared factories scored 1,035 (2026-08-23 single run) — +45% throughput (median vs shared single run) at the time; today's median-vs-shared gap is even wider. Os keeps shared factories and still lands at 884, i.e. O2's other optimizations buy +17% over Os at 3.9x the min-IIFE delta. Factory safe-sharing — emitting a shared factory only when frame layouts are provably identical — is the next size lever: it could recover most of the O2 premium for scopes whose frames happen to match, without the score loss of forcing all-shared.
+O1 already contains MIR/SSA SCCP, copy propagation, and DCE, so the jump from 26.3 at O1 to 2,202 at O2 cannot be attributed to “CFG+SSA” as a unit. It includes O2-only lowering, factories, local promotion, boundary fast paths, literal folding, and exact call/member shapes. Pass-level kill-switch A/Bs and held-out programs are required before assigning a general CFG/SSA gain.
+
+On this historical suite, the per-scope choice at O2 correlated with throughput: the same suite with shared factories scored 1,035 (2026-08-23 single run). That corpus-specific result is not yet a product-wide tradeoff. Factory safe-sharing — emitting a shared factory only when frame layouts are provably identical — remains a possible size lever after correctness hardening.
 
 ## Source vs compiled artifact on the wire
 
@@ -158,7 +174,7 @@ The cumulative effect of the whole optimization batch is measured against commit
 
 ## SunSpider 1.0 subset
 
-SunSpider is pinned from the `Action-Kamen/JavaScript-Benchmarks` mirror (`benchmark_suites/sunspider-1.0`). Three tests that extend shared intrinsics (`date-format-tofte`, `date-format-xparb`, `string-tagcloud`) are excluded from every backend so all three compare the same 23-test subset. Lower totals are better; medians of three samples.
+SunSpider is pinned from the `Action-Kamen/JavaScript-Benchmarks` mirror (`benchmark_suites/sunspider-1.0`). Three tests that extend shared intrinsics (`date-format-tofte`, `date-format-xparb`, `string-tagcloud`) are intentionally excluded from every backend, yielding a nominal 23-test subset. The historical runner could print `SKIP` after an unexpected per-test failure and still total the remaining cases. The current runner rejects missing, skipped, or incomplete tests; the table predates that gate and is not a current completeness certificate. Lower totals are better; medians of three samples.
 
 | Backend | Total (23 tests) |
 | --- | ---: |
@@ -166,11 +182,11 @@ SunSpider is pinned from the `Action-Kamen/JavaScript-Benchmarks` mirror (`bench
 | sablejs O2 sandbox | 515.5 ms |
 | QuickJS-WASM | 597.7 ms |
 
-Totals are per-suite medians of three samples; **lower is better** (2026-08-24 refresh, all pinned to one core; the previous record 276.0/442.2/588.1 was taken unpinned on 2026-08-22 and absolute values drift between sessions — the paired ratios are the signal). Sandbox runs at 76.8% of the fully trusted sablejs backend — that retention is relative to trusted, not a loss to the reference: the sandbox total is still 1.16x faster than QuickJS-WASM here. Trusted mode passes all 23 tests; the `$v1_30` temporary-scoping bug that failed `string-unpack-code` was fixed by a `temporaryRegions` visibility check (see [Roadmap](roadmap.md), Recent fixes).
+Totals are per-suite medians of three samples; **lower is better** (2026-08-24 refresh, all pinned to one core; the previous record 276.0/442.2/588.1 was taken unpinned on 2026-08-22 and absolute values drift between sessions). On that asymmetric harness, sandbox measured 1.16x lower than QuickJS-WASM and retained 76.8% of the fully trusted sablejs throughput. Trusted mode passed all 23 nominal tests; the `$v1_30` temporary-scoping bug that failed `string-unpack-code` was fixed by a `temporaryRegions` visibility check (see [Roadmap](roadmap.md), Recent fixes).
 
 ## Kraken 1.1 subset
 
-Kraken is pinned from `mozilla/krakenbenchmark.mozilla.org` (`tests/kraken-1.1`). The full LIST runs on every backend: the giant ~1.8 MB imaging literals previously hit quadratic table dedup, a quadratic SCCP result scan, O2 const-scope overflow, and 47 MB generated code per test; all four are fixed and the codegen now folds constant literal-array chains into native literals (~1.8 MB output per test). `ai-astar`'s `Array.prototype` helpers are lowered to local functions for every backend, like the Octane adaptations. Lower totals are better; single measured runs.
+Kraken is pinned from `mozilla/krakenbenchmark.mozilla.org` (`tests/kraken-1.1`). The nominal full LIST contains 14 tests: the giant ~1.8 MB imaging literals previously hit quadratic table dedup, a quadratic SCCP result scan, O2 const-scope overflow, and 47 MB generated code per test; all four are fixed and the codegen now folds constant literal-array chains into native literals (~1.8 MB output per test). `ai-astar`'s `Array.prototype` helpers are lowered to local functions for every backend, like the Octane adaptations. As with SunSpider, the current harness can omit a failed test instead of failing the command, and its claim that data preparation is untimed does not match the concatenated program that is passed to the timed runner. These are pending methodology fixes. Lower totals are better; historical single measured runs.
 
 | Backend | Total (14 tests) |
 | --- | ---: |
@@ -178,11 +194,11 @@ Kraken is pinned from `mozilla/krakenbenchmark.mozilla.org` (`tests/kraken-1.1`)
 | sablejs O2 sandbox | 15,935.3 ms |
 | QuickJS-WASM | 27,081.9 ms |
 
-Single measured runs; **lower is better** (2026-08-24 refresh, all pinned to one core). Sandbox runs at 33.7% of the fully trusted sablejs backend — again relative to trusted: the sandbox total is now 1.70x faster than QuickJS-WASM on this subset (was 1.12x — the sandbox-only member-call inlines and the deep-fold materialization hit the imaging tests' array/string work). The imaging tests dominate the sandbox total: their per-pixel property writes pay the boundary write guard on every element, which is exactly the cost the sandbox tax section tracks on the V8 suite. The pure-intrinsic call fast path took the sandbox total from 28.6 s to 20.8 s. Note: Kraken's imaging tests compile to ~1.8 MB of generated code each, so the driver needs a larger V8 heap than the other benchmarks — run it with `--max-old-space-size=2048`.
+Single historical measured runs; **lower is better** (2026-08-24 refresh, all pinned to one core). On that asymmetric harness, sandbox measured a 1.70x lower total than QuickJS-WASM and retained 33.7% of the fully trusted sablejs throughput. The imaging tests dominate the sandbox total: their per-pixel property writes pay the boundary write guard on every element, which is exactly the cost the sandbox tax section tracks on the V8 suite. The pure-intrinsic call fast path took the sandbox total from 28.6 s to 20.8 s. Note: Kraken's imaging tests compile to ~1.8 MB of generated code each, so the driver needs a larger V8 heap than the other benchmarks — run it with `--max-old-space-size=2048`.
 
 ## Real-world workloads
 
-Eight self-contained ES5.1 workloads (`benchmark/workloads/`) model the product scenarios in the README: data transforms, pricing rules, form validation, spreadsheet formulas, workflow rules, template rendering, event aggregation, and a small parser. Each embeds a deterministic input and returns a value that all four backends must agree on; `benchmark/workloads.js` runs them with 500 timed iterations per workload. Ops/sec, higher is better. Native is the raw V8 ceiling and is not a security alternative.
+Eight self-contained ES5.1 workloads (`benchmark/workloads/`) model the product scenarios in the README: data transforms, pricing rules, form validation, spreadsheet formulas, workflow rules, template rendering, event aggregation, and a small parser. The driver now defaults to varying runtime-provided JSON (`--input-mode=dynamic`), checks several inputs against native before timing, and reports optimizer coverage/bailouts per workload. The old source-embedded mode remains explicit as `--input-mode=static`. The table below predates this split: it is static-input tuning evidence, not a held-out or dynamic-input result. Ops/sec, higher is better. Native is the raw V8 ceiling and is not a security alternative.
 
 | Workload | sablejs sandbox | sablejs trusted | QuickJS-WASM | native V8 |
 | --- | ---: | ---: | ---: | ---: |
@@ -195,7 +211,7 @@ Eight self-contained ES5.1 workloads (`benchmark/workloads/`) model the product 
 | data-aggregation | 354 | 553 | 63 | 4,842 |
 | mini-parser | 8,637 | 8,353 | 8,965 | 126,377 |
 
-2026-08-24 refresh — the first full multi-backend run since the optimization batch completed (the previous table predated items 9–11; json-transform sandbox is 14x faster than the old record, the cumulative items 1–18 effect). Sandbox beats QuickJS-WASM on seven of the eight workloads, and the wins are now dominated by the literal-init + deep-fold work: json-transform 22.6x, pricing-rules 14.0x, workflow-rules 9.0x, spreadsheet-formulas 5.8x, data-aggregation 5.6x, form-validator 2.5x, template-logic 1.5x. Mini-parser sits at parity (8.6k vs 9.0k, inside the run-to-run spread). json-transform's sandbox column now outruns trusted (3,395 vs 1,876) — the sandbox-only member-call inlines (items 14/15) win on push/sort/join-heavy shapes where trusted still pays its `$apply` chain. These workloads double as a lightweight differential check: all four backends must return the trusted reference's result (JSON-stringified equality), and a backend that diverges fails the run — verified for every table row above (the comparison path was fixed on 2026-08-22: QuickJS's completion value is dumped before its handle is disposed, and the native timing path re-evaluates with indirect eval for the check, since the `Function` constructor never returns a body's completion value).
+2026-08-24 historical refresh — the first full multi-backend run after that optimization batch. The ratios in this paragraph are retained as the record of that run, but are not current cross-backend product claims because the input is compile-time-visible and the timed lifecycle differs for QuickJS. On that harness, sandbox measured above QuickJS-WASM on seven of eight rows, with the largest differences concentrated in literal-init/deep-fold and exact member-call shapes. The workloads also perform JSON-stringified result comparison, but the trusted optimized arm supplies the reference; the hardening plan changes correctness validation to native/O0 plus all optimization levels.
 
 All rows above are pinned to a single core (`taskset -c 11`) — the machine concurrently runs other projects' benchmark/compile jobs, so unpinned measurements are unreliable; absolute values drift between sessions, and the interleaved kill-switch A/Bs in the Optimization batch section are the per-item evidence.
 
@@ -204,6 +220,10 @@ All rows above are pinned to a single core (`taskset -c 11`) — the machine con
 ```sh
 npm ci
 npm run benchmark:release -- --samples=3
+npm run benchmark:release -- --protocol=cold --samples=3 --output=.cache/cold.json
+npm run benchmark:release -- --protocol=warm --samples=10 --warmup=2 --output=.cache/warm.json
+npm run benchmark:check -- --artifact=.cache/warm.json
+npm run benchmark:correctness -- --output=.cache/benchmark-correctness.json
 npm run benchmark
 npm run benchmark -- --security=sandbox
 npm run upstream:fetch -- octane sunspider kraken
@@ -213,8 +233,9 @@ npm run benchmark:sunspider -- --backend=sablejs-sandbox --samples=3
 node --max-old-space-size=2048 benchmark/kraken.js --backend=sablejs-sandbox # imaging tests need a larger heap than the npm default
 npm run benchmark:kraken -- --backend=quickjs --samples=3
 npm run benchmark:workloads -- --backend=sablejs-sandbox
+npm run benchmark:workloads -- --backend=sablejs-sandbox --input-mode=static
 npm run benchmark:workloads -- --backend=native
 npm run benchmark:workloads -- --backend=sablejs-sandbox --profile-boundary
 ```
 
-`benchmark:release` defaults to three measured runs for `sablejs-sandbox`, `sablejs-trusted`, and `quickjs`. Use `--backend=sablejs-sandbox` to isolate one backend. The SunSpider/Kraken drivers accept `--backend=sablejs-sandbox|sablejs-trusted|quickjs`, `--samples=N`, and `--suite=a,b` filters; each test is compiled once per backend and samples re-run the same program. The workloads driver accepts `--workload=name`, `--iterations=N`, and `--profile-boundary` (accumulated per-workload boundary counters). QuickJS-WASM is a WASM interpreter reference, not native QuickJS or browser performance.
+`benchmark:release` defaults to the warm protocol and three measured runs for `sablejs-sandbox`, `sablejs-trusted`, and `quickjs`. `--protocol=cold` includes prepare/compile, load/instantiate, and one execution in every sample; warm prepares once and times repeated equivalent calls. `--disable-pass=sccp,copy-propagation,dce,gvn,licm,dse` supports attributable A/B builds, and compiler metadata records every disabled pass. Use `--backend=sablejs-sandbox` to isolate one backend. The SunSpider/Kraken drivers accept `--backend=sablejs-sandbox|sablejs-trusted|quickjs`, `--samples=N`, and `--suite=a,b` filters; data source preparation occurs before warm timing for every backend, while data initialization remains in the executed program for every backend. Suite incompleteness is fatal. The workloads driver accepts `--workload=name`, `--iterations=N`, `--input-mode=dynamic|static`, and `--profile-boundary`. `benchmark:correctness` covers both input modes at all four optimization levels and both security modes against native. QuickJS-WASM is a WASM interpreter reference, not native QuickJS or browser performance. Use the tables for historical reproduction only until archived held-out reruns replace them.

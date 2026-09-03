@@ -55,7 +55,10 @@ for (var index = 0; index < 4; index += 1) {
 ({ total: total, finalValue: counter.value, label: platformLabel, argsProbe: argsProbe });
 `;
 
-const compiled = compile(source, { optimization: "O2", runtimeModule });
+const compiled = compile(source, { runtimeModule });
+if (compiled.optimization !== "O1") {
+  throw new Error(`implicit optimization must be O1, got ${compiled.optimization}`);
+}
 
 fs.mkdirSync(outputDirectory, { recursive: true });
 fs.writeFileSync(generatedPath, compiled.code);

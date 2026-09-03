@@ -80,7 +80,6 @@ runSuite({
   },
 }).then(({ total, skipped }) => {
   console.log(`[kraken] pinned=${pinnedKraken.commit}, skipped=${skipped.length}`);
-  process.exitCode = 0;
 }).catch((error) => {
   console.error(error && error.stack || error);
   process.exitCode = 1;

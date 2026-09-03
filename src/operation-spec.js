@@ -1,0 +1,177 @@
+"use strict";
+
+// Canonical operation contract shared by the numeric frontend stream and all
+// symbolic HIR/MIR consumers. Numeric codes are an internal, versioned
+// intra-compile format; operation order therefore remains stable.
+const definitions = [
+  ["POP", [], -1, "pure", "pop"],
+  ["DUP", [], 1, "pure", "dup"],
+  ["DUP2", [], 2, "pure", "dup2"],
+  ["ROT2", [], 0, "pure", "rot2"],
+  ["ROT3", [], 0, "pure", "rot3"],
+  ["ROT4", [], 0, "pure", "rot4"],
+  ["INTEGER", ["numberIndex"], 1, "pure", "pushLiteral"],
+  ["NUMBER", ["numberIndex"], 1, "pure", "pushLiteral"],
+  ["STRING", ["stringIndex"], 1, "pure", "pushLiteral"],
+  ["CLOSURE", ["functionIndex"], 1, "allocate", "closure"],
+  ["NEWARRAY", [], 1, "allocate", "newArray"],
+  ["NEWOBJECT", [], 1, "allocate", "newObject"],
+  ["NEWREGEXP", ["stringIndex", "stringIndex"], 1, "allocate", "newRegExp"],
+  ["EMPTY", [], 1, "pure", "pushEmpty"],
+  ["UNDEF", [], 1, "pure", "pushUndefined"],
+  ["NULL", [], 1, "pure", "pushNull"],
+  ["TRUE", [], 1, "pure", "pushTrue"],
+  ["FALSE", [], 1, "pure", "pushFalse"],
+  ["THIS", [], 1, "read", "pushThis"],
+  ["CURRENT", [], 1, "read", "pushCurrent"],
+  ["GETLOCAL", ["localIndex"], 1, "read", "getLocal"],
+  ["GETLOCAL2", ["localIndex"], 1, "read", "getLocal"],
+  ["SETLOCAL", ["localIndex"], 0, "write", "setLocal"],
+  ["SETLOCAL2", ["localIndex"], 0, "write", "setLocal"],
+  ["DELLOCAL", ["localIndex"], 1, "write", "deleteLocal"],
+  ["DELLOCAL2", ["localIndex"], 1, "write", "deleteLocal"],
+  ["HASVAR", ["stringIndex"], 1, "read", "hasVar"],
+  ["GETVAR", ["stringIndex"], 1, "read", "getVar"],
+  ["SETVAR", ["stringIndex"], 0, "write", "setVar"],
+  ["DELVAR", ["stringIndex"], 1, "write", "deleteVar"],
+  ["IN", [], -1, "host", "inOperator"],
+  ["INITPROP", [], -2, "host", "initProperty"],
+  ["INITGETTER", [], -2, "host", "initGetter"],
+  ["INITSETTER", [], -2, "host", "initSetter"],
+  ["GETPROP", [], -1, "host", "getProperty"],
+  ["GETPROP_S", ["stringIndex"], 0, "host", "getPropertyStatic"],
+  ["SETPROP", [], -2, "host", "setProperty"],
+  ["SETPROP_S", ["stringIndex"], -1, "host", "setPropertyStatic"],
+  ["DELPROP", [], -1, "host", "deleteProperty"],
+  ["DELPROP_S", ["stringIndex"], 0, "host", "deletePropertyStatic"],
+  ["ITERATOR", [], 0, "host", "iterator"],
+  ["NEXTITER", [], { fallthrough: 2, exhausted: 0 }, "host", "nextIterator"],
+  ["EVAL", ["evalIndex"], 0, "dynamic", "evalStatic"],
+  ["CALL", ["count"], (args) => -args[0] - 1, "call", "call"],
+  ["NEW", ["count"], (args) => -args[0], "call", "construct"],
+  ["TYPEOF", [], 0, "host", "typeOf"],
+  ["POS", [], 0, "host", "positive"],
+  ["NEG", [], 0, "host", "negative"],
+  ["BITNOT", [], 0, "host", "bitNot"],
+  ["LOGNOT", [], 0, "host", "logicalNot"],
+  ["INC", [], 0, "host", "increment"],
+  ["DEC", [], 0, "host", "decrement"],
+  ["POSTINC", [], 1, "host", "postIncrement"],
+  ["POSTDEC", [], 1, "host", "postDecrement"],
+  ["MUL", [], -1, "host", "multiply"],
+  ["DIV", [], -1, "host", "divide"],
+  ["MOD", [], -1, "host", "modulo"],
+  ["ADD", [], -1, "host", "add"],
+  ["SUB", [], -1, "host", "subtract"],
+  ["SHL", [], -1, "host", "shiftLeft"],
+  ["SHR", [], -1, "host", "shiftRight"],
+  ["USHR", [], -1, "host", "shiftRightUnsigned"],
+  ["LT", [], -1, "host", "lessThan"],
+  ["GT", [], -1, "host", "greaterThan"],
+  ["LE", [], -1, "host", "lessThanOrEqual"],
+  ["GE", [], -1, "host", "greaterThanOrEqual"],
+  ["EQ", [], -1, "host", "equal"],
+  ["NE", [], -1, "host", "notEqual"],
+  ["STRICTEQ", [], -1, "pure", "strictEqual"],
+  ["STRICTNE", [], -1, "pure", "strictNotEqual"],
+  ["JCASE", ["jumpTarget"], { fallthrough: -1, taken: -2 }, "control", "caseJump", "branch"],
+  ["BITAND", [], -1, "host", "bitAnd"],
+  ["BITXOR", [], -1, "host", "bitXor"],
+  ["BITOR", [], -1, "host", "bitOr"],
+  ["INSTANCEOF", [], -1, "host", "instanceOf"],
+  ["THROW", [], -1, "throw", "throwValue", "throw"],
+  ["TRY", ["jumpTarget"], 0, "control", "beginTry", "try"],
+  ["ENDTRY", [], 0, "control", "endTry"],
+  ["CATCH", ["stringIndex"], -1, "control", "beginCatch"],
+  ["ENDCATCH", [], 0, "control", "endCatch"],
+  ["WITH", [], -1, "dynamic", "beginWith"],
+  ["ENDWITH", [], 0, "dynamic", "endWith"],
+  ["DEBUGGER", [], 0, "control", "debuggerStatement"],
+  ["JUMP", ["jumpTarget"], 0, "control", null, "jump"],
+  ["JTRUE", ["jumpTarget"], -1, "control", null, "branchTrue"],
+  ["JFALSE", ["jumpTarget"], -1, "control", null, "branchFalse"],
+  ["LOC", ["line", "column"], 0, "control", "location"],
+  ["RETURN", [], -1, "control", null, "return"],
+  ["REFVAR", ["stringIndex"], 1, "read", "refVar"],
+  ["PUTVAR", ["stringIndex"], -1, "write", "putVar"],
+];
+
+// Operations that can produce a guest-observable abrupt completion under
+// ordinary execution. Allocation failure is intentionally outside this list;
+// this flag models JavaScript semantic flow used by protected-region CFGs.
+const MAY_THROW_OPERATIONS = new Set([
+  "HASVAR", "GETVAR", "SETVAR", "DELVAR", "IN",
+  "INITPROP", "INITGETTER", "INITSETTER",
+  "GETPROP", "GETPROP_S", "SETPROP", "SETPROP_S", "DELPROP", "DELPROP_S",
+  "ITERATOR", "NEXTITER", "EVAL", "CALL", "NEW",
+  "POS", "NEG", "BITNOT", "INC", "DEC", "POSTINC", "POSTDEC",
+  "MUL", "DIV", "MOD", "ADD", "SUB", "SHL", "SHR", "USHR",
+  "BITAND", "BITXOR", "BITOR",
+  "LT", "GT", "LE", "GE", "EQ", "NE", "INSTANCEOF", "THROW",
+  "REFVAR", "PUTVAR",
+]);
+
+// MIR stack-lowering classification is genuinely MIR-specific, so keep it in
+// the canonical operation contract and require an explicit class for every
+// operation. Consumers must not grow private, drifting opcode sets.
+const MIR_GROUPS = Object.freeze({
+  push: [
+    "INTEGER", "NUMBER", "STRING", "CLOSURE", "NEWARRAY", "NEWOBJECT", "NEWREGEXP",
+    "EMPTY", "UNDEF", "NULL", "TRUE", "FALSE", "THIS", "CURRENT", "GETLOCAL",
+    "GETLOCAL2", "DELLOCAL", "DELLOCAL2", "HASVAR", "GETVAR", "DELVAR", "REFVAR",
+  ],
+  peek: ["SETLOCAL", "SETLOCAL2", "SETVAR"],
+  unary: [
+    "GETPROP_S", "DELPROP_S", "ITERATOR", "EVAL", "TYPEOF", "POS", "NEG",
+    "BITNOT", "LOGNOT", "INC", "DEC",
+  ],
+  binary: [
+    "IN", "GETPROP", "DELPROP", "MUL", "DIV", "MOD", "ADD", "SUB", "SHL",
+    "SHR", "USHR", "LT", "GT", "LE", "GE", "EQ", "NE", "STRICTEQ",
+    "STRICTNE", "BITAND", "BITXOR", "BITOR", "INSTANCEOF",
+  ],
+  noStack: ["DEBUGGER", "LOC", "ENDCATCH", "ENDWITH", "ENDTRY", "JUMP"],
+  special: [
+    "POP", "DUP", "DUP2", "ROT2", "ROT3", "ROT4", "INITPROP", "INITGETTER",
+    "INITSETTER", "NEXTITER", "JCASE", "TRY", "SETPROP", "SETPROP_S", "PUTVAR",
+    "POSTINC", "POSTDEC", "CALL", "NEW", "JTRUE", "JFALSE", "THROW", "RETURN",
+    "CATCH", "WITH",
+  ],
+});
+const mirClassByName = Object.create(null);
+Object.entries(MIR_GROUPS).forEach(([classification, names]) => names.forEach((name) => {
+  if (mirClassByName[name]) throw new Error(`Duplicate MIR classification for ${name}`);
+  mirClassByName[name] = classification;
+}));
+
+const byCode = [];
+const byName = Object.create(null);
+
+definitions.forEach((definition, code) => {
+  const [name, operands, stack, effect, helper, control = null] = definition;
+  const spec = Object.freeze({
+    code,
+    name,
+    operands,
+    stack,
+    effect,
+    helper,
+    control,
+    mayThrow: MAY_THROW_OPERATIONS.has(name),
+    mir: mirClassByName[name] || "unsupported",
+  });
+  byCode[code] = spec;
+  byName[name] = spec;
+});
+
+const unsupportedMIR = byCode.filter((spec) => spec.mir === "unsupported");
+if (unsupportedMIR.length) {
+  throw new Error(`Missing MIR classification for ${unsupportedMIR.map((spec) => spec.name).join(", ")}`);
+}
+
+module.exports = Object.freeze({
+  schemaVersion: 1,
+  byCode: Object.freeze(byCode),
+  byName: Object.freeze(byName),
+  count: byCode.length,
+});

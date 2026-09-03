@@ -772,18 +772,22 @@ describe("sablejs sandbox known issues (audit 2026-08-22)", function () {
   it(
     "wrapper source must not be readable through Function.prototype.toString (finding 2)",
     function () {
-      const direct = run("var w = ({}).constructor; w.toString();").value;
-      assert.doesNotMatch(direct, /sableIntrinsicBoundary|sableDynamicFunctionBoundary/);
-      // The mediated chain reaches the raw Function.prototype.toString, which
-      // callHost refuses for wrapper receivers; either outcome must not
-      // disclose boundary source.
-      const viaPrototype = attempt("var w = ({}).constructor; Function.prototype.toString.call(w);");
-      assert.ok(
-        viaPrototype.outcome === "throw" ||
-        (viaPrototype.outcome === "value" &&
-          !/sableIntrinsicBoundary|sableDynamicFunctionBoundary/.test(viaPrototype.value)),
-        JSON.stringify(viaPrototype)
-      );
+      for (const optimization of ["O0", "O1", "O2", "Os"]) {
+        for (const source of [
+          "var w = ({}).constructor; w.toString();",
+          "var w = ({}).constructor; Function.prototype.toString.call(w);",
+        ]) {
+          // Conservative levels reject the read while optimized levels may
+          // return a redacted representation. Both are secure outcomes.
+          const result = attempt(source, undefined, { optimization });
+          assert.ok(
+            result.outcome === "throw" ||
+            (result.outcome === "value" &&
+              !/sableIntrinsicBoundary|sableDynamicFunctionBoundary/.test(result.value)),
+            `${optimization}: ${JSON.stringify(result)}`
+          );
+        }
+      }
     }
   );
 
@@ -915,7 +919,9 @@ describe("sablejs sandbox known issues (audit 2026-08-22)", function () {
 
   it("worker handler loads and runs compiled artifacts on evaluate messages", async function () {
     const { handleSandboxMessages } = sablejs.worker;
-    const artifact = sablejs.compile("var total = input.price * 2; total;", { runtimeModule }).code;
+    const compiled = sablejs.compile("var total = input.price * 2; total;", { runtimeModule });
+    assert.equal(compiled.optimization, "O1");
+    const artifact = compiled.code;
     let loads = 0;
     const posted = [];
     const scope = {};
@@ -1589,7 +1595,7 @@ describe("sablejs guest-object write fast path (local-safe IR distinction)", fun
   });
 });
 
-describe("sablejs literal-init fast path (prototype setter guard, audit 2026-08-23)", function () {
+describe("sablejs literal-init fast path (prototype write guard, audit 2026-08-23)", function () {
   it("creates own data properties for plain literals in both modes", function () {
     for (const security of ["sandbox", "trusted"]) {
       const value = run(
@@ -1608,6 +1614,46 @@ describe("sablejs literal-init fast path (prototype setter guard, audit 2026-08-
       { optimization: "O2", security: "trusted" }
     ).value;
     assert.deepStrictEqual(value, [3, 1, undefined, 3, false]);
+  });
+
+  it("creates object-literal properties over inherited non-writable data properties", function () {
+    for (const optimization of ["O1", "O2"]) {
+      for (const strict of [false, true]) {
+        const value = run(
+          (strict ? "'use strict'; " : "") +
+          "Object.defineProperty(Object.prototype, 'blocked', " +
+          "{ value: 9, writable: false, configurable: true }); " +
+          "var result; try { " +
+          "  var o = { blocked: 3 }; " +
+          "  result = [o.blocked, Object.prototype.hasOwnProperty.call(o, 'blocked'), " +
+          "   Object.getOwnPropertyDescriptor(o, 'blocked').writable]; " +
+          "} finally { delete Object.prototype.blocked; } result;",
+          undefined,
+          { optimization, security: "trusted" }
+        ).value;
+        assert.deepStrictEqual(value, [3, true, true], `${optimization}, strict=${strict}`);
+      }
+    }
+  });
+
+  it("creates array-literal elements over inherited non-writable indices", function () {
+    for (const optimization of ["O1", "O2"]) {
+      for (const strict of [false, true]) {
+        const value = run(
+          (strict ? "'use strict'; " : "") +
+          "Object.defineProperty(Array.prototype, '0', " +
+          "{ value: 9, writable: false, configurable: true }); " +
+          "var result; try { " +
+          "  var a = [3]; " +
+          "  result = [a[0], Object.prototype.hasOwnProperty.call(a, '0'), " +
+          "   Object.getOwnPropertyDescriptor(a, '0').writable]; " +
+          "} finally { delete Array.prototype[0]; } result;",
+          undefined,
+          { optimization, security: "trusted" }
+        ).value;
+        assert.deepStrictEqual(value, [3, true, true], `${optimization}, strict=${strict}`);
+      }
+    }
   });
 
   it("bypasses inherited setters for literals but not for assignments (trusted mode)", function () {

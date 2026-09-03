@@ -26,7 +26,7 @@ const source = fs.readFileSync(guestPath, "utf8");
 // location so esbuild can resolve and bundle it (the runtime is a normal
 // dependency in Node; the browser needs it in the bundle).
 const result = compile(source, {
-  optimization: "O2",
+  optimization: "O1",
   security: "sandbox",
   runtimeModule: path.join(root, "src", "runtime"),
   sourceMap: {

@@ -1,11 +1,11 @@
 # Roadmap
 
-[README](../README.md) · [Get started](../README.md#quick-start) · [Migration](migration-v2.md) · [Security](security.md) · [Performance](performance.md)
+[README](../README.md) · [Get started](../README.md#quick-start) · [Migration](migration-v2.md) · [Security](security.md) · [Performance](performance.md) · [CFG/SSA hardening](cfg-ssa-hardening.md)
 
-Status markers: ✅ Done · ◐ Partial · ⬜ Not started.
+Status markers: ✅ Done · ◐ Partial · ⬜ Not started · ⛔ Release blocker.
 Priority principle: **security correctness > semantic correctness > real-world evidence > DX > performance > benchmark scores**.
 
-Last updated 2026-08-25.
+Last updated 2026-09-02.
 
 ## Status summary
 
@@ -22,20 +22,28 @@ The 2026-08-22 top-10 priorities are all done:
 9. ✅ README positioning (versus eval/iframe/QuickJS, ES5.1 core strategy)
 10. ✅ ES5.1 strategy documented (README + [Security](security.md))
 
-## Current snapshot (2026-08-25)
+## Current snapshot (2026-09-01)
 
 - **Security**: a full boundary audit ([Security](security.md), Historical audit record) found no usable escape; the zero-skipped adversarial regression battery lives in `test/unit/security.test.js`, now including the boundary-internals sweep, the clone-shape sweep (P0-S1–S4), the provenance-v2 write fast-path pins, the arity-specialized dispatch pins, and the object-literal folding pins. Vulnerability disclosure is defined in the repository `SECURITY.md`.
-- **Performance**: V8 Benchmark Suite 7 sandbox 2,202, trusted 2,783 (three-run medians, [Performance](performance.md)); the sandbox beats QuickJS-WASM on 7 of the 8 real-world workloads (mini-parser at parity). The 2026-08-23/24 optimization batch (items 1–19, fully recorded in the [Optimization history](optimization.md)) shipped guest-provenance v2, arity-specialized call/NEW dispatch, literal folding, local promotion, slot-provenance write stamps, the inline guest-stamp write path, the literal-init fast path and its inlined/deep-folded successors, the sandbox-only host-intrinsic call inlines, frame-stack sync simplification, and branch-test round-trip elimination; item 16 measured flat and was rolled back. Cumulative Octane A/B vs the pre-items HEAD: **+37% geomean** across 8 suites (Splay 2.25×, EarleyBoyer 2.14×, RayTrace 1.67×, NavierStokes 1.48×; Richards −12% unattributable). The loop exited at item 19 — a refreshed real-speed decomposition found the remaining costs intrinsic (interp dispatch + guest-function/property sandbox mediation). **Measurement protocol: all in-session A/Bs are pinned to one core (`taskset -c 11`) — the machine runs other projects' benchmark jobs, so unpinned numbers are unreliable.**
-- **Semantics**: the pinned Test262 gate passes 14,293/14,293 variants with zero host failures. Native A/B failures are no longer automatic waivers: an exact, reviewed host-failure policy is required and is currently empty.
+- **Performance**: the historical V8 Benchmark Suite 7 measurements are sandbox 2,202 and trusted 2,783 (three-run medians, [Performance](performance.md)). The 2026-08-23/24 optimization batch (items 1–19, fully recorded in the [Optimization history](optimization.md)) shipped guest-provenance v2, arity-specialized call/NEW dispatch, literal folding, local promotion, slot-provenance write stamps, the inline guest-stamp write path, the literal-init fast path and its inlined/deep-folded successors, the sandbox-only host-intrinsic call inlines, frame-stack sync simplification, and branch-test round-trip elimination; item 16 measured flat and was rolled back. Cumulative Octane A/B vs the pre-items HEAD: **+37% geomean** across 8 suites (Splay 2.25×, EarleyBoyer 2.14×, RayTrace 1.67×, NavierStokes 1.48×; Richards −12% unattributable). These figures describe the then-current corpus and harness, not O2 production readiness or CFG/SSA-only gains. Held-out, dynamic-input, lifecycle-symmetric revalidation is tracked in the [CFG/SSA hardening plan](cfg-ssa-hardening.md). **Measurement protocol: all in-session A/Bs are pinned to one core (`taskset -c 11`) — the machine runs other projects' benchmark jobs, so unpinned numbers are unreliable.**
+- **Semantics**: the pinned Test262 gate passes 14,293/14,293 variants with zero host failures, but the 2026-09-01 optimizer audit found two deterministic P0 wrong-code cases outside that coverage. DSE now converges with a reverse worklist and fails closed on a diagnostic budget. Completion-aware CFG plus independent reuse verification fix the GVN defect in its supported private-local domain; real catch/with/eval and protected LICM/DSE/provenance retain safe bailouts. The implicit default is now O1. The remaining semantic proofs and validation gates still block O2/Os production approval; details are in the [CFG/SSA hardening plan](cfg-ssa-hardening.md).
 - **Debuggability**: opt-in Source Map v3 output is implemented for all optimization levels, including inline/external maps, Node and browser integration evidence, and virtual sources for static `eval`/`Function` bodies.
 
 ## Next priorities
 
-1. ◐ **Facet fuzzing** — semantics and sandbox-boundary facets plus generated-code syntax validation are in CI; parser/capability-serializer expansion and a nightly campaign remain.
-2. ⬜ **Benchmark reporting automation** — automatically generate the performance markdown and archive benchmark JSON with environment info.
-3. ⬜ **Fuel-budget prototype** — implement and measure the research design before committing to a public API.
+1. ⛔ **CFG/SSA correctness hardening** — containment, convergent DSE, completion-aware CFG, and independent GVN reuse proofs are implemented; next complete the remaining annotation proofs, directed corpus, and held-out evidence. See the [implementation plan](cfg-ssa-hardening.md).
+2. ◐ **Facet fuzzing** — semantics and sandbox-boundary facets plus generated-code syntax validation are in CI; parser/capability-serializer expansion and a nightly campaign remain.
+3. ⬜ **Benchmark methodology and reporting** — make backend lifecycles symmetric, fail on skips/errors, separate static from dynamic input, freeze a held-out corpus, generate the performance markdown, and archive benchmark JSON with environment info.
+4. ⬜ **Fuel-budget prototype** — implement and measure the research design before committing to a public API.
 
 ## Open work by priority
+
+### P0 — Optimizer correctness
+
+- ✅ DSE convergence containment: the fixed 256-iteration partial commit is replaced by a reverse worklist with atomic commit, fail-closed diagnostic budget, bailout statistics, generated reference-solver tests, and the old-boundary family through 1,024 blocks.
+- ◐ Exceptional/abrupt CFG: labelled semantic edges, inspection dumps, and an independent dominance/no-clobber verifier now protect GVN. Catch-free `try/finally` is re-enabled on that graph; real catches/with/eval still bail out, and LICM/DSE/provenance remain gated until their own proof contracts land.
+- ✅ The implicit default is O1 across compiler, docs/types/examples, Worker/build/cache evidence, Test262, and benchmark entry points. Explicit O2/Os remain non-production until every release gate in the [CFG/SSA hardening plan](cfg-ssa-hardening.md) passes.
+- ✅ New O2/Os throughput work is frozen until the correctness gates pass.
 
 ### P0 — Security
 
@@ -56,8 +64,8 @@ The 2026-08-22 top-10 priorities are all done:
 
 ### P1 — Semantic correctness
 
-- ✅ Pinned Test262 runs continuously (gate passes).
-- ✅ Differential testing established (return value + exception name, 16,000 cases zero mismatches); finer observation surfaces (observable mutations, descriptors, enumeration order) belong to facet fuzzing.
+- ◐ Pinned Test262 runs continuously and its current O2 gate passes, but that corpus did not expose either 2026-09-01 P0 optimizer finding. The release gate must run the eligible corpus at O0/O1/O2/Os and reject optimization-level drift.
+- ◐ Differential testing compares O0/O1/O2/Os against native, with both security modes covered. The boundary oracle also checks observable input mutations, own descriptors, key order, collection size, and capability-call traces. Dedicated deep-CFG/nested-completion families, AST-aware reduction, four permanent corpus cases, six metamorphic families, and verifier mutations are in CI. Feature quotas and the nightly/release-scale campaigns remain.
 - ✅ Archive Test262 pass/fail counts and failure lists per release (`npm run test262:archive` → `archives/test262/`); the release workflow archives the completed gate and attaches the full report plus `latest.json` to the GitHub release.
 - ✅ The ES5.1-contract exclusion list is documented ([Compatibility](compatibility.md)): corpus selection (`es5id`), the token-based dynamic-code policy exclusion, the pinned ES5.1 expectation adjustments, the Babel downlevel path, and the native A/B failure attribution.
 
@@ -70,11 +78,12 @@ The 2026-08-22 top-10 priorities are all done:
 
 ### P1 — Benchmark system
 
-- ✅ V8 Benchmark Suite 7 + Octane/SunSpider/Kraken, all pinned in `tools/upstreams.js`; three-backend comparison; median/MAD/min/max/p95 reporting; raw/minified/gzip size reporting; compile once + sample reuse per backend; machine/CPU/OS recorded in [Performance](performance.md).
+- ◐ V8 Benchmark Suite 7 + Octane/SunSpider/Kraken are pinned in `tools/upstreams.js`, with multi-backend comparison, distribution statistics, size reporting, and environment notes. QuickJS workload source is prepared outside warm samples; SunSpider/Kraken reject incomplete cases. `benchmark:release` has explicit cold/warm protocols and replayable raw JSON, while correctness artifacts are archived by releases. Existing ratios remain historical until all suites are rerun and archived.
+- ◐ A hashed manifest separates tuning, held-out, and adversarial groups; workloads default to runtime-provided varying input and retain explicit `--input-mode=static`. The held-out group is intentionally empty, and its release command fails closed until at least 20 licensed programs land.
 - ⬜ Measured runs 3 → 10–20, warmup tuning.
-- ⬜ Separate compile-time vs execution-time reporting, cold start vs warm throughput.
+- ◐ `benchmark:release` separates cold (compile/load/run) from warm (prepared repeated calls); the external-suite and workload reports still need the same complete raw protocol.
 - ⬜ Peak memory reporting.
-- ⬜ Automated Performance Markdown generation + benchmark JSON and environment archiving.
+- ◐ Raw release/correctness JSON includes commit, dirty state, Node/V8/QuickJS, CPU/OS/affinity, options, manifest hash, samples/results/errors/suite counts; automatic Markdown generation and external-suite parity remain.
 
 ### P1 — Sandbox tax
 
@@ -91,7 +100,7 @@ The 2026-08-22 top-10 priorities are all done:
 
 ### P1 — Real-world workloads
 
-- ✅ 8 workloads in `benchmark/workloads/` with a four-backend driver and cross-backend result verification.
+- ✅ 8 workloads in `benchmark/workloads/` with a four-backend driver, native-oracle correctness probes, default varying runtime JSON input, explicit static-input mode, and per-workload optimizer coverage/bailout reporting.
 - ⬜ 10k-scale pricing rules, AI-generated data transforms, UI decision logic, repeated execution, many-short-programs, cold Worker startup, compiled artifact cache reuse.
 
 ### P2 — Size
@@ -108,6 +117,7 @@ The 2026-08-22 top-10 priorities are all done:
 - ✅ Each optimization pass documents its semantic invariants (2026-08-22): every pass in `src/backend/optimizer.js` carries a contract note — what it proves, what it preserves, and which instruction fields it may write; the security-sensitive guest-object-provenance pass documents its mark soundness and has adversarial regression tests at all four optimization levels plus differential coverage.
 - ✅ IR dump / generated-code inspection mode (2026-08-22): `compile({ dumpDir })` writes `hir.txt` (annotated optimized HIR), `mir.txt` (MIR blocks/phis/operations), and `code.js`; `includeHIR`/`includeMIR`/`dumpIR: "hir"|"mir"|"all"` attach the graph objects (`dumpIR: "all"` now includes both forms). The text printer lives in `src/ir/print.js`; covered in `test/unit/compiler.test.js`.
 - ✅ Backend optimization batch (2026-08-23/24): strict-mode parameter propagation, guest-provenance v2, intrinsic-read LICM (validated out), local promotion (frame-shape specialization, all three phases), dead-store elimination, dense `JCASE` switch lowering, leaf-frame pooling, the NEW-dispatch arity specialization, slot-provenance write stamps, the inline guest-stamp write path, the literal-init fast path, the frame-stack sync simplification, the inlined literal-init fast path, and the sandbox-only host-intrinsic call inline shipped (plan items 4, 1, 5, 6, 7a, 7b, 7c, 8, 9, 10, 11, 12, 13, 14); the entry-counter investigation was closed (already gated) — full designs, soundness arguments, and per-item evidence gates in [Optimization history](optimization.md).
+- ◐ Productization hardening: the canonical opcode/MIR contract, completion-aware control flow, executable analysis-generation contracts, transactional pass rollback, and independent verification for `reuse`, LICM, elided stores, branch facts, and guest provenance have landed. CFG edges are source-reconstructed; MIR checks edge/Phi/definition/effect/use identities, HIR mapping, and edge stack signatures. Corpus, held-out evidence, and canary gates remain open; see the [CFG/SSA hardening plan](cfg-ssa-hardening.md).
 
 ### P2 — API / DX
 
@@ -117,7 +127,7 @@ The 2026-08-22 top-10 priorities are all done:
 
 ### P2 — Docs
 
-- ✅ `docs/architecture.md`, `docs/performance.md`, `docs/security.md` (with threat model), `docs/worker-isolation.md`.
+- ✅ `docs/architecture.md`, `docs/performance.md`, `docs/security.md` (with threat model), `docs/worker-isolation.md`, and the active [CFG/SSA hardening plan](cfg-ssa-hardening.md).
 - ◐ O0/O1/O2/Os design goals (brief version in [Architecture](architecture.md); expand).
 - ✅ Dedicated compatibility contract with a user-facing support summary.
 - ✅ V1-to-v2 migration guide and execution-model comparison.

@@ -12,7 +12,7 @@ function argument(name, fallback) {
   return value ? value.slice(prefix.length) : fallback;
 }
 
-const optimization = argument("optimization", "O2");
+const optimization = argument("optimization", "O1");
 const security = argument("security", "trusted");
 const suite = argument("suite", "");
 const preserveSourceLocations = process.argv.includes("--preserve-source-locations");

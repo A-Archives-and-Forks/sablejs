@@ -66,7 +66,14 @@ const options: CompileOptions = {
   strict: false,
   perScopeFactories: false,
   stackToLocal: true,
+  sparseConditionalConstantPropagation: true,
+  copyPropagation: true,
+  deadCodeElimination: true,
+  loopInvariantCodeMotion: true,
+  globalValueNumbering: true,
+  deadStoreElimination: true,
   includeHIR: true,
+  includeCFG: true,
   includeMIR: true,
   dumpIR: "all",
   dumpDir: "out",
@@ -95,6 +102,7 @@ const mir: any = result.mir;
 // Stats
 const stats: CompileStats = result.stats;
 const passes: OptimizerPassRecord[] = stats.passes;
+const disabledPasses: string[] = stats.disabledPasses;
 const passName: string = passes[0].name;
 const passDelta: number = passes[0].nodesChanged;
 const cfg: { blocks: number; edges: number; loops: number } = stats.cfg;
@@ -120,6 +128,7 @@ const idProtection: "alias" | "preserve" = metadata.identifierProtection;
 const optLevel: OptimizationLevel = metadata.optimize;
 const securityMode: SecurityMode = metadata.security;
 const normalizedMap: NormalizedSourceMapSettings | undefined = metadata.sourceMap;
+const optimizerDisabledPasses: string[] = metadata.optimizerDisabledPasses;
 
 // ---------------------------------------------------------------------------
 // Source-map option variants
@@ -265,9 +274,10 @@ createSandboxClient({});
 const notLevel: OptimizationLevelLike = 2;
 
 // Keep every imported value observably used (noUnusedLocals).
-void [codeText, format, level, map, hir, mir, passes, passName, passDelta, cfg, enabled, selected,
+void [codeText, format, level, map, hir, mir, passes, disabledPasses, passName, passDelta, cfg, enabled, selected,
   strategy, objective, sizeOpt, inliningStats, inlined, reusedAliases, provenance, droppedSlots,
-  abiVersion, inputLanguage, idProtection, optLevel, securityMode, normalizedMap, trusted,
+  abiVersion, inputLanguage, idProtection, optLevel, securityMode, normalizedMap,
+  optimizerDisabledPasses, trusted,
   normalized, disabled, aliasMode, anyMapOption, shorthand, withAliases, directResult, hirGraph,
   mirGraph, loweredHir, loweredMir, runtimeResult, isDisposed, instSecurity, globalsObject,
   boundaryStats, abi, rtInstance, programFromRuntime, capFromRuntime, workerNamespace,

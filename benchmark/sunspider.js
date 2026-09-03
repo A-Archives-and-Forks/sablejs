@@ -33,7 +33,6 @@ runSuite({
   },
 }).then(({ total, skipped }) => {
   console.log(`[sunspider] pinned=${pinnedSunspider.commit}, skipped=${skipped.length}`);
-  process.exitCode = 0;
 }).catch((error) => {
   console.error(error && error.stack || error);
   process.exitCode = 1;

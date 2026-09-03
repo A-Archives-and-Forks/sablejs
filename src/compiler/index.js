@@ -3,11 +3,16 @@
 const FrontendCompiler = require("../frontend/compiler");
 const decodeProgram = require("../ir/decode");
 const { verifyProgram } = require("../ir/verify");
+const { buildSemanticCFG, verifyCFG } = require("../ir/cfg");
 const { lowerToMIR: lowerProgramToMIR, verifyMIR } = require("../ir/mir");
-const { optimizeProgram, normalizeLevel } = require("../backend/optimizer");
+const {
+  OPTIMIZER_PIPELINE_VERSION,
+  optimizeProgram,
+  normalizeLevel,
+} = require("../backend/optimizer");
 const { generate, normalizeIdentifierProtection } = require("../codegen");
 const { finalizeSourceMap, sourceMapURLComment, stripMarkers } = require("../codegen/source-map");
-const { printProgram, printMIR } = require("../ir/print");
+const { printProgram, printMIR, printCFG } = require("../ir/print");
 const { ABI_VERSION } = require("../runtime");
 const { base64EncodeUtf8, utf8ByteLength } = require("../platform");
 
@@ -166,7 +171,21 @@ class AOTCompiler {
     let mir;
     if (options.includeMIR || options.dumpIR === "mir" || options.dumpIR === "all") {
       mir = lowerProgramToMIR(hir);
-      verifyMIR(mir);
+      verifyMIR(mir, hir);
+    }
+    let semanticCFG;
+    if (options.includeCFG || options.dumpIR === "cfg" ||
+        options.dumpIR === "all" || options.dumpDir) {
+      semanticCFG = {
+        kind: "ProgramCFG",
+        edgeModel: "semantic",
+        entry: hir.entry,
+        scopes: hir.scopes.map((scope) => {
+          const scopeCFG = buildSemanticCFG(scope);
+          verifyCFG(scopeCFG, scope);
+          return scopeCFG;
+        }),
+      };
     }
     const createCodegenStats = () => ({
       straightScopes: 0,
@@ -258,17 +277,18 @@ class AOTCompiler {
     }
     stats.codegen.sizeOptimization.outputBytes = utf8ByteLength(code);
     if (options.dumpDir) {
-      // Inspection mode: write the optimized HIR, the MIR the backend passes
-      // reason about, and the generated code as text files. Independent of
+      // Inspection mode: write optimized HIR, completion-aware semantic CFG,
+      // the MIR the backend passes reason about, and generated code. Independent of
       // dumpIR/includeHIR, which attach the graph objects to the result — the
       // returned object is unchanged by dumpDir. File access goes through the
       // options.fs adapter so browser bundles can supply an in-memory
       // implementation (the Node default is lazily required, see above).
       const dumpFs = options.fs || defaultInspectionFs();
       const dumpMIR = mir || lowerProgramToMIR(hir);
-      verifyMIR(dumpMIR);
+      verifyMIR(dumpMIR, hir);
       dumpFs.mkdirSync(options.dumpDir, { recursive: true });
       dumpFs.writeFileSync(dumpFs.join(options.dumpDir, "hir.txt"), printProgram(hir));
+      dumpFs.writeFileSync(dumpFs.join(options.dumpDir, "cfg.txt"), printCFG(semanticCFG));
       dumpFs.writeFileSync(dumpFs.join(options.dumpDir, "mir.txt"), printMIR(dumpMIR));
       // The dumped code.js uses code.js.map as its URL rather than leaking
       // the absolute dumpDir; the returned artifact continues to use the
@@ -293,6 +313,9 @@ class AOTCompiler {
       optimization,
       stats,
       hir: options.dumpIR === "hir" || options.dumpIR === "all" || options.includeHIR ? hir : undefined,
+      cfg: options.includeCFG || options.dumpIR === "cfg" || options.dumpIR === "all"
+        ? semanticCFG
+        : undefined,
       mir,
       map,
       metadata: {
@@ -301,6 +324,12 @@ class AOTCompiler {
         inputLanguage: "es5.1",
         identifierProtection,
         optimize: optimization,
+        optimizerPipelineVersion: OPTIMIZER_PIPELINE_VERSION,
+        optimizerPasses: stats.passes.map((pass) => pass.name),
+        optimizerDisabledPasses: stats.disabledPasses.slice(),
+        optimizerAnalysisGeneration: stats.analysis ? stats.analysis.generation : 0,
+        optimizerAnalysisRebuilds: stats.analysis ? stats.analysis.rebuilds.slice() : [],
+        optimizerBailouts: stats.analysis ? stats.analysis.bailouts.slice() : [],
         perScopeFactories,
         security,
         // The key exists only when a map was requested, matching the
@@ -314,7 +343,7 @@ class AOTCompiler {
   lowerToMIR(source, options = {}) {
     const hir = this.lowerToHIR(source, options);
     const mir = lowerProgramToMIR(hir);
-    verifyMIR(mir);
+    verifyMIR(mir, hir);
     return mir;
   }
 }

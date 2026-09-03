@@ -82,29 +82,30 @@ const OBJECT_DEFINE_SETTER = Object.prototype.__defineSetter__;
 const REFLECT_SET_PROTOTYPE_OF = Reflect.setPrototypeOf;
 let indexedPrototypeUnsafe = false;
 // Object-literal initialization must create own data properties without
-// consulting inherited accessors (ES5.1 11.1.5 -> CreateDataProperty). Once
-// any accessor is installed on Array.prototype/Object.prototype, any chain
-// swap of the two is performed, or any key of a literal is __proto__, the
-// fast assignment path would observe the prototype (an inherited accessor
-// without a setter throws in the strict runtime module), so it falls back
-// to defineData for the rest of the process. Setters cannot be installed by
-// sandboxed programs (the intrinsic graph is protected), so sandbox runs
-// stay on the fast path.
+// consulting inherited properties (ES5.1 11.1.5 -> CreateDataProperty). Once
+// an accessor or non-writable data property is installed on
+// Array.prototype/Object.prototype, any chain swap of the two is performed,
+// or any key of a literal is __proto__, the fast assignment path would
+// observe the prototype. It therefore falls back to defineData for the rest
+// of the process. Unsafe descriptors cannot be installed by sandboxed
+// programs (the intrinsic graph is protected), so sandbox runs stay fast.
 let prototypeSetterUnsafe = false;
 
 // The two built-in prototypes are captured at module load; a host that
-// installed accessors on them before loading the runtime must disable the
-// fast path too. Object.prototype's own __proto__ accessor is excluded —
+// installed unsafe properties on them before loading the runtime must disable
+// the fast path too. Object.prototype's own __proto__ accessor is excluded —
 // the initProperty key check already routes __proto__ keys to defineData,
 // and the accessor at that key affects only __proto__ writes.
-(function scanPrototypeAccessors() {
+(function scanUnsafePrototypeProperties() {
   for (const proto of [OBJECT_PROTOTYPE, ARRAY_PROTOTYPE]) {
     const keys = REFLECT_OWN_KEYS(proto);
     for (let i = 0; i < keys.length; i += 1) {
       const key = keys[i];
+      // ES5.1 literal keys are strings; host symbol properties cannot be
+      // addressed by INITPROP and must not disable its fast path.
       if (typeof key !== "string" || key === "__proto__") continue;
       const descriptor = OBJECT_GET_OWN_PROPERTY_DESCRIPTOR(proto, key);
-      if (descriptor && (HAS_OWN_PROPERTY(descriptor, "get") || HAS_OWN_PROPERTY(descriptor, "set"))) {
+      if (isLiteralAssignmentUnsafeDescriptor(descriptor)) {
         prototypeSetterUnsafe = true;
         return;
       }
@@ -196,16 +197,26 @@ function isAccessorDescriptor(descriptor) {
   return descriptor && (HAS_OWN_PROPERTY(descriptor, "get") || HAS_OWN_PROPERTY(descriptor, "set"));
 }
 
+// A fresh literal assignment can be intercepted by an accessor or rejected
+// by an inherited non-writable data property. Mutation observation runs
+// before defineProperty, so descriptors that do not explicitly opt into a
+// writable data property are treated conservatively: on a new property the
+// omitted writable field defaults to false, while a false positive only
+// disables the fast path.
+function isLiteralAssignmentUnsafeDescriptor(descriptor) {
+  return isAccessorDescriptor(descriptor) || !descriptor || descriptor.writable !== true;
+}
+
 function observePrototypeMutation(callable, thisValue, args) {
   if ((callable === OBJECT_DEFINE_PROPERTY || callable === REFLECT_DEFINE_PROPERTY) &&
       isIndexedPrototype(args[0])) {
     if (affectsInternalArraySlots(args[1])) indexedPrototypeUnsafe = true;
-    if (isAccessorDescriptor(args[2])) prototypeSetterUnsafe = true;
+    if (isLiteralAssignmentUnsafeDescriptor(args[2])) prototypeSetterUnsafe = true;
   } else if (callable === OBJECT_DEFINE_PROPERTIES && isIndexedPrototype(args[0]) && args[1]) {
     ARRAY_FOR_EACH(REFLECT_OWN_KEYS(args[1]), (key) => {
       const descriptor = args[1][key];
       if (affectsInternalArraySlots(key)) indexedPrototypeUnsafe = true;
-      if (isAccessorDescriptor(descriptor)) prototypeSetterUnsafe = true;
+      if (isLiteralAssignmentUnsafeDescriptor(descriptor)) prototypeSetterUnsafe = true;
     });
   } else if ((callable === OBJECT_SET_PROTOTYPE_OF || callable === REFLECT_SET_PROTOTYPE_OF) &&
              isIndexedPrototype(args[0])) {
@@ -546,8 +557,9 @@ function setGuestPropertyValue(runtime, frame, object, key, value) {
 // matching the call site's static argument count, so a guest call never
 // builds an args array: the captured Function.prototype.call forwards the
 // fixed arguments without materializing a list (V8 lowers `.call` on a
-// plain callee to a direct call). Measured against the alternatives on
-// Richards (2026-08-23): a per-site membership memo was a ~20% regression
+// plain callee to a direct call). A call-heavy tuning workload showed that
+// per-site membership memoization can regress throughput substantially, so
+// keep the generic direct check.
 // (V8's native WeakSet.has beats a manual array memo — 8.4 ns vs 15.7 ns
 // per hit), while the WeakSet probe itself is the cheap half of dispatch;
 // the win came from collapsing the guest fast path into the dispatch
@@ -1408,7 +1420,8 @@ class RuntimeInstance {
       // The literal object is fresh (no own accessors, extensible, chained
       // only to Array.prototype/Object.prototype), so a plain assignment
       // creates the same own data property as defineData — except when an
-      // inherited setter exists (prototypeSetterUnsafe) or the key is
+      // inherited accessor/non-writable property exists
+      // (prototypeSetterUnsafe) or the key is
       // __proto__ (host Object.prototype's own accessor). Object-literal
       // semantics must bypass both, so those stay on defineData.
       if (key !== "__proto__" && !prototypeSetterUnsafe) {

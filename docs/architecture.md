@@ -1,6 +1,6 @@
 # Architecture
 
-[README](../README.md) · [Get started](../README.md#quick-start) · [Migration](migration-v2.md) · [Security](security.md) · [Performance](performance.md)
+[README](../README.md) · [Get started](../README.md#quick-start) · [Migration](migration-v2.md) · [Security](security.md) · [Performance](performance.md) · [CFG/SSA hardening](cfg-ssa-hardening.md)
 
 sablejs compiles ES5.1 source into CommonJS ahead-of-time modules. The generated code uses native JavaScript values and objects; it does not ship an opcode dispatcher or evaluate source at runtime.
 
@@ -17,7 +17,7 @@ source
 
 The implementation follows the same layout:
 
-- `src/frontend`: ES5.1 parser and the 88-operation frontend contract.
+- `src/frontend`: ES5.1 parser and the symbolic frontend operation contract.
 - `src/ir`: HIR/MIR definitions, CFG analysis, decoding, and verification.
 - `src/backend`: optimization passes.
 - `src/codegen`: direct JavaScript generation.
@@ -28,12 +28,65 @@ The implementation follows the same layout:
 
 ## Optimization levels
 
-- `O0`: semantic oracle; no optimizer rewrites.
+- `O0`: unoptimized differential baseline; no optimizer rewrites. Native ES5.1 behavior remains the external semantic oracle.
 - `O1`: conservative CFG, constant, copy, and dead-code passes.
-- `O2`: adds stack-to-local lowering, cross-block GVN, safe LICM, guarded small-function inlining, and specialized leaf and inline fast-frame factories whose frame literals only carry the fields each scope reads.
+- `O2`: adds stack-to-local lowering, cross-block GVN, LICM, guarded small-function inlining, and specialized leaf and inline fast-frame factories whose frame literals only carry the fields each scope reads.
 - `Os`: uses measured output size to choose closure factories, reuses temporary slots, prunes runtime imports, and disables growth-oriented inlining.
 
 Unknown calls, property access, dynamic environments, captured values, parameter/`arguments` aliasing, and observable coercion remain optimization barriers unless a pass proves safety.
+
+**Current correctness status (2026-09-01):** the implementation defaults to O1.
+Explicit O2 and Os are not production-ready while the remaining annotation,
+corpus, and held-out gates are open. DSE now uses a convergent reverse worklist
+and fails closed on a diagnostic budget. GVN uses completion-aware facts and an
+independent reuse verifier in its supported private-local domain; real catches
+and with/eval still bail out, while protected-region LICM, DSE, and provenance
+remain conservatively disabled. Re-approval is tracked in the
+[CFG and SSA Hardening Plan](cfg-ssa-hardening.md). O1 reduces exposure; it is
+not a general correctness proof.
+
+## IR and control-flow contracts
+
+`src/operation-spec.js` is the canonical, immutable operation table. It derives
+both frontend numeric codes and symbolic IR metadata, including operand shape,
+stack effect, effect/control class, `mayThrow`, and an exhaustive MIR lowering
+class. The numeric operation stream is an internal, intra-compile format, not a
+public or persistent bytecode ABI; its `schemaVersion` exists so any future
+persisted consumer must reject an unknown version instead of decoding it with
+the current table. The only implicit emission pair is
+`NEXTITER`/`JTRUE|JFALSE`, whose adjacency and region relation are verified
+before MIR construction.
+
+CFG consumers choose an edge contract explicitly:
+
+- the normal CFG represents frontend lowering and the synthetic exception-stack
+  scaffolding still consumed by MIR;
+- the semantic CFG labels `normal`, `exceptional`, and `abrupt` edges, including
+  pending return/throw/break/continue completion through finalizers;
+- reachability retains the union of both contracts in protected scopes; GVN
+  uses semantic edges when completion can re-enter a scope and the smaller
+  normal graph when all exceptions exit; consumers still based on normal MIR
+  either prove that restriction safe or bail out in protected scopes.
+
+`includeCFG`, `dumpIR: "cfg"`, and `dumpDir/cfg.txt` expose the semantic graph
+with completion labels. Optimized HIR is structurally verified after every
+pass. Each pass declares the analyses it preserves and invalidates; MIR is
+published with a generation, cannot be read stale, and is rebuilt and verified
+after SCCP, DSE, and DCE change its facts. A failed pass restores all licensed
+annotation fields and its statistics. Optional DCE candidates with an invalid
+fresh MIR are skipped with the stable `candidate-mir-invalid` bailout reason;
+core structural failures still abort compilation.
+
+Independent checks cover `reuse` dominance/no-clobber, LICM natural-loop
+invariance and plan coherence, semantic deadness of elided stores, structured
+region contracts, MIR edge/Phi/definition/effect/use identities, retained branch
+facts, and guest-object origins through slots/Phi/return-safe constructors.
+Invalid optional provenance candidates roll back to the guarded sandbox path.
+MIR also records and verifies each outgoing edge's SSA stack signature and its
+exact HIR operation mapping; CFG verification reconstructs expected semantic
+edges from the source HIR. Remaining release blockers are corpus, held-out
+performance evidence, and staged canary gates rather than unchecked optimizer
+annotations.
 
 ## Runtime and security boundary
 
@@ -57,7 +110,7 @@ Unknown calls, property access, dynamic environments, captured values, parameter
 const { capability, compile } = require("sablejs");
 
 const result = compile("var answer = 40 + 2; answer;", {
-  optimization: "O2",
+  optimization: "O1", // temporary recommended profile during CFG/SSA hardening
   security: "sandbox",
 });
 
@@ -80,5 +133,10 @@ Compile options include the optimization level, security mode, inspection option
 - Multi-suite comparison backends: `npm run benchmark:sunspider -- --backend=quickjs` and `npm run benchmark:kraken -- --backend=sablejs-sandbox`
 - Real-world workloads: `npm run benchmark:workloads -- --backend=sablejs-sandbox`
 - Differential fuzzing: `npm run test:differential` (2,000-case CI smoke) and `npm run fuzz:differential` (100,000-case campaign); mismatches land in `.cache/differential-failures/` with seeds, and `--minimize` runs statement-level delta debugging.
+
+The differential commands compare O0/O1/O2/Os. The general generator rotates
+sandbox/trusted by seed, while the boundary generator runs both modes for every
+case. The deeper directed/nightly quotas in the hardening plan are still
+required before O2 can return to production-ready status.
 
 Test262 is pinned in `tools/upstreams.js`. The conformance runner verifies the checkout commit before executing any case and fails on a mismatch.

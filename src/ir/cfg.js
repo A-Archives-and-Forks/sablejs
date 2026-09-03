@@ -1,5 +1,7 @@
 "use strict";
 
+const OpSpec = require("./op-spec");
+
 const TERMINATORS = new Set([
   "JUMP", "JTRUE", "JFALSE", "JCASE", "RETURN", "THROW", "TRY", "ENDTRY",
 ]);
@@ -9,12 +11,29 @@ function unique(values) {
   return Array.from(new Set(values));
 }
 
-function buildBasicBlocks(scope) {
+function buildBasicBlocks(scope, options = {}) {
   const boundaries = new Set([0, scope.codeLength]);
   scope.instructions.forEach((instruction) => {
     if (TARGETED.has(instruction.op)) boundaries.add(instruction.args[0]);
     if (TERMINATORS.has(instruction.op)) boundaries.add(instruction.end);
+    if (options.semantic && OpSpec.byName[instruction.op].mayThrow) {
+      boundaries.add(instruction.offset);
+      boundaries.add(instruction.end);
+    }
   });
+  if (options.semantic) {
+    (scope.controlRegions || []).forEach((region) => {
+      Object.entries(region).forEach(([key, value]) => {
+        if (key !== "id" && Number.isInteger(value) && 0 <= value && value <= scope.codeLength) {
+          boundaries.add(value);
+        }
+      });
+    });
+    (scope.syntheticRanges || []).forEach((range) => {
+      boundaries.add(range.start);
+      boundaries.add(range.end);
+    });
+  }
 
   const starts = Array.from(boundaries).sort((left, right) => left - right);
   const blocks = [];
@@ -35,10 +54,194 @@ function buildBasicBlocks(scope) {
   return blocks;
 }
 
-function successorEdges(block, codeLength) {
+function regionPhase(region, offset) {
+  if (region.tryBodyStart <= offset && offset < region.tryBodyEnd) return "try";
+  if (Number.isInteger(region.catchBodyStart) &&
+      region.catchBodyStart <= offset && offset < region.catchBodyEnd) return "catch";
+  return null;
+}
+
+function protectedRegions(scope) {
+  return (scope.controlRegions || [])
+    .filter((region) => region.kind === "TryCatch" || region.kind === "TryFinally")
+    .slice()
+    .sort((left, right) => (left.end - left.start) - (right.end - right.start));
+}
+
+// Route a pending JavaScript completion through the innermost active
+// handler/finalizer. Finalizer bodies are deliberately not active for their
+// own region, so a completion created there continues to an outer region.
+function completionRoute(scope, offset, completion, excludedRegionIds = new Set()) {
+  for (const region of protectedRegions(scope)) {
+    if (excludedRegionIds.has(region.id)) continue;
+    const phase = regionPhase(region, offset);
+    if (!phase) continue;
+    if (completion === "throw") {
+      if (region.kind === "TryCatch" && phase === "try") {
+        return { target: region.catchBodyStart, ownerRegion: region.id, via: "catch" };
+      }
+      if (region.kind === "TryFinally") {
+        if (phase === "try" && region.hasCatch) {
+          return { target: region.catchBodyStart, ownerRegion: region.id, via: "catch" };
+        }
+        return { target: region.finalizerStart, ownerRegion: region.id, via: "finally" };
+      }
+    } else if (region.kind === "TryFinally") {
+      return { target: region.finalizerStart, ownerRegion: region.id, via: "finally" };
+    }
+  }
+  return { target: scope.codeLength, ownerRegion: null, via: "exit" };
+}
+
+function structuredCompletions(scope) {
+  const exits = new Map();
+  (scope.controlRegions || []).forEach((region) => {
+    (region.exits || []).forEach((exit) => exits.set(exit.offset, exit));
+  });
+  return (scope.syntheticRanges || []).map((range) => {
+    const owner = protectedRegions(scope).find((region) =>
+      region.kind === "TryFinally" && region.start <= range.start && range.end <= region.end
+    );
+    if (!owner) return null;
+    const abrupt = scope.instructions.find((instruction) =>
+      instruction.offset >= range.end && instruction.offset < owner.end &&
+      (instruction.op === "RETURN" ||
+       (instruction.op === "JUMP" && exits.has(instruction.offset)))
+    );
+    if (!abrupt) return null;
+    const exit = exits.get(abrupt.offset);
+    return {
+      owner,
+      range,
+      abrupt,
+      completion: abrupt.op === "RETURN" ? "return" : exit.kind,
+      resumeTarget: abrupt.op === "RETURN" ? scope.codeLength : abrupt.args[0],
+    };
+  }).filter(Boolean);
+}
+
+function semanticSuccessorEdges(scope, block, options = {}) {
+  const last = block.instructions[block.instructions.length - 1];
+  let edges = successorEdges(block, scope.codeLength, options).map((edge) => ({
+    ...edge,
+    class: "normal",
+    completion: "normal",
+  }));
+  if (!last) return edges;
+
+  // TRY/CATCH/ENDTRY are lowering markers. Structured execution enters the
+  // source try body; exceptional paths are added from their real producers.
+  if (last.op === "TRY") {
+    edges = [{
+      target: last.args[0],
+      kind: "structured-enter",
+      class: "normal",
+      completion: "normal",
+    }];
+  }
+
+  const completions = structuredCompletions(scope);
+  const startingCompletion = completions.find((entry) => entry.range.start === block.end);
+  if (startingCompletion) {
+    edges = [{
+      target: startingCompletion.owner.finalizerStart,
+      kind: "finally",
+      class: "abrupt",
+      completion: startingCompletion.completion,
+      ownerRegion: startingCompletion.owner.id,
+      resumeTarget: startingCompletion.resumeTarget,
+    }];
+  }
+
+  const spec = OpSpec.byName[last.op];
+  if (spec.mayThrow) {
+    const route = completionRoute(scope, last.offset, "throw");
+    edges.push({
+      target: route.target,
+      kind: route.via,
+      class: "exceptional",
+      completion: "throw",
+      ownerRegion: route.ownerRegion,
+      sourceOffset: last.offset,
+    });
+  }
+
+  if (last.op === "RETURN") {
+    const alreadyFinalized = completions.find((entry) => entry.abrupt.offset === last.offset);
+    const excluded = alreadyFinalized ? new Set([alreadyFinalized.owner.id]) : new Set();
+    const route = completionRoute(scope, last.offset, "return", excluded);
+    edges = [{
+      target: route.target,
+      kind: route.via,
+      class: "abrupt",
+      completion: "return",
+      ownerRegion: route.ownerRegion,
+      sourceOffset: last.offset,
+    }];
+  } else if (last.op === "JUMP") {
+    const exit = (scope.controlRegions || []).flatMap((region) => region.exits || [])
+      .find((candidate) => candidate.offset === last.offset);
+    if (exit) {
+      edges = [{
+        target: last.args[0],
+        kind: exit.kind,
+        class: "abrupt",
+        completion: exit.kind,
+        sourceOffset: last.offset,
+      }];
+    }
+  }
+
+  // A normally completing finalizer resumes each pending completion that can
+  // enter it. These labelled edges encode the completion state explicitly;
+  // consumers may conservatively meet them at the same target block.
+  const finalizer = protectedRegions(scope).find((region) =>
+    region.kind === "TryFinally" && region.finalizerEnd === block.end &&
+    last.op !== "RETURN" && last.op !== "THROW"
+  );
+  if (finalizer) {
+    completions.filter((entry) => entry.owner.id === finalizer.id).forEach((entry) => {
+      edges.push({
+        target: entry.range.end,
+        kind: "resume",
+        class: "abrupt",
+        completion: entry.completion,
+        ownerRegion: finalizer.id,
+        resumeTarget: entry.resumeTarget,
+      });
+    });
+    if (!finalizer.hasCatch) {
+      const route = completionRoute(
+        scope,
+        finalizer.finalizerStart,
+        "throw",
+        new Set([finalizer.id])
+      );
+      edges.push({
+        target: route.target,
+        kind: route.via,
+        class: "exceptional",
+        completion: "throw",
+        ownerRegion: route.ownerRegion,
+      });
+    }
+  }
+
+  const seen = new Set();
+  return edges.filter((edge) => {
+    const key = `${edge.target}|${edge.class}|${edge.completion}|${edge.kind}|${edge.ownerRegion}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function successorEdges(block, codeLength, options = {}) {
   const last = block.instructions[block.instructions.length - 1];
   if (!last) return block.end < codeLength ? [{ target: block.end, kind: "fallthrough" }] : [];
-  if (last.optimizedBranchTarget !== undefined) {
+  const ignoreOptimized = options.ignoreOptimizedBranches ||
+    (options.ignoreOptimizedBranchOffsets && options.ignoreOptimizedBranchOffsets.has(last.offset));
+  if (!ignoreOptimized && last.optimizedBranchTarget !== undefined) {
     return [{ target: last.optimizedBranchTarget, kind: "optimized" }];
   }
   switch (last.op) {
@@ -106,12 +309,18 @@ function computeImmediateDominators(reachable, dominators, entry) {
   return immediateDominators;
 }
 
-function buildCFG(scope) {
-  const blocks = buildBasicBlocks(scope);
+function buildGraph(scope, semantic, analyze = true, options = {}) {
+  const blocks = buildBasicBlocks(scope, { semantic });
   const byStart = new Map(blocks.map((block) => [block.start, block]));
   blocks.forEach((block) => {
-    block.edges = successorEdges(block, scope.codeLength);
-    block.successors = block.edges.map((edge) => edge.target).filter((target) => byStart.has(target));
+    block.edges = semantic
+      ? semanticSuccessorEdges(scope, block, options)
+      : successorEdges(block, scope.codeLength, options);
+    // Multiple semantic completions may share a target. The labelled edges
+    // remain distinct, while the graph relation used by dataflow is a set.
+    block.successors = unique(
+      block.edges.map((edge) => edge.target).filter((target) => byStart.has(target))
+    );
     block.predecessors = [];
   });
   blocks.forEach((block) => block.successors.forEach((target) => {
@@ -134,19 +343,25 @@ function buildCFG(scope) {
   }
   reachable.sort((left, right) => left - right);
 
-  const dominators = entry === null ? new Map() : computeDominators(blocks, reachable, entry);
-  const immediateDominators = entry === null
+  const dominators = entry === null || !analyze
+    ? new Map()
+    : computeDominators(blocks, reachable, entry);
+  const immediateDominators = entry === null || !analyze
     ? new Map()
     : computeImmediateDominators(reachable, dominators, entry);
   const loops = [];
-  blocks.forEach((block) => block.successors.forEach((target) => {
-    if (seen.has(block.start) && dominators.get(block.start).has(target)) {
-      loops.push({ header: target, backedge: block.start });
-    }
-  }));
+  if (analyze) {
+    blocks.forEach((block) => block.successors.forEach((target) => {
+      if (seen.has(block.start) && dominators.get(block.start).has(target)) {
+        loops.push({ header: target, backedge: block.start });
+      }
+    }));
+  }
 
   return {
     kind: "ControlFlowGraph",
+    edgeModel: semantic ? "semantic" : "normal",
+    analyzed: analyze,
     scopeId: scope.id,
     codeLength: scope.codeLength,
     entry,
@@ -159,7 +374,26 @@ function buildCFG(scope) {
   };
 }
 
-function verifyCFG(cfg) {
+function buildNormalCFG(scope, options = {}) {
+  return buildGraph(scope, false, options.analyze !== false, options);
+}
+
+// Backward-compatible internal name. New CFG consumers must choose
+// buildNormalCFG or buildSemanticCFG explicitly.
+const buildCFG = buildNormalCFG;
+
+function buildSemanticCFG(scope, options = {}) {
+  return buildGraph(scope, true, options.analyze !== false, options);
+}
+
+function edgeSignature(edge) {
+  return JSON.stringify([
+    edge.target, edge.kind, edge.class, edge.completion, edge.ownerRegion,
+    edge.resumeTarget, edge.sourceOffset,
+  ]);
+}
+
+function verifyCFG(cfg, sourceScope = null) {
   if (!cfg || cfg.kind !== "ControlFlowGraph" || !Array.isArray(cfg.blocks)) {
     throw new TypeError("Invalid ControlFlowGraph");
   }
@@ -183,6 +417,11 @@ function verifyCFG(cfg) {
       if (edge.target !== cfg.codeLength && !starts.has(edge.target)) {
         throw new Error(`CFG edge from ${block.start} has invalid target ${edge.target}`);
       }
+      if (cfg.edgeModel === "semantic" &&
+          (!["normal", "exceptional", "abrupt"].includes(edge.class) ||
+           typeof edge.completion !== "string")) {
+        throw new Error(`CFG edge from ${block.start} has an invalid semantic class`);
+      }
     });
     block.successors.forEach((target) => {
       const successor = cfg.byStart.get(target);
@@ -198,7 +437,31 @@ function verifyCFG(cfg) {
     });
   });
 
-  cfg.reachable.forEach((start) => {
+  if (sourceScope) {
+    if (sourceScope.id !== cfg.scopeId || sourceScope.codeLength !== cfg.codeLength) {
+      throw new Error(`CFG source mismatch for scope ${cfg.scopeId}`);
+    }
+    const expected = buildGraph(
+      sourceScope,
+      cfg.edgeModel === "semantic",
+      false
+    );
+    if (expected.blocks.length !== cfg.blocks.length) {
+      throw new Error(`CFG block reconstruction mismatch in scope ${cfg.scopeId}`);
+    }
+    cfg.blocks.forEach((block, index) => {
+      const expectedBlock = expected.blocks[index];
+      const actualEdges = block.edges.map(edgeSignature).sort();
+      const expectedEdges = expectedBlock.edges.map(edgeSignature).sort();
+      if (block.start !== expectedBlock.start || block.end !== expectedBlock.end ||
+          actualEdges.length !== expectedEdges.length ||
+          actualEdges.some((edge, edgeIndex) => edge !== expectedEdges[edgeIndex])) {
+        throw new Error(`CFG edge reconstruction mismatch at block ${block.start} in scope ${cfg.scopeId}`);
+      }
+    });
+  }
+
+  if (cfg.analyzed !== false) cfg.reachable.forEach((start) => {
     const dominators = cfg.dominators.get(start);
     if (!dominators || !dominators.has(start) || !dominators.has(cfg.entry)) {
       throw new Error(`Invalid dominators for reachable block ${start}`);
@@ -208,7 +471,7 @@ function verifyCFG(cfg) {
       throw new Error(`Invalid immediate dominator for block ${start}`);
     }
   });
-  cfg.loops.forEach((loop) => {
+  if (cfg.analyzed !== false) cfg.loops.forEach((loop) => {
     const dominators = cfg.dominators.get(loop.backedge);
     if (!dominators || !dominators.has(loop.header)) {
       throw new Error(`Invalid natural loop ${loop.backedge} -> ${loop.header}`);
@@ -217,4 +480,11 @@ function verifyCFG(cfg) {
   return true;
 }
 
-module.exports = { buildBasicBlocks, buildCFG, verifyCFG };
+module.exports = {
+  buildBasicBlocks,
+  buildCFG,
+  buildNormalCFG,
+  buildSemanticCFG,
+  completionRoute,
+  verifyCFG,
+};

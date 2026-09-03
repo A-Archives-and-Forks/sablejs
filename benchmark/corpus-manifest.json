@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "frozenAt": "2026-09-01",
+  "policy": {
+    "minimumHeldoutPrograms": 20,
+    "heldoutResultsVisibleDuringTuning": false
+  },
+  "tuning": [
+    { "id": "data-aggregation", "path": "benchmark/workloads/data-aggregation.js", "sha256": "fe8b55f1fb62e3231e4279fc87fa812d73ffe57ca28c87417657be94a1faf6b0", "license": "Apache-2.0", "inputMode": "static" },
+    { "id": "form-validator", "path": "benchmark/workloads/form-validator.js", "sha256": "cdd6f0158e39ef93e70e94ca6de5af671578ca9ae6bcc7b3b1f43722e8934077", "license": "Apache-2.0", "inputMode": "static" },
+    { "id": "json-transform", "path": "benchmark/workloads/json-transform.js", "sha256": "be252d9a19bea80a7a20da7352a97f33614580fc8f81b28e190ecb08adc499bc", "license": "Apache-2.0", "inputMode": "static" },
+    { "id": "mini-parser", "path": "benchmark/workloads/mini-parser.js", "sha256": "aa1ef7d198f774f50ab5b9a66de82b9e3825591430ab40de23e7296075c051a9", "license": "Apache-2.0", "inputMode": "static" },
+    { "id": "pricing-rules", "path": "benchmark/workloads/pricing-rules.js", "sha256": "02e05687580ea0bdfaf41e377e7bfe4b219d383d07ffeec6b14156099a7e3ff2", "license": "Apache-2.0", "inputMode": "static" },
+    { "id": "spreadsheet-formulas", "path": "benchmark/workloads/spreadsheet-formulas.js", "sha256": "d725e380c6fa4f223fdd3b31c904b259348f88db58c22328b8afff558e9202b0", "license": "Apache-2.0", "inputMode": "static" },
+    { "id": "template-logic", "path": "benchmark/workloads/template-logic.js", "sha256": "da3f8411e1e292c8a07c30d820f7067198d5ac3565bff463b7355d04ba472516", "license": "Apache-2.0", "inputMode": "static" },
+    { "id": "workflow-rules", "path": "benchmark/workloads/workflow-rules.js", "sha256": "0709ff5a2d036a0c647b153396e802a36d3ae71585213727b28e1dfe46795bd5", "license": "Apache-2.0", "inputMode": "static" },
+    { "id": "v8-suite-7", "path": "benchmark/v8-suite.js", "sha256": "c20b055dcf7ed200897e16fd430c5edbe9a1e11c5464f34bee4b7cab092a7863", "license": "BSD-3-Clause", "inputMode": "static" }
+  ],
+  "heldout": [],
+  "adversarial": [
+    { "id": "deep-cfg", "command": "npm run test:optimizer:deep-cfg" },
+    { "id": "protected-completion", "command": "npm run test:optimizer:completion" },
+    { "id": "metamorphic", "command": "npm run test:optimizer:metamorphic" }
+  ]
+}

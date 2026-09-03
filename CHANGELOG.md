@@ -5,6 +5,47 @@ the exact commit list and downloadable artifacts.
 
 ## Unreleased
 
+## 2.0.0-beta.6 — 2026-09-03
+
+- Changed the implicit optimization default from O2 to O1 while O2/Os remain
+  experimental behind the CFG/SSA hardening release gate.
+- Replaced DSE's fixed 256-iteration partial commit with a convergent reverse
+  worklist and fail-closed diagnostic budget. Added completion-labelled semantic
+  CFGs and independently verified GVN reuse; catch-free `try/finally` is
+  supported while real catch/with/eval and unproved protected-scope passes keep
+  conservative bailouts.
+- Added full optimization-level/security regressions for the deep-CFG and
+  `try`/`finally` wrong-code cases, a GVN kill switch, pipeline replay metadata,
+  and a canonical operation table shared by frontend and IR.
+- Added executable pass preservation/invalidation contracts, generation-checked
+  MIR rebuilds, transactional annotation rollback, structured-region checks,
+  independent LICM/dead-store proofs, and identity-level MIR verification.
+- Made invalid optional DCE candidates fail closed: the compiler restores the
+  last verified HIR/MIR/statistics and exposes `candidate-mir-invalid` through
+  optimizer bailout metadata instead of emitting or continuing with the
+  inconsistent candidate.
+- Added retained literal/SCCP branch facts with independent MIR constant
+  checking, plus an independent guest-origin analysis covering slots, Phi
+  meets, and return-safe constructors; invalid provenance candidates retain the
+  fully guarded sandbox write path.
+- Moved MIR lowering categories into the canonical exhaustive operation
+  contract and verified the sole `NEXTITER`/conditional emission relation
+  before MIR construction.
+- Added source-reconstructed CFG verification and MIR edge-stack/HIR-mapping
+  checks; optimizer bailout metadata now includes stable reasons plus scope and
+  diagnostic codes when available.
+- Added SCCP proof-ID rebinding after CFG-changing folds, AST-aware mismatch
+  reduction, permanent optimizer corpus replay, metamorphic shape checks, and a
+  boundary oracle for descriptors, key order, input mutations, and capability
+  traces.
+- Added attributable SCCP/copy/DCE/GVN/LICM/DSE kill switches, a hashed corpus
+  manifest, benchmark-leakage CI, default dynamic-input workloads, cold/warm
+  release protocols, native-oracle benchmark correctness checks, and replayable
+  raw benchmark artifacts. The held-out O2 gate fails closed until 20 licensed
+  programs are present.
+- Fixed object and array literal initialization when their prototypes contain
+  inherited non-writable data properties; the runtime now takes the same
+  define-own-property fallback already used for inherited accessors.
 - Reworked the public documentation around the v2 product positioning,
   migration path, execution-model comparison, and benchmark sampling.
 - Removed hard-coded beta versions from installation documentation.

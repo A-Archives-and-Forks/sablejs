@@ -76,7 +76,7 @@ test("trusted/trusted.cjs — trusted-mode direct globalThis access", () => {
 test("precompile/ — build-time compile, runtime app never imports the compiler", () => {
   run(process.execPath, ["examples/precompile/build.cjs"]);
   const out = nodeExample("examples/precompile/run.cjs");
-  assert.match(out, /artifact: es5\.1 · sandbox · O2/);
+  assert.match(out, /artifact: es5\.1 · sandbox · O1/);
   assert.match(out, /receipt: \{ line: 32, ship: 10 \}/);
 });
 
@@ -153,6 +153,6 @@ test("deno/ — bundle for a neutral platform, run under Deno", { skip: !hasBin(
 
 test("bun/ — run under Bun", { skip: !hasBin("bun") }, () => {
   const out = run("bun", ["examples/bun/main.ts"]);
-  assert.match(out, /compiled: O2 · sandbox · \d+ bytes/);
+  assert.match(out, /compiled: O1 · sandbox · \d+ bytes/);
   assert.match(out, /bun guest returned: 15/);
 });

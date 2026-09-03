@@ -16,7 +16,7 @@ const outDir = join(here, "dist");
 const source = readFileSync(join(here, "..", "precompile", "guest.js"), "utf8");
 
 const result = compile(source, {
-  optimization: "O2",
+  optimization: "O1",
   security: "sandbox",
   runtimeModule: join(root, "src", "runtime"),
 });

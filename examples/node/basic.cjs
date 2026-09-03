@@ -22,7 +22,7 @@ const guestSource = [
 // Compile once. `security: "sandbox"` (the default) deep-copies `globals`
 // so guest mutations never reach the host object graph.
 const result = compile(guestSource, {
-  optimization: "O2",
+  optimization: "O1",
   security: "sandbox",
   sourceMap: {
     mode: "external",
